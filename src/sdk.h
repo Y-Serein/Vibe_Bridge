@@ -1,6 +1,7 @@
 #ifndef __j5mSt0yNPrFBx__
 #define __j5mSt0yNPrFBx__
 
+#include <sys/cdefs.h>
 #if defined(__STDC__)
 #elifdef __GNUC__
 #else
@@ -22,6 +23,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define THDEBUG 1
+
 enum UartBaudMode : uint32_t {
     UBM11 = 2000000,
     UBM22 = 2500000,
@@ -32,8 +35,12 @@ enum UartBaudMode : uint32_t {
     UBM77 = 7000000,
     UBM88 = 8000000,
     UBMAA = 5000000,
+    UBMBB = 10000000,
+    UBMCC = 5000000,
+    UBMDD = 5000000,
 };
-#define UART_BAUD_MODE_DEF 0xAA
+#define UART_BAUD_MODE_DEF 0x55
+#define SHUTTER_ENABLE     0
 
 enum UartOutMode : uint32_t {
     UOM_CALI_U8 = 0,
@@ -42,7 +49,64 @@ enum UartOutMode : uint32_t {
 
 #define UART_OUT_MODE_DEF UOM_RAW_U16
 
+enum DataOutMode : uint8_t {
+    DOM_UART = 0,
+    DOM_UVC,
+};
+#define DATA_OUT_MODE_DEF DOM_UART
+
+enum CaliMode : uint8_t {
+    CM_OFF = 0,
+    CM_ON,
+};
+#define CALIMODE_DEF CM_OFF
+
+struct Button {
+    uint8_t pin;
+    uint8_t state;
+    uint32_t last_tick;
+    volatile bool event;
+};
+#define DEBOUNCE       20
+#define BUTTON_NUM_MAX 1
+
+struct GpioBtn {
+    uint8_t gpio;
+    uint8_t stable_level;
+    uint8_t last_level;
+    uint32_t last_change_ms;
+    uint32_t press_ms;
+    uint8_t event;
+};
+
+enum GpioBtnEvent {
+    GB_EV_PRESS = 1 << 0,
+    GB_EV_RELEASE = 1 << 1,
+    GB_EV_LONG = 1 << 2,
+};
+#define GB_LONG_PRESS 800
+
+struct __attribute__((packed)) BadPt {
+    uint8_t y;
+    uint8_t x;
+};
+#define MAX_BADPT 5
+
+enum : uint32_t {
+    CORE0_EV0 = 0xdeadc0e0,
+    CORE1_EV0 = 0xdeadc1e0,
+};
+
 #define RXPKTDBG 0
+
+#define LED_STATE_DEF  0
+#define LED_BOTH       1
+#define LED_ON_VAL     true
+#define LED_OFF_VAL    false
+#define LED_FAILED_INV 200
+#define LED_SUCC_INV   1000
+
+#define CALI_LED_T_NUM 3
 
 #define IO_ISDA 1
 #define IO_ICLK 2
@@ -64,6 +128,8 @@ enum UartOutMode : uint32_t {
 #define println(fmt, ...)  printf(fmt "\r\n", ##__VA_ARGS__)
 #define eprintln(fmt, ...) printf("[E]" fmt "\n", ##__VA_ARGS__)
 
+#define IO_PLED 25
+#define IO_LED  19
 #define IO_DUTX 20
 #define IO_SSDA 11
 #define IO_SCLK 10
@@ -79,6 +145,7 @@ enum UartOutMode : uint32_t {
 #define IO_SVMS 3
 #define IO_SVM1 4
 #define IO_SVM2 5
+#define IO_BTN  0
 
 #define MAIN_FUNC_MODE_SPI_INIT_25MHZ        0
 #define MAIN_FUNC_MODE_240MHZ                1
@@ -93,27 +160,75 @@ enum UartOutMode : uint32_t {
 #define MAIN_FUNC_MODE_ADC                   10
 #define MAIN_FUNC_MODE_SHUTTER               11
 #define MAIN_FUNC_MODE_FLASH                 12
+#define MAIN_FUNC_MODE_GPIO0                 13
+#define MAIN_FUNC_MODE_UVC_MAX               14
+#define MAIN_FUNC_MODE_BOARD_ID              15
+#define MAIN_FUNC_MODE_BOARD_ID_BOARD        16
 #define MAIN_FUNC_MODE                       MAIN_FUNC_MODE_SPI_INIT_40MHZ_4
 
-#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ_4
-#    define IO_LED 19
-#else
-#    define IO_LED 25
-#endif
-
-#define RAW_OUT_MODE 0
-#define RAW16_MODE   1
+#define RAW_OUT_MODE      0
+#define LED_BTN_SYNC_MODE 0
+#define CORE1_TIMEU_MODE  0
+#define CALI_PASS_MODE    0
 
 #define SENSOR_W 160
 #define SENSOR_H 120
 
 #define FLASH_SIZE          (4 * 1024 * 1024)
-#define FLASH_TARGET_SIZE   (128 * 1024)
+#define FLASH_TARGET_SIZE   (512 * 1024)
 #define FLASH_TARGET_OFFSET (FLASH_SIZE - FLASH_TARGET_SIZE)
+#define FLASH_OFS_INFO      0x000000
+#define FLASH_OFS_IMGBG     0x002000
+#define FLASH_OFS_BADPTS    0x00e000
+#define FLASH_OFS_GAIN      0x01a000
+#define FLASH_RETRY_MAX     3
+#define FLASH_HAS_DATA_F    0x78
+
+struct __attribute__((packed)) FlashDataInfo {
+    uint8_t has_data;
+    uint8_t _pad0[3];
+    uint32_t imgbg_ofs;
+    uint32_t imgbg_size;
+    uint32_t badpts_ofs;
+    uint32_t badpts_size;
+    uint32_t badpts_num;
+    uint32_t gain_ofs;
+    uint32_t gain_size;
+    uint8_t _pad1[32];
+};
+
+struct FlashOpInfo {
+    uint32_t ofs;
+    uint32_t size;
+    uint8_t* data;
+};
 
 extern const uint8_t* flash_target_contents;
+extern const struct FlashDataInfo* flash_header;
+extern const uint16_t* flash_imgbg;
+extern const float* flash_gain;
+extern const struct BadPt* flash_badpt;
+extern enum DataOutMode dataomode;
+extern struct Button buttons[BUTTON_NUM_MAX];
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID
+extern uint8_t uid[8];
+#endif
+
+#define UID_LEN (2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1)
+extern char uid[];
 
 void errh(const char* msg);
 void dump_buf_8bytes(const uint8_t* buf, size_t len);
+void button_init();
+void button_scan(struct GpioBtn* btn);
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID
+void flash_read_unique_id();
+#endif
+
+static_assert(sizeof(struct BadPt) == 2, "BadPt size must be 2 bytes!");
+static_assert(sizeof(struct FlashDataInfo) == 64,
+              "FlashDataInfo size must be 64 bytes!");
+#define FLOAT_ABS_EPS 1e-7f
+#define FLOAT_REL_EPS 1e-6f
 
 #endif

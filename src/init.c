@@ -492,8 +492,10 @@ static inline __attribute__((always_inline)) void piospi0_send_u32(
 
 void init_wpiospi()
 {
+#if 0
     extern const uint32_t reg_rstdata32[];
     extern const uint32_t reg_initdata32[];
+#endif
 
     pre_init();
     // CTL
@@ -545,7 +547,9 @@ void init_wpiospi()
 
     // rst REG
     piospi0_wait_idle(upio0, usm0);
+#if 0
     piospi0_send_u32(reg_rstdata32, REG_DATE_SPI_LEN32);
+#endif
     piospi0_wait_idle(upio0, usm0);
 
     // reset delay
@@ -554,7 +558,9 @@ void init_wpiospi()
     piospi0_program_init(IO_OSDA, IO_OCLK, IO_OFS, 1.5f);
     // init REG
     piospi0_wait_idle(upio0, usm0);
+#if 0
     piospi0_send_u32(reg_initdata32, REG_DATE_SPI_LEN32);
+#endif
     piospi0_wait_idle(upio0, usm0);
 
     // test
@@ -664,6 +670,25 @@ void th160_init()
     //     sleep_ms(1000);
     //     cnt++;
     // }
+
+#ifdef FPS
+#    undef FPS
+#endif
+#ifdef W
+#    undef W
+#endif
+#ifdef H
+#    undef H
+#endif
+#ifdef BSIZE
+#    undef BSIZE
+#endif
+#ifdef BUF_AT
+#    undef BUF_AT
+#endif
+#ifdef FPS_PRINT_INTERVAL_MS
+#    undef FPS_PRINT_INTERVAL_MS
+#endif
 }
 
 uint spi1clk;
@@ -948,19 +973,17 @@ void wspi_stop1()
 
 static const uint8_t SPI_CLK_A[40 / 8] = {0x00, 0x00, 0x00, 0x00, 0x00};
 static const uint8_t SPI_CLK_B[32 / 8] = {0xff, 0xff, 0xff, 0xff};
-extern const uint8_t reg_initdata[];
-extern const uint8_t reg_initdata_all1[];
-extern const uint8_t reg_initdata_all0[];
-#define REG_INITDATA reg_initdata
 void wspi_reinit1()
 {
+    extern const uint8_t reg_initdata[];
+
     gpio_put(IO_SCTL, 0);
     // gpio_put(IO_SRST, 0);
     gpio_put(IO_SCS, 0);
     // gpio_put(IO_SRST, 1);
     spi_write_blocking(spi1, SPI_CLK_A, 40 / 8);
     gpio_put(IO_SCS, 1);
-    spi_write_blocking(spi1, REG_INITDATA, 1286 - 32 / 8);
+    spi_write_blocking(spi1, reg_initdata, 1286 - 32 / 8);
     gpio_put(IO_SCS, 0);
     for (int i = 0; i < 5; ++i) {
         spi_write_blocking(spi1, SPI_CLK_B, 32 / 8);
@@ -1016,9 +1039,7 @@ void wspi_init1()
     rxring.ridx = 0;
     dma_done = false;
 
-    gpio_init(9);
-    gpio_set_dir(9, true);
-    gpio_put(9, 0);
+    extern const uint8_t reg_initdata[];
 
     // CTL = 0
     gpio_init(IO_SCTL);
@@ -1038,10 +1059,10 @@ void wspi_init1()
     gpio_set_function(IO_SSDA, GPIO_FUNC_SPI);  // MOSI
     gpio_set_function(IO_SCLK, GPIO_FUNC_SPI);  // SCLK
     gpio_disable_pulls(IO_SCLK);
-    gpio_set_drive_strength(IO_SCLK, GPIO_DRIVE_STRENGTH_4MA);
+    gpio_set_drive_strength(IO_SCLK, GPIO_DRIVE_STRENGTH_8MA);
     gpio_set_slew_rate(IO_SCLK, GPIO_SLEW_RATE_FAST);
     gpio_disable_pulls(IO_SSDA);
-    gpio_set_drive_strength(IO_SSDA, GPIO_DRIVE_STRENGTH_4MA);
+    gpio_set_drive_strength(IO_SSDA, GPIO_DRIVE_STRENGTH_8MA);
     gpio_set_slew_rate(IO_SSDA, GPIO_SLEW_RATE_FAST);
     // RSTN = 1
     gpio_put(IO_SRST, 1);
@@ -1050,7 +1071,7 @@ void wspi_init1()
     // CS = 1
     gpio_put(IO_SCS, 1);
     // INIT
-    spi_write_blocking(spi1, REG_INITDATA, 1286 - 32 / 8);
+    spi_write_blocking(spi1, reg_initdata, 1286 - 32 / 8);
     // CS = 0
     gpio_put(IO_SCS, 0);
     for (int i = 0; i < 5; ++i) {

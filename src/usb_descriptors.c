@@ -135,8 +135,9 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid)
         "Sipeed", // 1: Manufacturer
         "Thermal160", // 2: Product
         "123456", // 3: Serials, should use chip ID
-        "TinyUSB UVC", // 4: UVC Interface
+        "UVC", // 4: UVC Interface
     };
+    string_desc_arr[3] = uid;
 
     static uint16_t _desc_str[32];
 

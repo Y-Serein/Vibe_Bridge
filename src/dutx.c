@@ -13,10 +13,12 @@ static dma_channel_config dutx_dma_cfg;
 
 static void dutx_out_chars(const char* buf, int len)
 {
+#if THDEBUG == 1
     dma_channel_wait_for_finish_blocking(dutx_dma_chan);
     dma_channel_configure(
         dutx_dma_chan, &dutx_dma_cfg, &dutx_pio->txf[dutx_sm], buf, len, true);
     dma_channel_wait_for_finish_blocking(dutx_dma_chan);
+#endif
 }
 
 static stdio_driver_t dutx_stdio = {

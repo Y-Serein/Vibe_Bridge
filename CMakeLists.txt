@@ -40,12 +40,23 @@ add_executable(
     src/sdk.c
     src/main.c
     src/init.c
+    src/led.c
     src/static_data.c
     src/static_data2.c
     src/dutx.c
     src/utils.c
     src/usb_descriptors.c
     # src/usb_descriptors_cdc.c
+    src/uvc.c
+    src/cmap/hot.c
+    src/yuy2_smpte_bars.c
+    src/yuy2_red.c
+    src/yuy2_green.c
+    src/yuy2_blue.c
+    src/frame_FF0000.c
+    src/frame_00FF00.c
+    src/frame_0000FF.c
+    src/frame_FFFFFF.c
 )
 set_property(TARGET ${PROJECT_NAME} PROPERTY OUTPUT_NAME "${PROJECT_NAME}.elf")
 target_compile_options(${PROJECT_NAME} PRIVATE ${DEFAULT_C_FLAGS})
@@ -54,6 +65,8 @@ target_compile_definitions(
     REG_DATE_SPI_LEN=1286
     REG_DATE_SPI_LEN32=320
     PICO_FLASH_SIZE_BYTES=4194304
+    PICO_STACK_SIZE=4096
+    PICO_STACK_SIZE_CORE1=4096
 )
 
 target_link_libraries(
@@ -74,6 +87,12 @@ target_include_directories(
     ${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
 )
+
+target_link_options(
+    ${PROJECT_NAME} PRIVATE
+    -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/th160.map
+)
+
 
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/src/pio0)
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/src/pio0_io)

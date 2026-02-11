@@ -1,4 +1,5 @@
 #include <bsp/board_api.h>
+#include <cmap/cmap.h>
 #include <hardware/adc.h>
 #include <hardware/clocks.h>
 #include <hardware/dma.h>
@@ -14,14 +15,19 @@
 #include <hardware/timer.h>
 #include <hardware/uart.h>
 #include <hardware/vreg.h>
+#include <hardware/watchdog.h>
 #include <init.h>
+#include <led.h>
+#include <math.h>
 #include <memory.h>
 #include <pico/flash.h>
 #include <pico/multicore.h>
 #include <pico/platform/common.h>
+#include <pico/platform/sections.h>
 #include <pico/stdlib.h>
 #include <pico/time.h>
 #include <pico/types.h>
+#include <pico/unique_id.h>
 #include <sdk.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -32,6 +38,7 @@
 #include <utils.h>
 
 #include "usb_descriptors.h"
+
 #if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
 #    include "device/usbd.h"
 #    include "tusb.h"
@@ -56,13 +63,17 @@ int spi_init_40MHz();
 int spi_init_40MHz2();
 int spi_init_40MHz3();
 int spi_init_40MHz4();
-int uvc_init();
+int uvc_func();
 int cdc_func();
 int spi_init_40MHz2_noinit();
 int baud_sel();
 int adc_func();
 int shutter_func();
 int flash_func();
+int gpio0_func();
+int uvc_max_func();
+int board_id_func();
+int board_id_board_func();
 
 int main()
 {
@@ -75,7 +86,7 @@ int main()
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ
     return spi_init_40MHz2();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
-    return uvc_init();
+    return uvc_func();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_CDC
     return cdc_func();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ_NOINIT
@@ -92,11 +103,20 @@ int main()
     return shutter_func();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_FLASH
     return flash_func();
+#elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_GPIO0
+    return gpio0_func();
+#elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_UVC_MAX
+    return uvc_max_func();
+#elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID
+    return board_id_func();
+#elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID_BOARD
+    return board_id_board_func();
 #endif
 }
 
 int spi_init_25mhz()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_25MHZ
     extern void dutx_init();
     dutx_init();
 
@@ -109,6 +129,7 @@ int spi_init_25mhz()
         println("running...");
         sleep_ms(1000);
     }
+#endif
 
     errh(nullptr);
     return 0;
@@ -116,6 +137,7 @@ int spi_init_25mhz()
 
 int ovclk_240mhz()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_240MHZ
     gpio_init(IO_LED);
     gpio_set_dir(IO_LED, true);
     for (int i = 0; i < 3 * 2; ++i) {
@@ -149,12 +171,14 @@ int ovclk_240mhz()
                 (uint64_t)clock_get_hz(clk_sys),
                 (uint64_t)clock_get_hz(clk_peri));
     }
-
+#endif
+    errh(nullptr);
     return 0;
 }
 
 int spi_init_40MHz()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ
     vreg_set_voltage(VREG_VOLTAGE_1_25);
     sleep_ms(10);
     set_sys_clock_khz(240000, true);
@@ -179,11 +203,13 @@ int spi_init_40MHz()
                 (uint64_t)clock_get_hz(clk_sys),
                 (uint64_t)clock_get_hz(clk_peri));
     }
+#endif
 
     errh(nullptr);
     return 0;
 }
 
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
 enum {
     BL_NOT_MOUNTED = 250,
     BL_MOUNTED = 1000,
@@ -281,9 +307,11 @@ int tud_video_commit_cb(uint_fast8_t ctl_idx,
     inv_ms = parameters->dwFrameInterval / 10000;
     return VIDEO_ERROR_NONE;
 }
+#endif
 
-int uvc_init()
+int uvc_func()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -299,7 +327,6 @@ int uvc_init()
     gpio_put(IO_LED, 1);
 
     println("==========start==========");
-#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
     tusb_init();
     while (true) {
         tud_task();
@@ -314,6 +341,7 @@ int uvc_init()
 
 int cdc_func()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_CDC
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -324,7 +352,6 @@ int cdc_func()
     extern void dutx_init();
     dutx_init();
 
-#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_CDC
     println("==========start==========");
     board_init();
     tusb_init();
@@ -349,6 +376,7 @@ int cdc_func()
 
 int spi_init_40MHz2()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ_2
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -385,7 +413,7 @@ int spi_init_40MHz2()
         if (rxring.ridx != rxring.widx) {
             struct RxBuf* b = &rxring.buf[rxring.ridx];
 
-#if RXPKTDBG == 1
+#    if RXPKTDBG == 1
             uint64_t rt = time_us_64();
             uint64_t dt = rt - lt;
             lt = rt;
@@ -411,7 +439,7 @@ int spi_init_40MHz2()
                 }
                 println("");
             }
-#endif
+#    endif
 
             // chlt = time_us_64();
             if (b->data[2] == 0xff && b->data[3] == 0x00
@@ -449,10 +477,10 @@ int spi_init_40MHz2()
                 break;
             }
 
-#if RXPKTDBG == 1
+#    if RXPKTDBG == 1
             dma_channel_configure(
                 sdch, &clkdcfg, &spi_get_hw(spi1)->dr, &Z, 0xffffffff, true);
-#endif
+#    endif
         }
     }
     dma_channel_abort(sdch);
@@ -484,6 +512,7 @@ int spi_init_40MHz2()
     //     dump_buf_8bytes(rxring.buf[i].data, BUFSIZE + BUFOF);
     //     println("");
     // }
+#endif
 
     errh(nullptr);
     return 0;
@@ -491,6 +520,7 @@ int spi_init_40MHz2()
 
 int spi_init_40MHz2_noinit()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ_NOINIT
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -578,6 +608,7 @@ int spi_init_40MHz2_noinit()
         dump_buf_8bytes(rxring.buf[i].data, BUFSIZE + BUFOF);
         println("");
     }
+#endif
 
     errh(nullptr);
     return 0;
@@ -585,6 +616,7 @@ int spi_init_40MHz2_noinit()
 
 int spi_init_40MHz3()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SPI_INIT_40MHZ_3
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -683,6 +715,7 @@ int spi_init_40MHz3()
         dump_buf_8bytes(rxring.buf[i].data, BUFSIZE + BUFOF);
         println("");
     }
+#endif
 
     errh(nullptr);
     return 0;
@@ -704,8 +737,9 @@ enum rawbuf_state {
 static uint8_t rawbuf[RAWBUFCNT][RAWBUFSIZETOTAL];
 static volatile uint8_t rawbuf_state[RAWBUFCNT];
 static volatile int rawbuf_last_ready;
+static enum UartOutMode ouomode = UART_OUT_MODE_DEF;
 
-static void rawbuf_init(void)
+static inline __attribute__((always_inline)) void rawbuf_init(void)
 {
     for (int i = 0; i < RAWBUFCNT; i++) {
         rawbuf_state[i] = RAWBUF_FREE;
@@ -713,44 +747,46 @@ static void rawbuf_init(void)
     rawbuf_last_ready = -1;
 }
 
-static int rawbuf_find_free(void)
+static inline __attribute__((always_inline)) int rawbuf_find_free(void)
 {
     for (int i = 0; i < RAWBUFCNT; i++) {
-        if (rawbuf_state[i] == RAWBUF_FREE)
+        if (rawbuf_state[i] == RAWBUF_FREE) {
             return i;
+        }
     }
     return -1;
 }
 
-static inline void rawbuf_copy_line(int buf_idx,
-                                    int line,
-                                    const uint8_t* src,
-                                    size_t len)
+static inline __attribute__((always_inline)) void rawbuf_copy_line(
+    int buf_idx, int line, const uint8_t* src, size_t len)
 {
-    if (line >= SENSOR_H)
+    if (line >= SENSOR_H) {
         return;
+    }
 
-#if RAW16_MODE == 1
-    const size_t line_stride = SENSOR_W * 2 + 4;
-    uint8_t* dst = &rawbuf[buf_idx][line * line_stride];
-    memcpy(dst, src, SENSOR_W * 2);
-    memcpy(dst + SENSOR_W * 2, src + SENSOR_W * 2 + 4, 4);
-#else
-    uint8_t* dst = &rawbuf[buf_idx][line * SENSOR_W * 2];
-    memcpy(dst, src, len);
-#endif
+    if (ouomode == UOM_RAW_U16) {
+        const size_t line_stride = SENSOR_W * 2 + 4;
+        uint8_t* dst = &rawbuf[buf_idx][line * line_stride];
+        memcpy(dst, src, SENSOR_W * 2);
+        memcpy(dst + SENSOR_W * 2, src + SENSOR_W * 2 + 4, 4);
+    } else if (ouomode == UOM_CALI_U8) {
+        uint8_t* dst = &rawbuf[buf_idx][line * SENSOR_W * 2];
+        memcpy(dst, src, len);
+    }
 }
 
-static int rawbuf_pick_ready(void)
+static inline __attribute__((always_inline)) int rawbuf_pick_ready()
 {
     int idx = rawbuf_last_ready;
 
-    if (idx >= 0 && rawbuf_state[idx] == RAWBUF_READY)
+    if (idx >= 0 && rawbuf_state[idx] == RAWBUF_READY) {
         return idx;
+    }
 
     for (int i = 0; i < RAWBUFCNT; i++) {
-        if (rawbuf_state[i] == RAWBUF_READY)
+        if (rawbuf_state[i] == RAWBUF_READY) {
             return i;
+        }
     }
 
     return -1;
@@ -759,17 +795,16 @@ static int rawbuf_pick_ready(void)
 #define HIST_BUCKETS 64
 #define HIST_SHIFT   8 /* 14bit >> 8 = 6bit bucket */
 
-static inline uint16_t be16_to_u14(const uint8_t* p)
+static inline __attribute__((always_inline)) uint16_t be16_to_u14(
+    const uint8_t* p)
 {
     uint16_t v;
     v = ((uint16_t)p[0] << 8) | p[1];
     return v & 0x3fff;
 }
 
-static void calc_percentile_u14_be(const uint8_t* raw,
-                                   size_t px_cnt,
-                                   uint16_t* low,
-                                   uint16_t* high)
+static inline __attribute__((always_inline)) void calc_percentile_u14_be(
+    const uint8_t* raw, size_t px_cnt, uint16_t* low, uint16_t* high)
 {
     uint32_t hist[64] = {0};
     uint32_t i, acc;
@@ -799,25 +834,30 @@ static void calc_percentile_u14_be(const uint8_t* raw,
         }
     }
 
-    if (*high <= *low)
+    if (*high <= *low) {
         *high = *low + 1;
+    }
 }
 
-static inline uint8_t norm_u14_to_u8(uint16_t v, uint16_t low, uint16_t high)
+static inline __attribute__((always_inline)) uint8_t norm_u14_to_u8(
+    uint16_t v, uint16_t low, uint16_t high)
 {
     uint32_t t;
 
-    if (v <= low)
+    if (v <= low) {
         return 0;
+    }
 
-    if (v >= high)
+    if (v >= high) {
         return 254;
+    }
 
     t = (uint32_t)(v - low) * 254;
     t /= (high - low);
 
-    if (t > 254)
+    if (t > 254) {
         t = 254;
+    }
 
     return (uint8_t)t;
 }
@@ -829,31 +869,37 @@ enum tx_buf_state {
     TXBUF_SENDING,
 };
 
-static enum UartOutMode ouomode = UART_OUT_MODE_DEF;
-#define PX_CNT (SENSOR_W * SENSOR_H)
-#if RAW16_MODE
-#    define TX_PAYLOAD (RAWBUFSIZETOTAL + 2)
-#else
-#    define TX_PAYLOAD (PX_CNT + 1) /* 包头 + 归一化像素 */
-#endif
-#define TXBUF_CNT 3
+#define PX_CNT     (SENSOR_W * SENSOR_H)
+#define TX_PAYLOAD (RAWBUFSIZETOTAL + 2)
+#define TXBUF_CNT  3
 static int uart_tx_dma_chan = -1;
 static uint8_t norm_buf[TXBUF_CNT][TX_PAYLOAD];
-int tx_buf_idx;
+static int tx_buf_idx;
 static volatile int dma_busy;
 static int buf_idx;
 static volatile enum tx_buf_state tx_state[TXBUF_CNT];
 static volatile int newest_ready = -1;
 static volatile int sending = -1;
+#define CALIBUF_CNT       2
+#define CALIBUFSIZE       RAWBUFSIZE
+#define CALIBUF_IMG_L_IDX 0
+#define CALIBUF_IMG_H_IDX 1
+static uint8_t caliidx = CALIBUF_IMG_L_IDX;
+static uint8_t calibuf[CALIBUF_CNT][CALIBUFSIZE];
+static enum CaliMode cmode = CALIMODE_DEF;
+static const uint16_t* calibg = nullptr;
+static const float* caligain = nullptr;
+static const struct BadPt* calibadpt = nullptr;
 
-void normalize_frame_be(uint8_t* raw, uint8_t* out)
+static inline __attribute__((always_inline)) void normalize_frame_be(
+    uint8_t* raw, uint8_t* out)
 {
     uint16_t low, high;
     size_t i;
 
     calc_percentile_u14_be(raw, PX_CNT, &low, &high);
 
-    out[0] = 0xff; /* 包头 */
+    out[0] = 0xff;
 
     for (i = 0; i < PX_CNT; i++) {
         uint16_t v = be16_to_u14(&raw[i * 2]);
@@ -861,10 +907,8 @@ void normalize_frame_be(uint8_t* raw, uint8_t* out)
     }
 }
 
-void calc_percentile_u14(const uint16_t* raw14,
-                         size_t px_cnt,
-                         uint16_t* low,
-                         uint16_t* high)
+static inline __attribute__((always_inline)) void calc_percentile_u14(
+    const uint16_t* raw14, size_t px_cnt, uint16_t* low, uint16_t* high)
 {
     uint32_t hist[HIST_BUCKETS] = {0};
     size_t i;
@@ -872,8 +916,9 @@ void calc_percentile_u14(const uint16_t* raw14,
     uint32_t p1_cnt = px_cnt / 100;
     uint32_t p99_cnt = px_cnt - p1_cnt;
 
-    for (i = 0; i < px_cnt; i++)
+    for (i = 0; i < px_cnt; i++) {
         hist[raw14[i] >> HIST_SHIFT]++;
+    }
 
     acc = 0;
     for (i = 0; i < HIST_BUCKETS; i++) {
@@ -893,11 +938,12 @@ void calc_percentile_u14(const uint16_t* raw14,
         }
     }
 
-    if (*high <= *low)
+    if (*high <= *low) {
         *high = *low + 1;
+    }
 }
 
-static inline uint16_t gray14_to_bin(uint16_t g)
+static inline __attribute__((always_inline)) uint16_t gray14_to_bin(uint16_t g)
 {
     g &= 0x3fff;
     g ^= g >> 1;
@@ -907,7 +953,7 @@ static inline uint16_t gray14_to_bin(uint16_t g)
     return g & 0x3fff;
 }
 
-static inline uint16_t clip_u16(int32_t v)
+static inline __attribute__((always_inline)) uint16_t clip_u16(int32_t v)
 {
     if (v < 0) {
         return 0;
@@ -918,35 +964,8 @@ static inline uint16_t clip_u16(int32_t v)
     return (uint16_t)v;
 }
 
-#if 0
-static void raw16_decode_to_normbuf(const uint8_t* raw, uint8_t* out, size_t)
-{
-    uint8_t* dst = &out[2];
-    const size_t line_stride = SENSOR_W * 2 + 4;
-
-    for (size_t y = 0; y < SENSOR_H; y++) {
-        const uint8_t* line = raw + y * line_stride;
-
-        for (size_t x = 0; x < SENSOR_W; x++) {
-            uint16_t r = be16_to_u14(&line[x * 2]);
-            r = gray14_to_bin(r);
-
-            size_t idx = (y * (SENSOR_W + 2) + x) * 2;
-            dst[idx] = (uint8_t)(r >> 8);
-            dst[idx + 1] = (uint8_t)(r & 0xff);
-        }
-
-        memcpy(
-            &dst[(y * (SENSOR_W + 2) + SENSOR_W) * 2], &line[SENSOR_W * 2], 4);
-    }
-
-    const uint8_t* adc = raw + SENSOR_H * line_stride;
-    memcpy(&dst[SENSOR_H * (SENSOR_W + 2) * 2], adc, 2);
-}
-#else
-static void raw16_decode_to_normbuf(const uint8_t* raw,
-                                    uint8_t* out,
-                                    size_t size)
+static inline __attribute__((always_inline)) void raw16_decode_to_normbuf(
+    const uint8_t* raw, uint8_t* out, size_t size)
 {
     uint8_t* dst = &out[2];
     const size_t line_stride = SENSOR_W * 2 + 4;
@@ -970,42 +989,493 @@ static void raw16_decode_to_normbuf(const uint8_t* raw,
     const uint8_t* adc = raw + SENSOR_H * line_stride;
     memcpy(&dst[SENSOR_H * px_per_line * 2], adc, 2);
 }
+
+static inline __attribute__((always_inline)) int cali_ref_stream(
+    const uint8_t* raw_h,
+    const uint8_t* raw_l,
+    float* gain_map,
+    struct BadPt* badpts,
+    const uint8_t badpts_size)
+{
+    const size_t line_stride = SENSOR_W * 2;
+    const size_t px_per_line = SENSOR_W;
+    const uint8_t* rawl_src = raw_l;
+    const uint8_t* rawh_src = raw_h;
+
+    float diff_sum = 0.0f;
+    size_t diff_count = 0;
+
+    for (uint8_t i = 0; i < badpts_size; ++i) {
+        badpts[i].x = 0xFF;
+        badpts[i].y = 0xFF;
+    }
+
+    for (size_t y = 0; y < SENSOR_H; ++y) {
+        const uint8_t* line_h = rawh_src + y * line_stride;
+        const uint8_t* line_l = rawl_src + y * line_stride;
+
+        size_t curr_bad_n = 0;
+        uint8_t curr_bad_x[SENSOR_W + 2];
+
+        for (size_t x = 0; x < SENSOR_W; ++x) {
+            const uint8_t* src_h = line_h + x * 2;
+            const uint8_t* src_l = line_l + x * 2;
+
+            uint16_t h = be16_to_u14(src_h);
+            uint16_t l = be16_to_u14(src_l);
+
+            int32_t diff = (int32_t)h - (int32_t)l;
+            if (diff == 0) {
+                diff = 1;
+            }
+            diff_sum += diff;
+            diff_count++;
+
+            if (gain_map != nullptr) {
+                gain_map[y * px_per_line + x] = (float)diff;
+            }
+
+#if CALI_PASS_MODE != 1
+            if (y == 0 || y == SENSOR_H - 1 || x == 0 || x == SENSOR_W - 1) {
+                if (diff < 0) {
+                    return -1;
+                }
+            }
+#endif
+        }
+    }
+
+#if CALI_PASS_MODE != 1
+    if (diff_count == 0) {
+        return -2;
+    }
+#else
+    if (diff_count == 0) {
+        diff_count = 1;
+    }
+#endif
+    float avg_diff = diff_sum / (float)diff_count;
+
+    size_t bad_idx = 0;
+    if (gain_map != nullptr) {
+        for (size_t y = 0; y < SENSOR_H; ++y) {
+            for (size_t x = 0; x < px_per_line; ++x) {
+                float diff = gain_map[y * px_per_line + x];
+                gain_map[y * px_per_line + x] = avg_diff / diff;
+                if (diff < avg_diff * 0.6) {
+                    if (bad_idx >= badpts_size) {
+#if CALI_PASS_MODE != 1
+                        return -3;
+#else
+                        continue;
+#endif
+                    }
+                    badpts[bad_idx].y = y;
+                    badpts[bad_idx].x = x;
+                    bad_idx++;
+                }
+            }
+        }
+    }
+
+#if CALI_PASS_MODE != 1
+    for (size_t i = 0; i < bad_idx - 1; ++i) {
+        int dy = (int)badpts[i].y - (int)badpts[i + 1].y;
+        int dx = (int)badpts[i].x - (int)badpts[i + 1].x;
+        if (abs(dy) <= 1 && abs(dx) <= 1) {
+            return -4;
+        }
+    }
 #endif
 
-// static void raw16_decode_to_normbuf(const uint8_t* raw,
-//                                     uint8_t* out,
-//                                     size_t px_cnt)
-// {
-//     uint8_t* dst = &out[2];
-//
-//     for (size_t i = 0; i < px_cnt; i++) {
-//         uint16_t v;
-//
-//         if (i < PX_CNT - RAWBUFADCCNT) {
-//             uint16_t r = be16_to_u14(&raw[i * 2]);
-//             r = gray14_to_bin(r);
-//             v = r;
-//         } else {
-//             v = ((uint16_t)raw[i * 2] << 8) | raw[i * 2 + 1];
-//         }
-//
-//         dst[i * 2] = (uint8_t)(v >> 8);
-//         dst[i * 2 + 1] = (uint8_t)(v & 0xff);
-//     }
-// }
-//
-void binary_calib_frame(const uint8_t* raw,
-                        const uint16_t* calib,
-                        uint8_t* out,
-                        size_t px_cnt)
+    return 0;
+}
+
+static inline __attribute__((always_inline)) void be_u8_to_le_u16_inplace(
+    uint8_t* buf, size_t len)
+{
+    if (!buf || len < 2) {
+        return;
+    }
+
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        uint8_t tmp = buf[i];
+        buf[i] = buf[i + 1];
+        buf[i + 1] = tmp;
+    }
+}
+
+void __not_in_flash_func(__flash_write2__)(void* param)
+{
+    const struct FlashOpInfo* opinfo = (const struct FlashOpInfo*)param;
+    if (opinfo == nullptr) {
+        return;
+    }
+    uint32_t ofs = FLASH_TARGET_OFFSET + opinfo->ofs;
+    flash_range_erase(ofs, opinfo->size);
+    flash_range_program(ofs, opinfo->data, opinfo->size);
+}
+
+static inline __attribute__((always_inline)) bool flash_write2(
+    const struct FlashOpInfo* flashop)
+{
+    static uint8_t buffer[FLASH_SECTOR_SIZE];
+    int rc = -1;
+    const uint32_t fsector = flashop->size / FLASH_SECTOR_SIZE;
+    const uint32_t lsector = flashop->size % FLASH_SECTOR_SIZE;
+    const uint8_t* data = flash_target_contents + flashop->ofs;
+
+    for (uint32_t i = 0; i < fsector; ++i) {
+        memcpy(
+            buffer, flashop->data + i * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
+        struct FlashOpInfo op;
+        op.ofs = flashop->ofs + i * FLASH_SECTOR_SIZE;
+        op.data = buffer;
+        op.size = FLASH_SECTOR_SIZE;
+        rc = flash_safe_execute(__flash_write2__, (void*)&op, 500);
+        if (rc != PICO_OK) {
+            eprintln("flash failed, rc = %d", rc);
+            return false;
+        }
+        const uint8_t* flashdata = data + i * FLASH_SECTOR_SIZE;
+        for (uint32_t j = 0; j < FLASH_SECTOR_SIZE; ++j) {
+            if (flashdata[j] != buffer[j]) {
+                eprintln("flash check failed in %llu %02x != %02x",
+                         (uint64_t)j,
+                         flashdata[j],
+                         buffer[j]);
+                return false;
+            }
+        }
+    }
+
+    if (lsector != 0) {
+        memset(buffer, 0xFF, FLASH_SECTOR_SIZE);
+        memcpy(buffer, flashop->data + fsector * FLASH_SECTOR_SIZE, lsector);
+        struct FlashOpInfo op;
+        op.ofs = flashop->ofs + fsector * FLASH_SECTOR_SIZE;
+        op.data = buffer;
+        op.size = FLASH_SECTOR_SIZE;
+        rc = flash_safe_execute(__flash_write2__, (void*)&op, 500);
+        if (rc != PICO_OK) {
+            eprintln("flash failed, rc = %d", rc);
+            return false;
+        }
+        const uint8_t* flashdata = data + fsector * FLASH_SECTOR_SIZE;
+        for (uint32_t j = 0; j < FLASH_SECTOR_SIZE; ++j) {
+            if (flashdata[j] != buffer[j]) {
+                eprintln("flash check failed in %llu %02x != %02x",
+                         (uint64_t)j,
+                         flashdata[j],
+                         buffer[j]);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static inline __attribute__((always_inline)) bool float_equal(float a, float b)
+{
+    const float abs_eps = FLOAT_ABS_EPS;
+    const float rel_eps = FLOAT_REL_EPS;
+
+    float diff = fabsf(a - b);
+    if (diff <= abs_eps) {
+        return true;
+    }
+
+    return diff <= rel_eps * fmaxf(fabsf(a), fabsf(b));
+}
+
+static inline __attribute__((always_inline)) bool start_cali()
+{
+    multicore_fifo_push_blocking(CORE0_EV0);
+    while (multicore_fifo_rvalid()) {
+        uint32_t cmd = multicore_fifo_pop_blocking();
+        if (cmd == CORE1_EV0) {
+            break;
+        }
+    }
+    sleep_ms(100);
+
+    println("start cali");
+
+    float* gain_map = (float*)rawbuf;
+    static struct BadPt badpts[MAX_BADPT];
+    int caliret = cali_ref_stream(calibuf[CALIBUF_IMG_H_IDX],
+                                  calibuf[CALIBUF_IMG_L_IDX],
+                                  gain_map,
+                                  badpts,
+                                  MAX_BADPT);
+    if (caliret < 0) {
+        println("cali failed: ret = %d", caliret);
+        return false;
+    }
+
+    const uint32_t gain_size = SENSOR_W * SENSOR_H * sizeof(float);
+    const uint32_t badpt_size = MAX_BADPT * sizeof(struct BadPt);
+    static struct FlashDataInfo fheader;
+    memset(&fheader, 0x00, sizeof(fheader));
+    fheader.has_data = FLASH_HAS_DATA_F;
+    fheader.imgbg_ofs = FLASH_OFS_IMGBG;
+    fheader.imgbg_size = CALIBUFSIZE;
+    fheader.gain_ofs = FLASH_OFS_GAIN;
+    fheader.gain_size = gain_size;
+    fheader.badpts_ofs = FLASH_OFS_BADPTS;
+    fheader.badpts_num = MAX_BADPT;
+    fheader.badpts_size = badpt_size;
+
+    const uint8_t header[2] = {0xff, 0xff};
+    println("send img_l...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, calibuf[CALIBUF_IMG_L_IDX], CALIBUFSIZE);
+    sleep_ms(5);
+
+    println("send img_h...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, calibuf[CALIBUF_IMG_H_IDX], CALIBUFSIZE);
+    sleep_ms(5);
+
+    be_u8_to_le_u16_inplace(calibuf[CALIBUF_IMG_L_IDX], CALIBUFSIZE);
+    println("flash: imgbg...");
+    {
+        uint8_t retry = 0;
+        struct FlashOpInfo fop;
+        fop.ofs = fheader.imgbg_ofs;
+        fop.data = calibuf[CALIBUF_IMG_L_IDX];
+        fop.size = fheader.imgbg_size;
+    flash_imgbg_start:
+        while (retry++ < FLASH_RETRY_MAX) {
+            if (!flash_write2(&fop)) {
+                goto flash_imgbg_start;
+            }
+            const uint16_t* data =
+                (const uint16_t*)(calibuf[CALIBUF_IMG_L_IDX]);
+            for (uint32_t i = 0; i < CALIBUFSIZE / sizeof(uint16_t); ++i) {
+                if (data[i] != flash_imgbg[i]) {
+                    eprintln(
+                        "falsh: imgbg check failed ram %llu != %llu flash in "
+                        "[%llu]",
+                        (uint64_t)data[i],
+                        (uint64_t)flash_imgbg[i],
+                        (uint64_t)i);
+                    goto flash_imgbg_start;
+                }
+            }
+            break;
+        }
+        if (retry >= FLASH_RETRY_MAX) {
+            eprintln("flash failed");
+            return false;
+        }
+    }
+    println("send img_bg...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, calibuf[CALIBUF_IMG_L_IDX], CALIBUFSIZE);
+    sleep_ms(5);
+
+    println("flash: gain...");
+    {
+        uint8_t retry = 0;
+        struct FlashOpInfo fop;
+        fop.ofs = fheader.gain_ofs;
+        fop.data = (uint8_t*)gain_map;
+        fop.size = fheader.gain_size;
+    flash_gain_start:
+        while (retry++ < FLASH_RETRY_MAX) {
+            if (!flash_write2(&fop)) {
+                goto flash_gain_start;
+            }
+            const float* data = gain_map;
+            for (uint32_t i = 0; i < gain_size / sizeof(float); ++i) {
+                if (!float_equal(data[i], flash_gain[i])) {
+                    eprintln(
+                        "falsh: check failed ram %0.2f != %0.2f flash in "
+                        "[%llu]",
+                        data[i],
+                        flash_gain[i],
+                        (uint64_t)i);
+                    goto flash_gain_start;
+                }
+            }
+            break;
+        }
+        if (retry >= FLASH_RETRY_MAX) {
+            eprintln("flash failed");
+            return false;
+        }
+    }
+    println("send gain...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, (const uint8_t*)gain_map, gain_size);
+    sleep_ms(5);
+
+    println("flash badpts");
+    {
+        uint8_t retry = 0;
+        struct FlashOpInfo fop;
+        fop.ofs = fheader.badpts_ofs;
+        fop.data = (uint8_t*)badpts;
+        fop.size = fheader.badpts_size;
+    flash_badpts_start:
+        while (retry++ < FLASH_RETRY_MAX) {
+            if (!flash_write2(&fop)) {
+                goto flash_badpts_start;
+            }
+            const struct BadPt* data = badpts;
+            for (uint32_t i = 0; i < fheader.badpts_num; ++i) {
+                if (data[i].x != flash_badpt[i].x
+                    || data[i].y != flash_badpt[i].y) {
+                    eprintln(
+                        "falsh: check failed ram %u:%u != %u:%u flash in "
+                        "[%llu]",
+                        data[i].x,
+                        data[i].y,
+                        flash_badpt[i].x,
+                        flash_badpt[i].y,
+                        (uint64_t)i);
+                    goto flash_badpts_start;
+                }
+            }
+            break;
+        }
+        if (retry >= FLASH_RETRY_MAX) {
+            eprintln("flash failed");
+            return false;
+        }
+    }
+    println("send badpts...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, (const uint8_t*)badpts, badpt_size);
+    sleep_ms(5);
+
+    println("flash header");
+    {
+        uint8_t retry = 0;
+        struct FlashOpInfo fop;
+        fop.ofs = FLASH_OFS_INFO;
+        fop.data = (uint8_t*)&fheader;
+        fop.size = sizeof(fheader);
+    flash_header_start:
+        while (retry++ < FLASH_RETRY_MAX) {
+            if (!flash_write2(&fop)) {
+                goto flash_header_start;
+            }
+            if (0
+                != memcmp(
+                    &fheader, flash_header, sizeof(struct FlashDataInfo))) {
+                eprintln("flash: check failed in header");
+                dump_buf_8bytes((uint8_t*)&fheader,
+                                sizeof(struct FlashDataInfo));
+                dump_buf_8bytes((uint8_t*)flash_header,
+                                sizeof(struct FlashDataInfo));
+                goto flash_header_start;
+            }
+            break;
+        }
+        if (retry >= FLASH_RETRY_MAX) {
+            eprintln("flash failed");
+            return false;
+        }
+    }
+
+    println("send finish...");
+    const uint8_t finish[2] = {0x78, 0x78};
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, (const uint8_t*)finish, 2);
+    sleep_ms(5);
+
+    return true;
+}
+
+static inline __attribute__((always_inline)) bool dump_cli()
+{
+    multicore_fifo_push_blocking(CORE0_EV0);
+    while (multicore_fifo_rvalid()) {
+        uint32_t cmd = multicore_fifo_pop_blocking();
+        if (cmd == CORE1_EV0) {
+            break;
+        }
+    }
+    sleep_ms(100);
+
+    println("dump cli");
+
+    if (flash_header->has_data != FLASH_HAS_DATA_F) {
+        return false;
+    }
+
+    sleep_ms(500);
+
+    const uint8_t header[2] = {0xff, 0xff};
+
+    println("send img_bg...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(
+        OUART, (const uint8_t*)flash_imgbg, flash_header->imgbg_size);
+    sleep_ms(5);
+
+    println("send gain...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(
+        OUART, (const uint8_t*)flash_gain, flash_header->gain_size);
+    sleep_ms(5);
+
+    println("send badpts...");
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(
+        OUART, (const uint8_t*)flash_badpt, flash_header->badpts_size);
+    sleep_ms(5);
+
+    println("send finish...");
+    const uint8_t finish[2] = {0x78, 0x78};
+    uart_write_blocking(OUART, header, sizeof(header));
+    uart_write_blocking(OUART, (const uint8_t*)finish, 2);
+    sleep_ms(5);
+
+    return true;
+}
+
+static inline __attribute__((always_inline)) void binary_calib_frame(
+    const uint8_t* raw,
+    const uint16_t* calib,
+    const float* calig,
+    const struct BadPt* calip,
+    uint8_t* out,
+    size_t px_cnt)
 {
     uint16_t low, high;
     static uint16_t raw14[PX_CNT];
-    for (size_t i = 0; i < px_cnt; i++) {
-        uint16_t r = be16_to_u14(&raw[i * 2]);
-        r = gray14_to_bin(r);
-        int32_t diff = (int32_t)r - (int32_t)calib[i];
-        raw14[i] = clip_u16(diff);
+    bool debad = false;
+
+    if (calib != nullptr && calig == nullptr) {
+        for (size_t i = 0; i < px_cnt; i++) {
+            uint16_t r = be16_to_u14(&raw[i * 2]);
+            r = gray14_to_bin(r);
+            int32_t diff = (int32_t)r - (int32_t)calib[i];
+            raw14[i] = clip_u16(diff);
+        }
+        debad = true;
+    } else if (calib != nullptr && calig != nullptr) {
+        for (size_t i = 0; i < px_cnt; i++) {
+            uint16_t r = be16_to_u14(&raw[i * 2]);
+            r = gray14_to_bin(r);
+            int32_t diff = (int32_t)r - (int32_t)calib[i];
+            raw14[i] = clip_u16(diff);
+            raw14[i] = (uint16_t)(calig[i] * raw14[i]);
+        }
+        debad = true;
+    } else {
+        for (size_t i = 0; i < px_cnt; i++) {
+            uint16_t r = be16_to_u14(&raw[i * 2]);
+            raw14[i] = gray14_to_bin(r);
+        }
+    }
+    if (debad) {
+        // FIXME: 修复坏点
+        (void)calip;
     }
     calc_percentile_u14(raw14, PX_CNT, &low, &high);
 
@@ -1015,9 +1485,37 @@ void binary_calib_frame(const uint8_t* raw,
     }
 }
 
-void normalize_frame_corrected_be(const uint8_t* raw,
-                                  const uint16_t* calib,
-                                  uint8_t* out)
+static inline __attribute__((always_inline)) void binary_frame(
+    const uint8_t* raw, uint8_t* out, size_t px_cnt)
+{
+#if 0
+    for (size_t i = 0; i < px_cnt; i++) {
+        uint16_t r = be16_to_u14(&raw[i * 2]);
+        uint16_t pixu16 = gray14_to_bin(r);
+        out[i * 2] = (uint8_t)((pixu16 >> 8) & 0xFF);
+        out[i * 2 + 1] = (uint8_t)(pixu16 & 0xFF);
+    }
+#else
+    uint8_t* dst = out;
+    const size_t line_stride = SENSOR_W * 2;
+    const size_t px_per_line = SENSOR_W;
+    for (size_t y = 0; y < SENSOR_H; ++y) {
+        const uint8_t* line = raw + y * line_stride;
+        for (size_t x = 0; x < px_per_line; ++x) {
+            const uint8_t* src = &line[x * 2];
+
+            uint16_t r = be16_to_u14(src);
+            r = gray14_to_bin(r);
+            size_t idx = (y * px_per_line + x) * 2;
+            dst[idx] = (uint8_t)(r >> 8);
+            dst[idx + 1] = (uint8_t)(r & 0xFF);
+        }
+    }
+#endif
+}
+
+static inline __attribute__((always_inline)) void normalize_frame_corrected_be(
+    const uint8_t* raw, const uint16_t* calib, uint8_t* out)
 {
     uint16_t low, high;
     uint16_t raw14[PX_CNT];
@@ -1041,22 +1539,25 @@ void normalize_frame_corrected_be(const uint8_t* raw,
     }
 }
 
-static inline int txbuf_pick_free(void)
+static inline __attribute__((always_inline)) int txbuf_pick_free(void)
 {
     for (int i = 0; i < TXBUF_CNT; i++) {
-        if (tx_state[i] == TXBUF_FREE)
+        if (tx_state[i] == TXBUF_FREE) {
             return i;
+        }
     }
 
     for (int i = 0; i < TXBUF_CNT; i++) {
-        if (tx_state[i] == TXBUF_READY)
+        if (tx_state[i] == TXBUF_READY) {
             return i;
+        }
     }
 
     return -1;
 }
 
-static inline void uart_tx_dma_start(const uint8_t* buf, size_t len)
+static inline __attribute__((always_inline)) void uart_tx_dma_start(
+    const uint8_t* buf, size_t len)
 {
     dma_busy = 1;
 
@@ -1064,17 +1565,20 @@ static inline void uart_tx_dma_start(const uint8_t* buf, size_t len)
     dma_channel_set_trans_count(uart_tx_dma_chan, len, true);
 }
 
-static inline void try_start_dma(void)
+static inline __attribute__((always_inline)) void try_start_dma(void)
 {
-    if (dma_busy)
+    if (dma_busy) {
         return;
+    }
 
     int b = newest_ready;
-    if (b < 0)
+    if (b < 0) {
         return;
+    }
 
-    if (tx_state[b] != TXBUF_READY)
+    if (tx_state[b] != TXBUF_READY) {
         return;
+    }
 
     tx_state[b] = TXBUF_SENDING;
     newest_ready = -1;
@@ -1083,7 +1587,11 @@ static inline void try_start_dma(void)
     __dmb();
     dma_busy = 1;
 
-    uart_tx_dma_start(norm_buf[b], TX_PAYLOAD);
+    if (ouomode == UOM_RAW_U16) {
+        uart_tx_dma_start(norm_buf[b], TX_PAYLOAD);
+    } else if (ouomode == UOM_CALI_U8) {
+        uart_tx_dma_start(norm_buf[b], PX_CNT + 1);
+    }
 }
 
 void __isr dma_irq1_handler(void)
@@ -1098,55 +1606,110 @@ void __isr dma_irq1_handler(void)
     __sev();
 }
 
-static void fill_txbuf(int tx_idx, int raw_idx)
+static inline __attribute__((always_inline)) void fill_txbuf(int tx_idx,
+                                                             int raw_idx)
 {
-#if RAW16_MODE
-    /* RAW16 模式：复制原始数据 + 2字节包头 */
-    norm_buf[tx_idx][0] = 0xFF;
-    norm_buf[tx_idx][1] = 0xFF;
-    // memcpy(&norm_buf[tx_idx][2], rawbuf[raw_idx], RAWBUFSIZETOTAL);
-    raw16_decode_to_normbuf(rawbuf[raw_idx], norm_buf[tx_idx], PX_CNT);
-#else
-    extern const uint16_t calib[];
-    /* RAW14 模式：归一化处理 */
-    // normalize_frame_corrected_be(rawbuf[raw_idx], rawdata, norm_buf[tx_idx]);
-    binary_calib_frame(rawbuf[raw_idx], calib, norm_buf[tx_idx], PX_CNT);
-#endif
+    if (ouomode == UOM_RAW_U16) {
+        norm_buf[tx_idx][0] = 0xFF;
+        norm_buf[tx_idx][1] = 0xFF;
+        raw16_decode_to_normbuf(rawbuf[raw_idx], norm_buf[tx_idx], PX_CNT);
+    } else if (ouomode == UOM_CALI_U8) {
+        if (cmode == CM_OFF) {
+            // extern const uint16_t calib[];
+            // binary_calib_frame(rawbuf[raw_idx], calib, norm_buf[tx_idx],
+            // PX_CNT);
+            binary_calib_frame(rawbuf[raw_idx],
+                               calibg,
+                               caligain,
+                               calibadpt,
+                               norm_buf[tx_idx],
+                               PX_CNT);
+        } else if (cmode == CM_ON) {
+            if (caliidx < CALIBUF_CNT) {
+                binary_frame(rawbuf[raw_idx], calibuf[caliidx], PX_CNT);
+            }
+        }
+    }
 }
 
 static uint32_t curr_uartb;
-uint32_t baud_get2(uint8_t cmd)
+static bool flash_dm = false;
+static inline __attribute__((always_inline)) uint32_t baud_get2(uint8_t cmd)
 {
     uint32_t baud = 0;
-    ouomode = UOM_CALI_U8;
     switch (cmd) {
     case 0x11:
         baud = UBM11;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x22:
         baud = UBM22;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x33:
         baud = UBM33;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x44:
         baud = UBM44;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x55:
         baud = UBM55;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x66:
         baud = UBM66;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x77:
         baud = UBM77;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0x88:
         baud = UBM88;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = false;
         break;
     case 0xAA:
         baud = UBMAA;
         ouomode = UOM_RAW_U16;
+        cmode = CM_OFF;
+        flash_dm = false;
+        break;
+    case 0xBB:
+        baud = UBMBB;
+        ouomode = UOM_RAW_U16;
+        cmode = CM_OFF;
+        flash_dm = false;
+        break;
+    case 0xCC:
+        baud = UBMCC;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_ON;
+        flash_dm = false;
+        led_off();
+        break;
+    case 0xDD:
+        baud = UBMDD;
+        ouomode = UOM_CALI_U8;
+        cmode = CM_OFF;
+        flash_dm = true;
         break;
     default:
         break;
@@ -1154,7 +1717,7 @@ uint32_t baud_get2(uint8_t cmd)
     return baud;
 }
 
-void ouart_init(const uint8_t cmd)
+static inline __attribute__((always_inline)) void ouart_init(const uint8_t cmd)
 {
     uint32_t baud = baud_get2(cmd);
     uart_deinit(OUART);
@@ -1181,7 +1744,8 @@ void ouart_init(const uint8_t cmd)
     curr_uartb = baud;
 }
 
-void uart_poll2(uint32_t (*sel)(uint8_t))
+static inline __attribute__((always_inline)) void uart_poll2(
+    uint32_t (*sel)(uint8_t))
 {
     if (!uart_is_readable(OUART)) {
         return;
@@ -1214,7 +1778,375 @@ void uart_poll2(uint32_t (*sel)(uint8_t))
     curr_uartb = baud;
 }
 
-void core1_rawbuf_consumer(void)
+static inline __attribute__((always_inline)) uint32_t now()
+{
+    return to_ms_since_boot(get_absolute_time());
+}
+
+enum {
+    UVCBUF_FREE = 0,
+    UVCBUF_FILLING,
+    UVCBUF_READY,
+    UVCBUF_SENDING,
+};
+
+#define UVC_BUF_CNT 2
+static uint8_t uvc_buf[UVC_BUF_CNT][FRAME_SIZE];
+static volatile uint8_t uvc_state[UVC_BUF_CNT];
+static volatile int uvc_newest_ready = -1;
+static volatile int uvc_sending = -1;
+static volatile uint8_t uvc_tx_busy = 0;
+static volatile uint32_t uvc_frame_num = 0;
+static volatile uint32_t uvc_inv_ms = 1000 / FRAME_RATE;
+static enum UartOutMode uvc_ouomode_bak = UART_OUT_MODE_DEF;
+
+static inline __attribute__((always_inline)) void uvc_buf_init()
+{
+    for (int i = 0; i < UVC_BUF_CNT; ++i) {
+        uvc_state[i] = UVCBUF_FREE;
+    }
+
+    uvc_newest_ready = -1;
+    uvc_sending = -1;
+    uvc_tx_busy = 0;
+}
+
+static inline __attribute__((always_inline)) int find_free_uvc_buf(void)
+{
+    for (int i = 0; i < UVC_BUF_CNT; ++i) {
+        if (uvc_state[i] == UVCBUF_FREE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static inline __attribute__((always_inline)) int find_ready_uvc_buf(void)
+{
+    int b = uvc_newest_ready;
+    if (b >= 0 && uvc_state[b] == UVCBUF_READY) {
+        return b;
+    }
+    return -1;
+}
+
+void tud_mount_cb()
+{
+    uvc_ouomode_bak = ouomode;
+    ouomode = UOM_CALI_U8;
+    dataomode = DOM_UVC;
+}
+void tud_umount_cb()
+{
+    dataomode = DOM_UART;
+    ouomode = uvc_ouomode_bak;
+}
+void tud_resume_cb() {}
+void tud_suspend_cb(bool remote_wakeup_en) { (void)remote_wakeup_en; }
+
+static inline __attribute__((always_inline)) void fill_random_yuy2(uint8_t* buf,
+                                                                   size_t len)
+{
+    for (size_t i = 0; i < len; i += 4) {
+        uint8_t y0 = rand() & 0xff;
+        uint8_t y1 = rand() & 0xff;
+        uint8_t u = 128 + (rand() % 32 - 16);
+        uint8_t v = 128 + (rand() % 32 - 16);
+
+        buf[i + 0] = y0;
+        buf[i + 1] = u;
+        buf[i + 2] = y1;
+        buf[i + 3] = v;
+    }
+}
+
+static inline __attribute__((always_inline)) void fill_smpte_yuy2(uint8_t* buf,
+                                                                  size_t len)
+{
+    extern const uint8_t frame_FF0000[];
+    extern const uint8_t frame_00FF00[];
+    extern const uint8_t frame_0000FF[];
+    extern const uint8_t frame_FFFFFF[];
+    static uint8_t sel = 0;
+
+    switch (sel) {
+    case 0x01:
+        memcpy(buf, frame_FF0000, len);
+        break;
+    case 0x02:
+        memcpy(buf, frame_00FF00, len);
+        break;
+    case 0x03:
+        memcpy(buf, frame_0000FF, len);
+        break;
+    default:
+        sel = 0;
+        memcpy(buf, frame_FFFFFF, len);
+        break;
+    }
+    sel++;
+}
+
+static inline __attribute__((always_inline)) void fill_uvc_frame(
+    const uint8_t* pixbuf, const uint8_t* cmap, uint8_t* buf, size_t len)
+{
+    if (!pixbuf || !cmap || !buf || len < 4) {
+        return;
+    }
+
+    const uint8_t* src = pixbuf + 1;
+    size_t out_idx = 0;
+
+    while (out_idx + 3 < len) {
+        uint8_t g0 = *src++;
+        uint8_t g1 = *src++;
+
+        uint8_t r0 = cmap[g0 * 3 + 0];
+        uint8_t g0c = cmap[g0 * 3 + 1];
+        uint8_t b0 = cmap[g0 * 3 + 2];
+
+        uint8_t r1 = cmap[g1 * 3 + 0];
+        uint8_t g1c = cmap[g1 * 3 + 1];
+        uint8_t b1 = cmap[g1 * 3 + 2];
+
+        uint8_t y0 =
+            (uint8_t)(((66 * r0 + 129 * g0c + 25 * b0 + 128) >> 8) + 16);
+        uint8_t y1 =
+            (uint8_t)(((66 * r1 + 129 * g1c + 25 * b1 + 128) >> 8) + 16);
+
+        uint8_t u = (uint8_t)(((-38 * r0 - 74 * g0c + 112 * b0 + -38 * r1
+                                - 74 * g1c + 112 * b1 + 256)
+                               >> 8)
+                              + 128);
+        uint8_t v = (uint8_t)(((112 * r0 - 94 * g0c - 18 * b0 + 112 * r1
+                                - 94 * g1c - 18 * b1 + 256)
+                               >> 8)
+                              + 128);
+
+        buf[out_idx++] = y0;
+        buf[out_idx++] = u;
+        buf[out_idx++] = y1;
+        buf[out_idx++] = v;
+    }
+}
+
+void tud_video_frame_xfer_complete_cb(uint_fast8_t ctl_idx,
+                                      uint_fast8_t stm_idx)
+{
+    (void)ctl_idx;
+    (void)stm_idx;
+#if 0
+    uvc_tx_busy = 0;
+    ++uvc_frame_num;
+#else
+    int b = uvc_sending;
+    if (b >= 0) {
+        uvc_state[b] = UVCBUF_FREE;
+        uvc_sending = -1;
+    }
+
+    __dmb();
+    uvc_tx_busy = 0;
+    ++uvc_frame_num;
+
+    __sev();
+#endif
+}
+
+int tud_video_commit_cb(uint_fast8_t ctl_idx,
+                        uint_fast8_t stm_idx,
+                        video_probe_and_commit_control_t const* parameters)
+{
+    (void)ctl_idx;
+    (void)stm_idx;
+    uvc_inv_ms = parameters->dwFrameInterval / 10000;
+    return VIDEO_ERROR_NONE;
+}
+
+static inline __attribute__((always_inline)) void uvc_init() { tusb_init(); }
+
+static inline __attribute__((always_inline)) void fake_uvc_fill(uint8_t* buf,
+                                                                size_t size)
+{
+    int b = newest_ready;
+    if (b < 0) {
+        return;
+    }
+
+    if (tx_state[b] != TXBUF_READY) {
+        return;
+    }
+
+    tx_state[b] = TXBUF_SENDING;
+    newest_ready = -1;
+    sending = b;
+
+    __dmb();
+
+    fill_random_yuy2(buf, size);
+
+    b = sending;
+    tx_state[b] = TXBUF_FREE;
+    __dmb();
+    sending = -1;
+    __sev();
+}
+
+static inline __attribute__((always_inline)) void smpte_uvc_fill(uint8_t* buf,
+                                                                 size_t size)
+{
+    int b = newest_ready;
+    if (b < 0) {
+        return;
+    }
+
+    if (tx_state[b] != TXBUF_READY) {
+        return;
+    }
+
+    tx_state[b] = TXBUF_SENDING;
+    newest_ready = -1;
+    sending = b;
+
+    __dmb();
+
+    fill_smpte_yuy2(buf, size);
+
+    b = sending;
+    tx_state[b] = TXBUF_FREE;
+    __dmb();
+    sending = -1;
+    __sev();
+}
+
+static inline __attribute__((always_inline)) void uvc_fill(uint8_t* buf,
+                                                           size_t size)
+{
+    int b = newest_ready;
+    if (b < 0) {
+        return;
+    }
+
+    if (tx_state[b] != TXBUF_READY) {
+        return;
+    }
+
+    tx_state[b] = TXBUF_SENDING;
+    newest_ready = -1;
+    sending = b;
+
+    __dmb();
+
+    fill_uvc_frame(norm_buf[b], colormap_hot, buf, size);
+
+    b = sending;
+    tx_state[b] = TXBUF_FREE;
+    __dmb();
+    sending = -1;
+    __sev();
+}
+
+static inline __attribute__((always_inline)) void uvc_prepare_next(void)
+{
+    int src = newest_ready;
+    if (src < 0) {
+        return;
+    }
+
+    if (tx_state[src] != TXBUF_READY) {
+        return;
+    }
+
+    int b = find_free_uvc_buf();
+    if (b < 0) {
+        return;
+    }
+
+    tx_state[src] = TXBUF_SENDING;
+    newest_ready = -1;
+
+    uvc_state[b] = UVCBUF_FILLING;
+    __dmb();
+
+    fill_uvc_frame(norm_buf[src], colormap_hot, uvc_buf[b], FRAME_SIZE);
+
+    __dmb();
+    uvc_state[b] = UVCBUF_READY;
+    uvc_newest_ready = b;
+
+    tx_state[src] = TXBUF_FREE;
+    __dmb();
+
+    __sev();
+}
+
+#if 0
+uint32_t uvc_task(void (*fill)(uint8_t*, size_t))
+{
+    static uint8_t frame_buffer[FRAME_SIZE];
+    static uint32_t start_ms = 0;
+    static uint32_t already_sent = 0;
+
+    if (fill == nullptr) {
+        return UINT32_MAX;
+    }
+
+    if (!tud_video_n_streaming(0, 0)) {
+        already_sent = 0;
+        uvc_frame_num = 0;
+        return UINT32_MAX;
+    }
+
+    if (!already_sent) {
+        already_sent = 1;
+        uvc_tx_busy = 1;
+        start_ms = now();
+        fill(frame_buffer, FRAME_SIZE);
+        tud_video_n_frame_xfer(0, 0, (void*)frame_buffer, FRAME_SIZE);
+    }
+
+    uint32_t cur = now();
+    if (cur - start_ms < uvc_inv_ms || uvc_tx_busy) {
+        return UINT32_MAX;
+    }
+    start_ms += uvc_inv_ms;
+    uvc_tx_busy = 1;
+    fill(frame_buffer, FRAME_SIZE);
+    tud_video_n_frame_xfer(0, 0, (void*)frame_buffer, FRAME_SIZE);
+
+    return now() - cur;
+}
+#else
+static inline __attribute__((always_inline)) uint32_t uvc_task(void)
+{
+    if (!tud_video_n_streaming(0, 0)) {
+        return UINT32_MAX;
+    }
+
+    if (uvc_tx_busy) {
+        return UINT32_MAX;
+    }
+
+    int b = find_ready_uvc_buf();
+    if (b < 0) {
+        return UINT32_MAX;
+    }
+
+    uvc_state[b] = UVCBUF_SENDING;
+    uvc_sending = b;
+    uvc_newest_ready = -1;
+
+    __dmb();
+    uvc_tx_busy = 1;
+
+    tud_video_n_frame_xfer(0, 0, uvc_buf[b], FRAME_SIZE);
+
+    return 0;
+}
+
+#endif
+
+void core1_rawbuf_consumer()
 {
     int idx;
     for (int i = 0; i < TXBUF_CNT; i++) {
@@ -1224,18 +2156,58 @@ void core1_rawbuf_consumer(void)
     newest_ready = -1;
     sending = -1;
     dma_busy = 0;
+    struct GpioBtn boot;
+    boot.gpio = 0;
+    boot.event = 0;
+    boot.last_change_ms = 0;
+    boot.last_level = 1;
+    boot.stable_level = 1;
+    boot.press_ms = 0;
+    gpio_init(boot.gpio);
+    gpio_set_dir(boot.gpio, GPIO_IN);
+    gpio_set_pulls(boot.gpio, true, false);
 
     println("Core1 consumer start");
+    uvc_init();
+    // button_init();
     flash_safe_execute_core_init();
 
     ouart_init(UART_BAUD_MODE_DEF);
     dma_busy = 0;
     buf_idx = 0;
 
-    extern const uint8_t rawdata[];
+#if CORE1_TIMEU_MODE == 1
+#    define TIMEU_MAX_CNT 10
+    const uint8_t timeu_max_cnt = TIMEU_MAX_CNT;
+    uint8_t timeu_upoll_cnt = 0;
+    uint8_t timeu_utask_cnt = 0;
+    uint8_t timeu_vtask_cnt = 0;
+    uint8_t timeu_bscan_cnt = 0;
+    uint8_t timeu_upoll[TIMEU_MAX_CNT];
+    uint8_t timeu_utask[TIMEU_MAX_CNT];
+    uint8_t timeu_vtask[TIMEU_MAX_CNT];
+    uint8_t timeu_bscan[TIMEU_MAX_CNT];
+    memset(timeu_upoll, 0x00, TIMEU_MAX_CNT);
+    memset(timeu_utask, 0x00, TIMEU_MAX_CNT);
+    memset(timeu_vtask, 0x00, TIMEU_MAX_CNT);
+    memset(timeu_bscan, 0x00, TIMEU_MAX_CNT);
+#    undef TIMEU_MAX_CNT
+#endif
 
     while (true) {
+#if CORE1_TIMEU_MODE == 1
+        uint32_t upoll_lt = now();
+#endif
         uart_poll2(baud_get2);
+#if CORE1_TIMEU_MODE == 1
+        uint32_t upoll_dt = now() - upoll_lt;
+        if (timeu_upoll_cnt < timeu_max_cnt && uvc_frame_num >= 2) {
+            timeu_upoll[timeu_upoll_cnt++] = (uint8_t)upoll_dt;
+        }
+#endif
+        if (flash_dm) {
+            goto dump_start;
+        }
         bool did_work = false;
 
         idx = rawbuf_pick_ready();
@@ -1260,80 +2232,149 @@ void core1_rawbuf_consumer(void)
             did_work = true;
         }
 
-        try_start_dma();
+#if CORE1_TIMEU_MODE == 1
+        uint32_t utask_lt = now();
+#endif
+        if (dataomode == DOM_UVC) {
+            uvc_prepare_next();
+        }
+        tud_task();
+#if CORE1_TIMEU_MODE == 1
+        uint32_t utask_dt = now() - utask_lt;
+        if (timeu_utask_cnt < timeu_max_cnt && uvc_frame_num >= 2) {
+            timeu_utask[timeu_utask_cnt++] = (uint8_t)utask_dt;
+        }
+#endif
 
-        if (!did_work)
+        if (dataomode == DOM_UART) {
+            if (cmode == CM_OFF) {
+                try_start_dma();
+            } else if (cmode == CM_ON) {
+                if (caliidx < CALIBUF_CNT) {
+                    button_scan(&boot);
+                    uint8_t boot_ev = boot.event;
+                    if (boot_ev) {
+                        boot.event = 0;
+                        if (boot_ev & GB_EV_RELEASE) {
+                            caliidx++;
+                            led_toggle();
+                        }
+                    }
+                } else {
+                    goto cali_start;
+                }
+            }
+        } else if (dataomode == DOM_UVC) {
+#if 0
+            uint32_t vut = uvc_task(uvc_fill);
+            // uvc_task(smpte_uvc_fill);
+#else
+            uvc_task();
+#endif
+#if CORE1_TIMEU_MODE == 1
+            if (vut != UINT32_MAX) {
+                uint32_t vtask_dt = vut;
+                if (timeu_vtask_cnt < timeu_max_cnt && uvc_frame_num >= 2) {
+                    timeu_vtask[timeu_vtask_cnt++] = (uint8_t)vtask_dt;
+                }
+            }
+#endif
+
+#if CORE1_TIMEU_MODE == 1
+            uint32_t bscan_lt = now();
+#endif
+            button_scan(&boot);
+            uint8_t boot_ev = boot.event;
+            if (boot_ev) {
+                boot.event = 0;
+                if (boot_ev & GB_EV_RELEASE) {
+                    led_toggle();
+                    // TODO: cmap sw
+                }
+            }
+#if CORE1_TIMEU_MODE == 1
+            uint32_t bscan_dt = now() - bscan_lt;
+            if (timeu_bscan_cnt < timeu_max_cnt && uvc_frame_num >= 2) {
+                timeu_bscan[timeu_bscan_cnt++] = (uint8_t)bscan_dt;
+            }
+#endif
+        }
+
+        if (!did_work) {
             __wfe();
+        }
+
+#if CORE1_TIMEU_MODE == 1
+        if (timeu_upoll_cnt == timeu_max_cnt) {
+            uint32_t total = 0;
+            for (uint8_t i = 0; i < timeu_upoll_cnt; ++i) {
+                total += timeu_upoll[i];
+            }
+            float avg = total / (float)timeu_upoll_cnt;
+            println("upoll: %0.2f", avg);
+            timeu_upoll_cnt = 0xFF;
+        }
+        if (timeu_utask_cnt == timeu_max_cnt) {
+            uint32_t total = 0;
+            for (uint8_t i = 0; i < timeu_utask_cnt; ++i) {
+                total += timeu_utask[i];
+            }
+            float avg = total / (float)timeu_utask_cnt;
+            println("utask: %0.2f", avg);
+            timeu_utask_cnt = 0xFF;
+        }
+        if (timeu_vtask_cnt == timeu_max_cnt) {
+            uint32_t total = 0;
+            for (uint8_t i = 0; i < timeu_vtask_cnt; ++i) {
+                total += timeu_vtask[i];
+            }
+            float avg = total / (float)timeu_vtask_cnt;
+            println("vtask: %0.2f", avg);
+            timeu_vtask_cnt = 0xFF;
+        }
+        if (timeu_bscan_cnt == timeu_max_cnt) {
+            uint32_t total = 0;
+            for (uint8_t i = 0; i < timeu_bscan_cnt; ++i) {
+                total += timeu_bscan[i];
+            }
+            float avg = total / (float)timeu_bscan_cnt;
+            println("bscan: %0.2f", avg);
+            timeu_bscan_cnt = 0xFF;
+        }
+#endif
+    }
+
+cali_start:
+    if (start_cali()) {
+        led_on_succ(CALI_LED_T_NUM);
+    } else {
+        led_on_failed(CALI_LED_T_NUM);
+    }
+    goto core1_restart;
+
+dump_start:
+    if (dump_cli()) {
+        led_on_succ(CALI_LED_T_NUM);
+    } else {
+        led_on_failed(CALI_LED_T_NUM);
+    }
+
+    goto core1_restart;
+
+core1_restart:
+    watchdog_reboot(0, 0, 0);
+    while (true) {
+        tight_loop_contents();
     }
 }
 
-static inline void uart_tx_dma_wait_done(void)
+static inline __attribute__((always_inline)) void uart_tx_dma_wait_done()
 {
     dma_channel_wait_for_finish_blocking(uart_tx_dma_chan);
     dma_busy = 0;
 }
 
-#if RAW_OUT_MODE == 1
-void core1_rawbuf_consumer2(void)
-{
-    // uint32_t cnt = 0;
-    int idx;
-
-    println("Core1 consumer start");
-    uart_deinit(OUART);
-    gpio_set_function(IO_OTX, GPIO_FUNC_UART);
-    gpio_set_function(IO_ORX, GPIO_FUNC_UART);
-    uart_init(OUART, 5000000);
-    uart_set_hw_flow(OUART, false, false);
-    uart_set_format(OUART, 8, 1, UART_PARITY_NONE);
-
-    dma_channel_config c;
-
-    uart_tx_dma_chan = dma_claim_unused_channel(true);
-
-    c = dma_channel_get_default_config(uart_tx_dma_chan);
-
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, uart_get_dreq(OUART, true));
-
-    dma_channel_configure(
-        uart_tx_dma_chan, &c, &uart_get_hw(OUART)->dr, nullptr, 0, false);
-
-    dma_busy = 0;
-    buf_idx = 0;
-
-    while (true) {
-        while ((idx = rawbuf_pick_ready()) < 0) {
-            __wfe();
-        }
-
-        // cnt++;
-        // println("%llu %llu", (uint64_t)cnt, (uint64_t)idx);
-        __dmb();
-        rawbuf_state[idx] = RAWBUF_READING;
-
-        // println("========");
-        // dump_buf_8bytes(rawbuf[idx], RAWBUFSIZE);
-
-        if (dma_busy) {
-            uart_tx_dma_wait_done();
-        }
-        normalize_frame_be(rawbuf[idx], norm_buf[buf_idx]);
-        uart_tx_dma_start(norm_buf[tx_buf_idx], TX_PAYLOAD);
-
-        __dmb();
-        rawbuf_state[idx] = RAWBUF_FREE;
-        __sev();
-        buf_idx ^= 1;
-    }
-}
-#endif
-
-#define SHUTTER_ENABLE 1
-
-void shutter_on()
+static inline __attribute__((always_inline)) void shutter_on()
 {
 #if SHUTTER_ENABLE == 1
     gpio_put(IO_SVMS, 1);
@@ -1348,7 +2389,7 @@ void shutter_on()
 #endif
 }
 
-void shutter_off()
+static inline __attribute__((always_inline)) void shutter_off()
 {
 #if SHUTTER_ENABLE == 1
     gpio_put(IO_SVMS, 1);
@@ -1363,65 +2404,8 @@ void shutter_off()
 #endif
 }
 
-uint16_t adc_read_median()
-{
-#define ADC_SAMPLES 5
-    uint16_t v[ADC_SAMPLES];
-
-    for (int i = 0; i < ADC_SAMPLES; i++) {
-        v[i] = adc_read();
-    }
-
-    for (int i = 0; i < ADC_SAMPLES - 1; i++) {
-        for (int j = i + 1; j < ADC_SAMPLES; j++) {
-            if (v[j] < v[i]) {
-                uint16_t t = v[i];
-                v[i] = v[j];
-                v[j] = t;
-            }
-        }
-    }
-
-    return v[ADC_SAMPLES / 2];
-#if defined(ADC_SAMPLES)
-#    undef ADC_SAMPLES
-#endif
-}
-
-uint16_t adc_read_trimmed_mean()
-{
-#define ADC_SAMPLES 8
-    uint16_t v[ADC_SAMPLES];
-    uint32_t sum = 0;
-
-    for (int i = 0; i < ADC_SAMPLES; i++) {
-        v[i] = adc_read();
-        sleep_us(5);
-    }
-
-    for (int i = 0; i < ADC_SAMPLES - 1; i++) {
-        for (int j = i + 1; j < ADC_SAMPLES; j++) {
-            if (v[j] < v[i]) {
-                uint16_t t = v[i];
-                v[i] = v[j];
-                v[j] = t;
-            }
-        }
-    }
-
-    for (int i = 1; i < ADC_SAMPLES - 1; i++) {
-        sum += v[i];
-    }
-
-    return (uint16_t)(sum / (ADC_SAMPLES - 2));
-
-#if defined(ADC_SAMPLES)
-#    undef ADC_SAMPLES
-#endif
-}
-
-uint16_t adc_read_trimmed_mean_from_buf(const uint16_t* data,
-                                        const uint32_t size)
+static inline __attribute__((always_inline)) uint16_t
+adc_read_trimmed_mean_from_buf(const uint16_t* data, const uint32_t size)
 {
     uint32_t sum = 0;
     uint16_t min = 0xffff;
@@ -1436,39 +2420,18 @@ uint16_t adc_read_trimmed_mean_from_buf(const uint16_t* data,
 
         sum += v;
 
-        if (v < min)
+        if (v < min) {
             min = v;
-        if (v > max)
+        }
+        if (v > max) {
             max = v;
+        }
     }
 
     sum -= min;
     sum -= max;
 
     return (uint16_t)(sum / (size - 2));
-}
-
-uint16_t raw16_line_vtemp_avg(const uint8_t* line)
-{
-    const uint8_t* p;
-    uint16_t v0, v1;
-
-    p = line + SENSOR_W * 2 + 4;
-
-    v0 = gray14_to_bin(be16_to_u14(&p[0]));
-    v1 = gray14_to_bin(be16_to_u14(&p[2]));
-
-    return (uint16_t)(((uint32_t)v0 + v1) >> 1);
-}
-
-uint16_t raw16_vtemp_avg(const uint8_t* line)
-{
-    uint16_t v0, v1;
-
-    v0 = gray14_to_bin(be16_to_u14(&line[0]));
-    v1 = gray14_to_bin(be16_to_u14(&line[2]));
-
-    return (uint16_t)(((uint32_t)v0 + v1) >> 1);
 }
 
 int spi_init_40MHz4()
@@ -1480,6 +2443,11 @@ int spi_init_40MHz4()
                     CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
                     160 * MHZ,
                     160 * MHZ);
+    clock_configure(clk_usb,
+                    0,
+                    CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                    48 * MHZ,
+                    48 * MHZ);
     clock_configure(clk_adc,
                     0,
                     CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
@@ -1487,18 +2455,21 @@ int spi_init_40MHz4()
                     48 * MHZ);
     extern void dutx_init();
     dutx_init();
+    pico_get_unique_board_id_string(uid, UID_LEN);
+    flash_safe_execute_core_init();
 
     println("MODE: %s", __PRETTY_FUNCTION__);
     println("==========start==========");
-    gpio_init(IO_LED);
-    gpio_set_dir(IO_LED, true);
-    gpio_put(IO_LED, 0);
+    led_init();
 
-#if RAW16_MODE == 1
-#    define ADC_SAMPLES 1800
-#else
-#    define ADC_SAMPLES 1
-#endif
+    if (flash_header->has_data == FLASH_HAS_DATA_F) {
+        calibg = flash_imgbg;
+        // FIXME:
+        caligain = flash_gain;
+        calibadpt = flash_badpt;
+    }
+
+#define ADC_SAMPLES 1280
     const uint32_t adcsamp = ADC_SAMPLES;
     uint16_t adcbuf[ADC_SAMPLES];
 #undef ADC_SAMPLES
@@ -1536,10 +2507,7 @@ int spi_init_40MHz4()
     gpio_put(IO_SVMS, 0);
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 0);
-#if RAW16_MODE
     bool shutter_is_on = false;
-    static uint8_t vtemps[SENSOR_H][4] = {0};
-#endif
 
     extern uint spi1clk;
     spi1clk = 45000000;
@@ -1595,14 +2563,12 @@ int spi_init_40MHz4()
                         goto next_rx;
                     }
 
-                    adc_run(true);
-                    dma_channel_start(adcdch);
+                    if (ouomode == UOM_RAW_U16) {
+                        adc_run(true);
+                        dma_channel_start(adcdch);
+                    }
 
                     rawbuf_copy_line(cur_buf, lidx, &b->data[14], SENSOR_W * 2);
-#if RAW16_MODE == 1
-                    // vtemps[lidx] = raw16_line_vtemp_avg(&b->data[14]);
-                    memcpy(vtemps[lidx], &b->data[14 + SENSOR_W * 2 + 4], 4);
-#endif
                     lidx++;
 #if TEST_MAX_CNT != TEST_MAX_CNT_MAX
                     headpos[headcnt++] = cnt;
@@ -1616,11 +2582,6 @@ int spi_init_40MHz4()
                     }
 
                     rawbuf_copy_line(cur_buf, lidx, &b->data[14], SENSOR_W * 2);
-#if RAW16_MODE == 1
-                    // vtemps[lidx] = raw16_line_vtemp_avg(&b->data[14]);
-                    memcpy(vtemps[lidx], &b->data[14 + SENSOR_W * 2 + 4], 4);
-#endif
-
                     lidx++;
 #if TEST_MAX_CNT != TEST_MAX_CNT_MAX
                     bodycnt++;
@@ -1635,84 +2596,40 @@ int spi_init_40MHz4()
 #if RAW_OUT_MODE == 1
                     dump_buf_8bytes(rawbuf[cur_buf], RAWBUFSIZE);
 #endif
-                    dma_channel_wait_for_finish_blocking(adcdch);
-                    adc_run(false);
-                    dma_channel_configure(adcdch,
-                                          &adcdcfg,
-                                          adcbuf,
-                                          &adc_hw->fifo,
-                                          adcsamp,
-                                          false);
-#if RAW16_MODE == 1
-                    // uint16_t ntc = adc_read();
-                    // uint16_t ntc = adc_read_median();
-                    // uint16_t ntc = adc_read_trimmed_mean();
-                    if (shutter_is_on) {
-                        uint16_t ntc =
-                            adc_read_trimmed_mean_from_buf(adcbuf, adcsamp);
-                        rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
-                            (uint8_t)((ntc >> 8) & 0xFF);
-                        rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] =
-                            (uint8_t)(ntc & 0xFF);
-                        shutter_off();
-                        shutter_is_on = false;
-                    } else {
-                        rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
-                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] = 0x00;
-                        shutter_on();
-                        shutter_is_on = true;
-                    }
-                    // gpio_put(IO_LED, !gpio_get(IO_LED));
 
-                    {
-                        uint16_t vtemp1 = raw16_vtemp_avg(vtemps[0]);
-                        // uint16_t vtemp2 = raw16_vtemp_avg(vtemps[1]);
-                        // uint32_t vtemp_total = vtemp1;
-                        // vtemp_total += vtemp2;
-                        // uint32_t vtemp_avg = vtemp_total / 2;
-                        // float vtemp = 25.0f + (float)(vtemp_avg - 8192)
-                        // / 70.0f;
-                        float vtemp = 25.0f + (float)(vtemp1 - 8192) / 70.0f;
-                        println(" %0.4f", vtemp);
+                    while (multicore_fifo_rvalid()) {
+                        uint32_t cmd = multicore_fifo_pop_blocking();
+                        if (cmd == CORE0_EV0) {
+                            multicore_fifo_push_blocking(CORE1_EV0);
+                            goto core0_stop;
+                        }
                     }
 
-                    // uint64_t vtemp_total = 0;
-                    // bool vtemps_chk = true;
-                    // for (uint32_t i = 0; i < SENSOR_H / 2; ++i) {
-                    //     uint16_t vtemp_u16 = raw16_vtemp_avg(vtemps[i]);
-                    //     if (vtemp_u16 == 0) {
-                    //         vtemps_chk = false;
-                    //         break;
-                    //     }
-                    //     vtemp_total += vtemp_u16;
-                    // }
-                    // if (vtemps_chk) {
-                    //     uint64_t vtemp_avg = vtemp_total / (SENSOR_H / 2);
-                    //     float vtemp = 25.0f + (float)(vtemp_avg - 8192)
-                    //     / 70.0f; println("%0.4f", vtemp);
-                    // } else {
-                    //     println("chkf");
-                    // }
-                    // memset(vtemps, 0x00, SENSOR_H * 4);
-
-                    // bool vtemps_chk = true;
-                    // uint64_t vtemp_total = 0;
-                    // for (uint32_t i = 0; i < SENSOR_H; ++i) {
-                    //     if (vtemps[i] == 0) {
-                    //         vtemps_chk = false;
-                    //         break;
-                    //     }
-                    //     vtemps_chk += vtemps[i];
-                    // }
-                    // if (vtemps_chk) {
-                    //     uint64_t vtemp_avg = vtemp_total / SENSOR_H;
-                    //     float vtemp = 25.0f + (float)(vtemp_avg - 8192)
-                    //     / 70.0f; println("%0.4f", vtemp);
-                    // } else {
-                    //     println("chkf");
-                    // }
-                    // memset(vtemps, 0x00, SENSOR_H * sizeof(uint16_t));
-#endif
+                    if (ouomode == UOM_RAW_U16) {
+                        dma_channel_wait_for_finish_blocking(adcdch);
+                        adc_run(false);
+                        dma_channel_configure(adcdch,
+                                              &adcdcfg,
+                                              adcbuf,
+                                              &adc_hw->fifo,
+                                              adcsamp,
+                                              false);
+                        if (shutter_is_on) {
+                            uint16_t ntc =
+                                adc_read_trimmed_mean_from_buf(adcbuf, adcsamp);
+                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
+                                (uint8_t)((ntc >> 8) & 0xFF);
+                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] =
+                                (uint8_t)(ntc & 0xFF);
+                            shutter_off();
+                            shutter_is_on = false;
+                        } else {
+                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
+                                rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] = 0x00;
+                            shutter_on();
+                            shutter_is_on = true;
+                        }
+                    }
                     if (cur_buf >= 0) {
                         __dmb();
                         rawbuf_state[cur_buf] = RAWBUF_READY;
@@ -1776,11 +2693,16 @@ int spi_init_40MHz4()
 #endif
 
     errh(nullptr);
+core0_stop:
+    while (true) {
+        tight_loop_contents();
+    }
     return 0;
 }
 
 int sclk_io()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SCLK_IO
     gpio_init(IO_SCLK);
     gpio_set_dir(IO_SCLK, true);
     gpio_init(IO_LED);
@@ -1795,10 +2717,13 @@ int sclk_io()
         sleep_ms(500);
         tight_loop_contents();
     }
+#endif
 
+    errh(nullptr);
     return 0;
 }
 
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BAUD_SEL
 void uart_swb(uint32_t baud)
 {
     if (baud == curr_uartb || baud == 0) {
@@ -1850,9 +2775,11 @@ uint32_t baud_get(uint8_t cmd)
     };
     return baud;
 }
+#endif
 
 int baud_sel()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BAUD_SEL
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -1882,6 +2809,7 @@ int baud_sel()
         uart_write_blocking(OUART, (const uint8_t*)string, strlen(string));
         sleep_ms(1000);
     }
+#endif
 
     errh(nullptr);
     return 0;
@@ -1889,6 +2817,7 @@ int baud_sel()
 
 int adc_func()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_ADC
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -1913,6 +2842,7 @@ int adc_func()
         gpio_put(IO_LED, !gpio_get(IO_LED));
         sleep_ms(1000);
     }
+#endif
 
     errh(nullptr);
     return 0;
@@ -1920,6 +2850,7 @@ int adc_func()
 
 int shutter_func()
 {
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_SHUTTER
     set_sys_clock_khz(160000, true);
     sleep_ms(10);
     clock_configure(clk_peri,
@@ -1957,11 +2888,13 @@ int shutter_func()
     while (true) {
         sleep_ms(1000);
     }
+#endif
 
     errh(nullptr);
     return 0;
 }
 
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_FLASH
 void __not_in_flash_func(call_flash_range_erase)(void* param)
 {
     uint32_t offset = (uint32_t)param;
@@ -1976,6 +2909,85 @@ void __not_in_flash_func(call_flash_range_program)(void* param)
 
     flash_range_program(offset, data, FLASH_PAGE_SIZE);
 }
+
+void __not_in_flash_func(__flash_write__)(void* param)
+{
+    const struct FlashOpInfo* opinfo = (const struct FlashOpInfo*)param;
+    if (opinfo == nullptr) {
+        return;
+    }
+    uint32_t ofs = FLASH_TARGET_OFFSET + opinfo->ofs;
+    flash_range_erase(ofs, opinfo->size);
+    flash_range_program(ofs, opinfo->data, opinfo->size);
+}
+
+bool flash_write(const struct FlashOpInfo* flashop)
+{
+    static uint8_t buffer[FLASH_SECTOR_SIZE];
+    int rc = -1;
+    const uint32_t fsector = flashop->size / FLASH_SECTOR_SIZE;
+    const uint32_t lsector = flashop->size % FLASH_SECTOR_SIZE;
+    const uint8_t* data = flash_target_contents + flashop->ofs;
+
+    for (uint32_t i = 0; i < fsector; ++i) {
+        println("flash #%llu...", (uint64_t)i);
+        memcpy(
+            buffer, flashop->data + i * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
+        for (uint32_t i = 0; i < FLASH_SECTOR_SIZE; ++i) {
+            if (buffer[i] != 0x34) {
+                println("[%llu] = %02x", (uint64_t)i, buffer[i]);
+            }
+        }
+        struct FlashOpInfo op;
+        op.ofs = flashop->ofs + i * FLASH_SECTOR_SIZE;
+        op.data = buffer;
+        op.size = FLASH_SECTOR_SIZE;
+        rc = flash_safe_execute(__flash_write__, (void*)&op, 500);
+        if (rc != PICO_OK) {
+            eprintln("flash failed, rc = %d", rc);
+            return false;
+        }
+        const uint8_t* flashdata = data + i * FLASH_SECTOR_SIZE;
+        for (uint32_t j = 0; j < FLASH_SECTOR_SIZE; ++j) {
+            if (flashdata[j] != buffer[j]) {
+                eprintln("flash check failed in %llu %02x != %02x",
+                         (uint64_t)j,
+                         flashdata[j],
+                         buffer[j]);
+                return false;
+            }
+        }
+    }
+
+    if (lsector != 0) {
+        println("flash lsector %llu bytes", (uint64_t)lsector);
+        memset(buffer, 0xFF, FLASH_SECTOR_SIZE);
+        memcpy(buffer, flashop->data + fsector * FLASH_SECTOR_SIZE, lsector);
+        struct FlashOpInfo op;
+        op.ofs = flashop->ofs + fsector * FLASH_SECTOR_SIZE;
+        op.data = buffer;
+        op.size = FLASH_SECTOR_SIZE;
+        rc = flash_safe_execute(__flash_write__, (void*)&op, 500);
+        if (rc != PICO_OK) {
+            eprintln("flash failed, rc = %d", rc);
+            return false;
+        }
+        const uint8_t* flashdata = data + fsector * FLASH_SECTOR_SIZE;
+        for (uint32_t j = 0; j < FLASH_SECTOR_SIZE; ++j) {
+            if (flashdata[j] != buffer[j]) {
+                eprintln("flash check failed in %llu %02x != %02x",
+                         (uint64_t)j,
+                         flashdata[j],
+                         buffer[j]);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+#endif
 
 int flash_func()
 {
@@ -1997,7 +3009,11 @@ int flash_func()
     flash_safe_execute_core_init();
 
     multicore_launch_core1(core1_rawbuf_consumer);
+    sleep_ms(50);
 
+    println("%d", __LINE__);
+
+#    if 0
     println("read");
     dump_buf_8bytes(flash_target_contents, FLASH_PAGE_SIZE);
     println("done");
@@ -2051,11 +3067,176 @@ int flash_func()
     } else {
         println("program succ");
     }
+#    else
+
+#        define FLASH_TEST_DATA_SIZE 81920
+    // uint8_t random_data[FLASH_TEST_DATA_SIZE];
+    uint8_t* random_data = malloc(FLASH_TEST_DATA_SIZE);
+    const uint8_t value = 0x34;
+    for (uint32_t i = 0; i < FLASH_TEST_DATA_SIZE; ++i) {
+        // random_data[i] = (uint8_t)(rand() >> 8);
+        random_data[i] = value;
+    }
+    struct FlashOpInfo testflashop;
+    testflashop.ofs = 0x00;
+    testflashop.data = random_data;
+    testflashop.size = FLASH_TEST_DATA_SIZE;
+    if (flash_write(&testflashop)) {
+        println("flash succ");
+    } else {
+        eprintln("flash failed");
+    }
+    free(random_data);
+
+    // const uint8_t* flashdata = flash_target_contents + testflashop.ofs;
+    // for (uint32_t i = 0; i < FLASH_TEST_DATA_SIZE; ++i) {
+    //     if (flashdata[i] != value) {
+    //         eprintln("failed in %llu", (uint64_t)i);
+    //         dump_buf_8bytes(&flashdata[i], 8);
+    //         break;
+    //     }
+    // }
+
+#    endif
 
     while (true) {
         sleep_ms(1000);
         gpio_put(IO_LED, !gpio_get(IO_LED));
     }
+#endif
+
+    errh(nullptr);
+    return 0;
+}
+
+int gpio0_func()
+{
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_GPIO0
+    set_sys_clock_khz(160000, true);
+    sleep_ms(10);
+    clock_configure(clk_peri,
+                    0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    160 * MHZ,
+                    160 * MHZ);
+    extern void dutx_init();
+    dutx_init();
+
+    println("MODE: %s", __PRETTY_FUNCTION__);
+    println("==========start==========");
+    gpio_init(IO_LED);
+    gpio_set_dir(IO_LED, true);
+    gpio_put(IO_LED, 1);
+
+    gpio_init(IO_PLED);
+    gpio_set_dir(IO_PLED, true);
+    gpio_put(IO_PLED, 1);
+
+    gpio_init(IO_BTN);
+    gpio_set_dir(IO_BTN, false);
+    gpio_pull_up(IO_BTN);
+    // gpio_disable_pulls(IO_BTN);
+
+    uint8_t cnt = 0;
+    while (true) {
+        bool value = gpio_get(IO_BTN);
+        gpio_put(IO_LED, value);
+        gpio_put(IO_PLED, value);
+        tight_loop_contents();
+        sleep_ms(100);
+        cnt++;
+        if (cnt >= 10) {
+            println("GPIO0: %d", value);
+            cnt = 0;
+        }
+    }
+#endif
+
+    errh(nullptr);
+    return 0;
+}
+
+int uvc_max_func()
+{
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_UVC_MAX
+    set_sys_clock_khz(160000, true);
+    sleep_ms(10);
+    clock_configure(clk_peri,
+                    0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    160 * MHZ,
+                    160 * MHZ);
+    clock_configure(clk_usb,
+                    0,
+                    CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+                    48 * MHZ,
+                    48 * MHZ);
+    extern void dutx_init();
+    dutx_init();
+
+    println("MODE: %s", __PRETTY_FUNCTION__);
+    println("==========start==========");
+    uvc_init();
+
+    while (true) {
+        tud_task();
+        uvc_task(fill_smpte_yuy2);
+        tight_loop_contents();
+    }
+
+#endif
+
+    errh(nullptr);
+    return 0;
+}
+
+int board_id_func()
+{
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID
+    set_sys_clock_khz(160000, true);
+    sleep_ms(10);
+    clock_configure(clk_peri,
+                    0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    160 * MHZ,
+                    160 * MHZ);
+    extern void dutx_init();
+    dutx_init();
+
+    println("MODE: %s", __PRETTY_FUNCTION__);
+    println("==========start==========");
+
+    flash_read_unique_id();
+    println("Flash UID:");
+    for (uint8_t i = 0; i < 8; ++i) {
+        print("%02X ", uid[i]);
+    }
+    println("");
+
+#endif
+    errh(nullptr);
+    return 0;
+}
+
+int board_id_board_func()
+{
+#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID_BOARD
+    set_sys_clock_khz(160000, true);
+    sleep_ms(10);
+    clock_configure(clk_peri,
+                    0,
+                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+                    160 * MHZ,
+                    160 * MHZ);
+    extern void dutx_init();
+    dutx_init();
+
+    println("MODE: %s", __PRETTY_FUNCTION__);
+    println("==========start==========");
+
+    char id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+    pico_get_unique_board_id_string(id, sizeof(id));
+    println("Board id: %s", id);
 
 #endif
     errh(nullptr);
