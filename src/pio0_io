@@ -1,0 +1,19 @@
+.pio_version 0
+.program pio0io
+
+;.side_set 1 opt
+;.wrap_target
+;    set pins, 1 side 1
+;    set pins, 0 side 0
+;.wrap
+
+;.side_set 1 opt
+;again:
+;    set pins, 1 side 1
+;    set pins, 0 side 0
+;    jmp again
+
+.wrap_target
+    set pins, 1
+    set pins, 0
+.wrap

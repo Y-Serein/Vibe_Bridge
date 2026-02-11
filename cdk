@@ -1,0 +1,68 @@
+#!/bin/bash
+
+PROJECT_PATH=$(pwd)
+
+ft() {
+    find . \( -path ./build -o -path ./tools \) -prune -o -type f -regex '.*\.\(c\|cpp\|cc\|cxx\|h\|hpp\|hh\|hxx\)$' -exec clang-format -i {} +
+}
+
+__cd() {
+    local DIR="$PROJECT_PATH/build"
+
+    if [ ! -d "${DIR}" ]; then
+        mkdir -p "${DIR}"
+    fi
+}
+
+bt() {
+    ft
+    __cd
+    pushd $PROJECT_PATH/build
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPICO_PLATFORM=rp2350 \
+        -DPICO_TOOLCHAIN_PATH=$PICO_TOOLCHAIN_PATH \
+        -DCMAKE_TOOLCHAIN_FILE=$PICO_SDK_PATH/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -G Ninja
+    cmake --build . --parallel $(nproc)
+    popd
+}
+
+ct() {
+    rm -rf $PROJECT_PATH/build
+}
+
+rt() {
+    ct
+    bt
+}
+
+at() {
+    rt
+    sudo mount /dev/sdb1 /media/rp2350/
+    sudo cp build/th160.elf.uf2 /media/rp2350/
+    sudo cp build/th160.elf.uf2 /media/rp2350/
+    sudo umount /media/rp2350
+}
+
+case "$1" in
+b)
+    bt
+    ;;
+r)
+    rt
+    ;;
+c)
+    ct
+    ;;
+f)
+    ft
+    ;;
+a)
+    at
+    ;;
+*)
+    return 1
+    ;;
+esac

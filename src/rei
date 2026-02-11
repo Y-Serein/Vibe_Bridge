@@ -1,0 +1,35 @@
+.program rei
+
+;   start:
+;       mov isr, null
+;       wait 1 pin 0
+;       wait 0 pin 0
+;       in pins, 1
+;
+;   .wrap_target
+;
+;   resetx:
+;       set x, 31
+;   bitloop:
+;       wait 1 pin 1
+;       wait 0 pin 1
+;       in pins, 1
+;       jmp pin resetx ; error
+;       jmp x-- bitloop
+;       irq 0
+;       jmp start
+
+    pull block
+    mov x, osr
+
+.wrap_target
+    mov y, x
+    mov isr, null
+    wait 1 pin 0
+    wait 0 pin 0
+bitloop:
+    wait 1 pin 1
+    wait 0 pin 1
+    in pins, 1
+    jmp y-- bitloop
+.wrap

@@ -1,0 +1,116 @@
+#ifndef _TUSB_CONFIG_H_
+#define _TUSB_CONFIG_H_
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if 1
+
+#    define CFG_TUSB_MCU          OPT_MCU_RP2040
+#    define BOARD_TUD_MAX_SPEED   OPT_MODE_FULL_SPEED
+#    define CFG_TUD_MAX_SPEED     OPT_MODE_FULL_SPEED
+#    define CFG_TUSB_RHPORT0_MODE OPT_MODE_DEVICE
+
+#    ifdef CFG_TUSB_OS
+#        undef CFG_TUSB_OS
+#    endif
+#    define CFG_TUSB_OS OPT_OS_NONE
+
+//--------------------------------------------------------------------+
+// Board Specific Configuration
+//--------------------------------------------------------------------+
+
+// RHPort number used for device can be defined by board.mk, default to port 0
+#    ifndef BOARD_TUD_RHPORT
+#        define BOARD_TUD_RHPORT 0
+#    endif
+
+// RHPort max operational speed can defined by board.mk
+#    ifndef BOARD_TUD_MAX_SPEED
+#        define BOARD_TUD_MAX_SPEED OPT_MODE_DEFAULT_SPEED
+#    endif
+
+//--------------------------------------------------------------------
+// Common Configuration
+//--------------------------------------------------------------------
+
+// defined by compiler flags for flexibility
+#    ifndef CFG_TUSB_MCU
+#        error CFG_TUSB_MCU must be defined
+#    endif
+
+#    ifndef CFG_TUSB_OS
+#        define CFG_TUSB_OS OPT_OS_NONE
+#    endif
+
+#    ifndef CFG_TUSB_DEBUG
+#        define CFG_TUSB_DEBUG 0
+#    endif
+
+// Enable Device stack
+#    define CFG_TUD_ENABLED 1
+
+/* USB DMA on some MCUs can only access a specific SRAM region with restriction
+ * on alignment. Tinyusb use follows macros to declare transferring memory so
+ * that they can be put into those specific section. e.g
+ * - CFG_TUSB_MEM SECTION : __attribute__ (( section(".usb_ram") ))
+ * - CFG_TUSB_MEM_ALIGN   : __attribute__ ((aligned(4)))
+ */
+#    ifndef CFG_TUSB_MEM_SECTION
+#        define CFG_TUSB_MEM_SECTION
+#    endif
+
+#    ifndef CFG_TUSB_MEM_ALIGN
+#        define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
+#    endif
+
+//--------------------------------------------------------------------
+// DEVICE CONFIGURATION
+//--------------------------------------------------------------------
+
+#    ifndef CFG_TUD_ENDPOINT0_SIZE
+#        define CFG_TUD_ENDPOINT0_SIZE 64
+#    endif
+
+//------------- CLASS -------------//
+// The number of video control interfaces
+#    define CFG_TUD_VIDEO 1
+
+// The number of video streaming interfaces
+#    define CFG_TUD_VIDEO_STREAMING 1
+
+// video streaming endpoint size
+#    define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 512
+
+#else
+#    define CFG_TUD_ENABLED       (1)
+
+// Legacy RHPORT configuration
+#    define CFG_TUSB_RHPORT0_MODE (OPT_MODE_DEVICE | OPT_MODE_FULL_SPEED)
+#    ifndef BOARD_TUD_RHPORT
+#        define BOARD_TUD_RHPORT (0)
+#    endif
+// end legacy RHPORT
+
+//------------------------
+// DEVICE CONFIGURATION //
+//------------------------
+
+// Enable 2 CDC classes
+#    define CFG_TUD_CDC            (2)
+// Set CDC FIFO buffer sizes
+#    define CFG_TUD_CDC_RX_BUFSIZE (64)
+#    define CFG_TUD_CDC_TX_BUFSIZE (64)
+#    define CFG_TUD_CDC_EP_BUFSIZE (64)
+
+#    ifndef CFG_TUD_ENDPOINT0_SIZE
+#        define CFG_TUD_ENDPOINT0_SIZE (64)
+#    endif
+
+#    ifdef __cplusplus
+}
+#    endif
+#endif
+
+#endif /* _TUSB_CONFIG_H_ */
