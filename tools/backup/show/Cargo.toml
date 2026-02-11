@@ -1,0 +1,11 @@
+[package]
+name = "show"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serialport = "4.8.1"
+crossbeam-channel = "0.5.15"
+ctrlc = "3.5.1"
+image = "0.25"
+show-image = { version = "0.14", features = ["image"] }
