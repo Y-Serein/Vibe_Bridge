@@ -406,17 +406,6 @@ void init_wpio()
 static inline __attribute__((always_inline)) void piospi0_program_init(
     uint data_pin, uint clk_pin, uint fs_pin, float clk_div)
 {
-    // gpio_init(data_pin);
-    // gpio_set_dir(data_pin, true);
-    // gpio_put(data_pin, 0);
-    // gpio_init(clk_pin);
-    // gpio_set_dir(clk_pin, true);
-    // gpio_put(clk_pin, 0);
-    // gpio_init(fs_pin);
-    // gpio_set_dir(fs_pin, true);
-    // gpio_put(fs_pin, 0);
-    // tight_loop_contents();
-
     upio0 = pio0;
     usm0 = 0;
     uofs0 = pio_add_program(upio0, &piospi0_program);
@@ -445,28 +434,41 @@ static inline __attribute__((always_inline)) void piospi0_program_init(
     sm_config_set_out_shift(&c, false, false, 32);
     pio_sm_init(upio0, usm0, uofs0, &c);
     pio_sm_set_enabled(upio0, usm0, true);
+
+    if (THDEBUG) {
+        gpio_init(data_pin);
+        gpio_set_dir(data_pin, true);
+        gpio_put(data_pin, 0);
+        gpio_init(clk_pin);
+        gpio_set_dir(clk_pin, true);
+        gpio_put(clk_pin, 0);
+        gpio_init(fs_pin);
+        gpio_set_dir(fs_pin, true);
+        gpio_put(fs_pin, 0);
+        tight_loop_contents();
+    }
 }
 
-static inline __attribute__((always_inline)) void piospi0_wait_idle(PIO pio,
-                                                                    uint sm)
+void piospi0_wait_idle(PIO pio, uint sm)
 {
     uint32_t sm_stall_mask = 1u << (sm + PIO_FDEBUG_TXSTALL_LSB);
     pio->fdebug = sm_stall_mask;
-    while (!(pio->fdebug & sm_stall_mask))
-        ;
+    while (!(pio->fdebug & sm_stall_mask)) {
+        tight_loop_contents();
+    }
 }
 
 static inline __attribute__((always_inline)) void piospi0_put_u32(PIO pio,
                                                                   uint sm,
                                                                   uint32_t v)
 {
-    while (pio_sm_is_tx_fifo_full(pio, sm))
-        ;
+    while (pio_sm_is_tx_fifo_full(pio, sm)) {
+        tight_loop_contents();
+    }
     pio->txf[sm] = v;
 }
 
-static inline __attribute__((always_inline)) void piospi0_send_u32(
-    const uint32_t* data, uint32_t word_count)
+void piospi0_send_u32(const uint32_t* data, uint32_t word_count)
 {
     if (data == nullptr || word_count == 0) {
         return;
@@ -492,11 +494,6 @@ static inline __attribute__((always_inline)) void piospi0_send_u32(
 
 void init_wpiospi()
 {
-#if 0
-    extern const uint32_t reg_rstdata32[];
-    extern const uint32_t reg_initdata32[];
-#endif
-
     pre_init();
     // CTL
     gpio_init(IO_EN);
@@ -545,29 +542,10 @@ void init_wpiospi()
         sleep_ms(60);
     }
 
-    // rst REG
-    piospi0_wait_idle(upio0, usm0);
-#if 0
-    piospi0_send_u32(reg_rstdata32, REG_DATE_SPI_LEN32);
-#endif
-    piospi0_wait_idle(upio0, usm0);
-
     // reset delay
     pio_remove_program(upio0, &piospi0_program, uofs0);
     sleep_ms(60);
     piospi0_program_init(IO_OSDA, IO_OCLK, IO_OFS, 1.5f);
-    // init REG
-    piospi0_wait_idle(upio0, usm0);
-#if 0
-    piospi0_send_u32(reg_initdata32, REG_DATE_SPI_LEN32);
-#endif
-    piospi0_wait_idle(upio0, usm0);
-
-    // test
-    // while (true) {
-    //     piospi0_send_u32(reg_initdata32, REG_DATE_SPI_LEN32);
-    //     piospi0_wait_idle(upio0, usm0);
-    // }
 
     // release OFS
     pio_remove_program(upio0, &piospi0_program, uofs0);
@@ -613,10 +591,6 @@ void th160_init()
     while (true) {
         absolute_time_t t0 = get_absolute_time();
         uart_write_blocking(uart0, buffer, BSIZE);
-        // (void)buffer;
-        // const char* test_str = "Hello from rp2350\n";
-        // uart_write_blocking(uart0, (const uint8_t*)test_str,
-        // strlen(test_str));
         absolute_time_t t1 = get_absolute_time();
         uart_total_us += absolute_time_diff_us(t0, t1);
 
@@ -637,40 +611,6 @@ void th160_init()
         sleep_until(next_time);
         next_time = delayed_by_ms(next_time, PERIOD);
     }
-
-    // uint8_t buffer[32];
-    // int cnt = 0;
-    //
-    // while (true) {
-    //     memset(buffer, 0x00, 32);
-    //     int ret = snprintf((char*)buffer,
-    //                        32,
-    //                        "#%d %llu %llu\n",
-    //                        cnt,
-    //                        (uint64_t)clock_get_hz(clk_sys),
-    //                        (uint64_t)clock_get_hz(clk_peri));
-    //     size_t len = (ret >= 32) ? 31 : ret;
-    //     buffer[len] = '\0';
-    //     uart_write_blocking(uart0, buffer, len);
-    //
-    //     extern uint64_t irq;
-    //     extern uint64_t sof;
-    //     extern uint64_t sol;
-    //     extern uint64_t eof;
-    //     extern uint64_t eol;
-    //
-    //     printf("[%llu] sof:%llu sol:%llu eof:%llu eol:%llu",
-    //            irq,
-    //            sof,
-    //            sol,
-    //            eof,
-    //            eol);
-    //
-    //     printf("[%llu]<%d> %s\n", time_us_64(), len, buffer);
-    //     sleep_ms(1000);
-    //     cnt++;
-    // }
-
 #ifdef FPS
 #    undef FPS
 #endif
@@ -721,10 +661,6 @@ void rx_poll(void)
         return;
 
     dma_done = false;
-    // pio_sm_set_enabled(rxpio, rxsm, false);
-    // while (!pio_sm_is_rx_fifo_empty(rxpio, rxsm)) {
-    //     (void)pio_sm_get(rxpio, rxsm);
-    // }
 
 #if RXPKTDBG == 1
     dma_channel_abort(sdch);
@@ -740,8 +676,6 @@ void rx_poll(void)
     dma_channel_set_write_addr(
         rxchan.chan, rxring.buf[rxchan.buf_idx].data, false);
     dma_channel_set_trans_count(rxchan.chan, BUFSIZE, true);
-
-    // pio_sm_set_enabled(rxpio, rxsm, true);
 }
 
 void wspi_init0()
@@ -815,7 +749,6 @@ void wspi_init0()
     sm_config_set_in_pins(&rxpioc, IO_PSDA);
     sm_config_set_in_shift(&rxpioc, false, true, 8);
     pio_sm_set_consecutive_pindirs(rxpio, rxsm, IO_PSDA, 2, false);
-    // pio_sm_set_consecutive_pindirs(rxpio, rxsm, IO_PCLK, 1, false);
     sm_config_set_clkdiv(&rxpioc, 1.0f);
     pio_sm_init(rxpio, rxsm, rxofs, &rxpioc);
     pio_sm_clear_fifos(rxpio, rxsm);
@@ -959,6 +892,23 @@ void wspi_init0_noinit()
         sdch, &clkdcfg, &spi_get_hw(spi1)->dr, &Z, 0xffffffff, true);
 }
 
+static const uint8_t SPI_CLK_A[40 / 8] = {0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t SPI_CLK_B[32 / 8] = {0xff, 0xff, 0xff, 0xff};
+extern const uint8_t reg_initdata[];
+extern const uint8_t reg_initdata_299_290_0010001011[];
+extern const uint8_t reg_initdata_299_290_0001101101_234_225_0001111010[];
+extern const uint8_t
+    reg_initdata_299_290_0001101101_234_225_0001111010_163_132_11111111111111111111111111111111
+        [];
+extern const uint8_t
+    reg_initdata_299_290_0001101101_234_225_0001111010_163_132_11111111111111111000000000000000
+        [];
+extern const uint8_t
+    reg_initdata_299_290_0001101101_234_225_0001111010_83_81_111[];
+extern const uint8_t
+    reg_initdata_299_290_0001110010_234_225_0001111010_83_81_111[];
+#define INITREG reg_initdata_299_290_0001101101_234_225_0001111010
+
 void wspi_stop1()
 {
     dma_channel_abort(sdch);
@@ -971,19 +921,15 @@ void wspi_stop1()
     pio_remove_program(rxpio, &rei_program, rxofs);
 }
 
-static const uint8_t SPI_CLK_A[40 / 8] = {0x00, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t SPI_CLK_B[32 / 8] = {0xff, 0xff, 0xff, 0xff};
 void wspi_reinit1()
 {
-    extern const uint8_t reg_initdata[];
-
     gpio_put(IO_SCTL, 0);
     // gpio_put(IO_SRST, 0);
     gpio_put(IO_SCS, 0);
     // gpio_put(IO_SRST, 1);
     spi_write_blocking(spi1, SPI_CLK_A, 40 / 8);
     gpio_put(IO_SCS, 1);
-    spi_write_blocking(spi1, reg_initdata, 1286 - 32 / 8);
+    spi_write_blocking(spi1, INITREG, 1286 - 32 / 8);
     gpio_put(IO_SCS, 0);
     for (int i = 0; i < 5; ++i) {
         spi_write_blocking(spi1, SPI_CLK_B, 32 / 8);
@@ -1010,6 +956,7 @@ void wspi_reinit1()
 
     rxchan.buf_idx = rxring.widx;
     dma_channel_config dcfg0 = dma_channel_get_default_config(rxchan.chan);
+    channel_config_set_high_priority(&dcfg0, true);
     channel_config_set_transfer_data_size(&dcfg0, DMA_SIZE_8);
     channel_config_set_read_increment(&dcfg0, false);
     channel_config_set_write_increment(&dcfg0, true);
@@ -1038,8 +985,6 @@ void wspi_init1()
     rxring.widx = 0;
     rxring.ridx = 0;
     dma_done = false;
-
-    extern const uint8_t reg_initdata[];
 
     // CTL = 0
     gpio_init(IO_SCTL);
@@ -1071,7 +1016,7 @@ void wspi_init1()
     // CS = 1
     gpio_put(IO_SCS, 1);
     // INIT
-    spi_write_blocking(spi1, reg_initdata, 1286 - 32 / 8);
+    spi_write_blocking(spi1, INITREG, 1286 - 32 / 8);
     // CS = 0
     gpio_put(IO_SCS, 0);
     for (int i = 0; i < 5; ++i) {
@@ -1100,6 +1045,7 @@ void wspi_init1()
     rxchan.chan = dma_claim_unused_channel(true);
     rxchan.buf_idx = rxring.widx;
     dma_channel_config dcfg0 = dma_channel_get_default_config(rxchan.chan);
+    channel_config_set_high_priority(&dcfg0, true);
     channel_config_set_transfer_data_size(&dcfg0, DMA_SIZE_8);
     channel_config_set_read_increment(&dcfg0, false);
     channel_config_set_write_increment(&dcfg0, true);

@@ -53,24 +53,25 @@ void errh(const char* msg)
     }
 }
 
-void dump_buf_8bytes(const uint8_t* buf, size_t len)
+void dump_buf_8bytes([[maybe_unused]] const uint8_t* buf, size_t len)
 {
     size_t i;
 
     for (i = 0; i < len; i++) {
         if ((i & 0x7) == 0) {
-            if (i != 0)
-                println("");
+            if (i != 0) {
+                print("\n");
+            }
             print("[%04zu]: ", i);
         }
 
         print("%02x ", buf[i]);
     }
 
-    println("");
+    print("\n");
 }
 
-void gpio_irq_handler(uint gpio, uint32_t events)
+void gpio_irq_handler(uint gpio, [[maybe_unused]] uint32_t events)
 {
     for (int i = 0; i < BUTTON_NUM_MAX; i++) {
         struct Button* btn = &buttons[i];

@@ -11,7 +11,8 @@ static uint dutx_ofs;
 static int dutx_dma_chan;
 static dma_channel_config dutx_dma_cfg;
 
-static void dutx_out_chars(const char* buf, int len)
+static void dutx_out_chars([[maybe_unused]] const char* buf,
+                           [[maybe_unused]] int len)
 {
 #if THDEBUG == 1
     dma_channel_wait_for_finish_blocking(dutx_dma_chan);

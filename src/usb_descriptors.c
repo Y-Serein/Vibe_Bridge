@@ -6,8 +6,8 @@
 #include <stdlib.h>
 #include <tusb.h>
 
-#define USB_VID 0xCafe
-#define USB_PID 0x4009
+#define USB_VID 0x359F
+#define USB_PID 0x4202
 
 /* A combination of interfaces must have a unique product id, since PC will save
  * device driver after the first plug. Same VID/PID with different interface e.g
@@ -16,11 +16,6 @@
  * Auto ProductID layout's Bitmap:
  *   [MSB]  VIDEO | AUDIO | MIDI | HID | MSC | CDC          [LSB]
  */
-// #define _PID_MAP(itf, n) ((CFG_TUD_##itf) << (n))
-// #define USB_PID \
-//     (0x4000 | _PID_MAP(CDC, 0) | _PID_MAP(MSC, 1) | _PID_MAP(HID, 2) \
-//      | _PID_MAP(MIDI, 3) | _PID_MAP(AUDIO, 4) | _PID_MAP(VIDEO, 5) \
-//      | _PID_MAP(VENDOR, 6))
 
 //--------------------------------------------------------------------+
 // Device Descriptors
@@ -132,12 +127,12 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid)
     char const* string_desc_arr[] = {
         (const char[]) {0x09,
                         0x04}, // 0: is supported language is English (0x0409)
-        "Sipeed", // 1: Manufacturer
+        "Sipeed Co. Ltd.", // 1: Manufacturer
         "Thermal160", // 2: Product
-        "123456", // 3: Serials, should use chip ID
+        "123456", // 3: Serials
         "UVC", // 4: UVC Interface
     };
-    string_desc_arr[3] = uid;
+    string_desc_arr[3] = uid;  // chip id
 
     static uint16_t _desc_str[32];
 

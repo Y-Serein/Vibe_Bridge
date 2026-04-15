@@ -27,7 +27,7 @@ struct RxDma {
 };
 
 extern uint spi1clk;
-extern struct RxRing rxring;
+extern struct RxRing rxring __attribute__((section(".scratch_x")));
 extern PIO rxpio;
 extern uint rxsm;
 extern uint rxofs;

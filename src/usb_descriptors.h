@@ -9,7 +9,7 @@
 
 #define FRAME_WIDTH  160
 #define FRAME_HEIGHT 120
-#define FRAME_RATE   22
+#define FRAME_RATE   30
 #define FRAME_SIZE   (FRAME_WIDTH * FRAME_HEIGHT * 2)
 
 #define CFG_EXAMPLE_VIDEO_DISABLE_MJPEG
@@ -105,7 +105,7 @@ enum {
                        _stridx), /* Video control 0 */ \
         TUD_VIDEO_DESC_STD_VC(ITF_NUM_VIDEO_CONTROL, 0, _stridx), \
         TUD_VIDEO_DESC_CS_VC( \
-            /* UVC 1.5*/ 0x0150, /* wTotalLength - bLength */ \
+            0x0110, /* wTotalLength - bLength */ \
             TUD_VIDEO_DESC_CAMERA_TERM_LEN + TUD_VIDEO_DESC_OUTPUT_TERM_LEN, \
             UVC_CLOCK_FREQUENCY, \
             ITF_NUM_VIDEO_STREAMING), \
@@ -172,7 +172,7 @@ enum {
                        _stridx), /* Video control 0 */ \
         TUD_VIDEO_DESC_STD_VC(ITF_NUM_VIDEO_CONTROL, 0, _stridx), \
         TUD_VIDEO_DESC_CS_VC( \
-            /* UVC 1.5*/ 0x0150, /* wTotalLength - bLength */ \
+            0x0110, /* wTotalLength - bLength */ \
             TUD_VIDEO_DESC_CAMERA_TERM_LEN + TUD_VIDEO_DESC_OUTPUT_TERM_LEN, \
             UVC_CLOCK_FREQUENCY, \
             ITF_NUM_VIDEO_STREAMING), \

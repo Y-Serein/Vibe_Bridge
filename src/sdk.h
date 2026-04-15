@@ -23,7 +23,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define THDEBUG 1
+#define THDEBUG   1
+#define MAX_SPEED 1
 
 enum UartBaudMode : uint32_t {
     UBM11 = 2000000,
@@ -34,13 +35,13 @@ enum UartBaudMode : uint32_t {
     UBM66 = 6000000,
     UBM77 = 7000000,
     UBM88 = 8000000,
-    UBMAA = 5000000,
+    UBMAA = 2000000,
     UBMBB = 10000000,
     UBMCC = 5000000,
     UBMDD = 5000000,
 };
-#define UART_BAUD_MODE_DEF 0x55
-#define SHUTTER_ENABLE     0
+#define UART_BAUD_MODE_DEF 0x11
+#define SHUTTER_ENABLE     1
 
 enum UartOutMode : uint32_t {
     UOM_CALI_U8 = 0,
@@ -90,11 +91,44 @@ struct __attribute__((packed)) BadPt {
     uint8_t y;
     uint8_t x;
 };
-#define MAX_BADPT 5
+#define MAX_BADPT       5
+#define HOT_PIXEL_THRES 15000
+#ifndef unlikely
+#    define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+#define CALI_ERROR_LIST \
+    X(ERR_NONE, 0) \
+    X(ERR_CALI_ALGO_BORDER_NEG_DIFF, 1) \
+    X(ERR_CALI_ALGO_NO_VALID_PIXEL, 2) \
+    X(ERR_CALI_ALGO_TOO_MANY_BAD_PTS, 3) \
+    X(ERR_CALI_ALGO_ADJACENT_BAD_PTS, 4) \
+    X(ERR_FLASH_IMGBG, 5) \
+    X(ERR_FLASH_GAIN, 6) \
+    X(ERR_FLASH_BADPT, 7) \
+    X(ERR_FLASH_HDR, 8) \
+    X(ERR_FLASH_EMPTY, 9)
+
+#define X(name, val) name = val,
+enum {
+    CALI_ERROR_LIST
+};
+#undef X
 
 enum : uint32_t {
     CORE0_EV0 = 0xdeadc0e0,
     CORE1_EV0 = 0xdeadc1e0,
+};
+
+struct yuv_cmap_entry {
+    int16_t u_raw;
+    int16_t v_raw;
+    uint8_t y;
+};
+
+struct yuv_cmap_simd {
+    uint32_t uv_raw;
+    uint32_t y;
 };
 
 #define RXPKTDBG 0
@@ -124,9 +158,15 @@ enum : uint32_t {
 #define IO_FURX 5
 #define FUP     uart1
 
-#define print(fmt, ...)    printf(fmt, ##__VA_ARGS__)
-#define println(fmt, ...)  printf(fmt "\r\n", ##__VA_ARGS__)
-#define eprintln(fmt, ...) printf("[E]" fmt "\n", ##__VA_ARGS__)
+#if THDEBUG == 1
+#    define print(fmt, ...)    printf(fmt, ##__VA_ARGS__)
+#    define println(fmt, ...)  printf(fmt "\r\n", ##__VA_ARGS__)
+#    define eprintln(fmt, ...) printf("[E]" fmt "\n", ##__VA_ARGS__)
+#else
+#    define print(fmt, ...)
+#    define println(fmt, ...)
+#    define eprintln(fmt, ...)
+#endif
 
 #define IO_PLED 25
 #define IO_LED  19
@@ -164,15 +204,19 @@ enum : uint32_t {
 #define MAIN_FUNC_MODE_UVC_MAX               14
 #define MAIN_FUNC_MODE_BOARD_ID              15
 #define MAIN_FUNC_MODE_BOARD_ID_BOARD        16
+#define MAIN_FUNC_MODE_BLINK                 17
 #define MAIN_FUNC_MODE                       MAIN_FUNC_MODE_SPI_INIT_40MHZ_4
 
 #define RAW_OUT_MODE      0
 #define LED_BTN_SYNC_MODE 0
 #define CORE1_TIMEU_MODE  0
 #define CALI_PASS_MODE    0
+#define OCLK_180          1
+#define OUART_SETUP_DEF   true
 
-#define SENSOR_W 160
-#define SENSOR_H 120
+#define SENSOR_W          160
+#define SENSOR_H          120
+#define MIN_THERMAL_RANGE 128
 
 #define FLASH_SIZE          (4 * 1024 * 1024)
 #define FLASH_TARGET_SIZE   (512 * 1024)

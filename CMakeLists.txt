@@ -15,12 +15,12 @@ set(CMAKE_C_EXTENSIONS ON)
 add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=ROOT)
 
 
-# set(DEFAULT_C_FLAGS
-#     -Wall
-#     -Wextra
-#     -Werror
-#     -Wbuiltin-macro-redefined
-# )
+set(DEFAULT_C_FLAGS
+    -Wall
+    -Wextra
+    -Werror
+    -Wbuiltin-macro-redefined
+)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(pico_sdk_import)
@@ -49,6 +49,11 @@ add_executable(
     # src/usb_descriptors_cdc.c
     src/uvc.c
     src/cmap/hot.c
+    src/cmap/cool.c
+    src/cmap/magma.c
+    src/cmap/turbo.c
+    src/cmap/gray.c
+    src/cmap/deepgreen.c
     src/yuy2_smpte_bars.c
     src/yuy2_red.c
     src/yuy2_green.c
@@ -65,7 +70,7 @@ target_compile_definitions(
     REG_DATE_SPI_LEN=1286
     REG_DATE_SPI_LEN32=320
     PICO_FLASH_SIZE_BYTES=4194304
-    PICO_STACK_SIZE=4096
+    PICO_STACK_SIZE=2048
     PICO_STACK_SIZE_CORE1=4096
 )
 

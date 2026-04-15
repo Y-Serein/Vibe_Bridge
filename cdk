@@ -1,36 +1,40 @@
 #!/bin/bash
 
-PROJECT_PATH=$(pwd)
+PROJECT_PATH=$(cd "$(dirname "$0")" && pwd)
+
+# build/ inside project is a symlink -> /home/slam/build/pico_tn160 (WSL native fs)
+BUILD_DIR=/home/slam/build/pico_tn160
+
+# Env defaults (can be overridden by environment)
+PICO_SDK_PATH=${PICO_SDK_PATH:-$PROJECT_PATH/tools/pico-sdk-2.2.0}
+PICO_TOOLCHAIN_PATH=${PICO_TOOLCHAIN_PATH:-/home/slam/Sipeed/tools/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi}
 
 ft() {
-    find . \( -path ./build -o -path ./tools \) -prune -o -type f -regex '.*\.\(c\|cpp\|cc\|cxx\|h\|hpp\|hh\|hxx\)$' -exec clang-format -i {} +
+    find "$PROJECT_PATH" \( -path "$PROJECT_PATH/build" -o -path "$PROJECT_PATH/tools" \) -prune -o -type f -regex '.*\.\(c\|cpp\|cc\|cxx\|h\|hpp\|hh\|hxx\)$' -exec clang-format -i {} +
 }
 
 __cd() {
-    local DIR="$PROJECT_PATH/build"
-
-    if [ ! -d "${DIR}" ]; then
-        mkdir -p "${DIR}"
-    fi
+    mkdir -p "${BUILD_DIR}"
 }
 
 bt() {
     ft
     __cd
-    pushd $PROJECT_PATH/build
-    cmake .. \
+    pushd "$BUILD_DIR"
+    cmake "$PROJECT_PATH" \
         -DCMAKE_BUILD_TYPE=Release \
         -DPICO_PLATFORM=rp2350 \
-        -DPICO_TOOLCHAIN_PATH=$PICO_TOOLCHAIN_PATH \
-        -DCMAKE_TOOLCHAIN_FILE=$PICO_SDK_PATH/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake \
+        -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+        -DPICO_TOOLCHAIN_PATH="$PICO_TOOLCHAIN_PATH" \
+        -DCMAKE_TOOLCHAIN_FILE="$PICO_SDK_PATH/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -G Ninja
-    cmake --build . --parallel $(nproc)
+    cmake --build . --parallel "$(nproc)"
     popd
 }
 
 ct() {
-    rm -rf $PROJECT_PATH/build
+    rm -rf "$BUILD_DIR"
 }
 
 rt() {
@@ -38,12 +42,17 @@ rt() {
     bt
 }
 
+# Flash: mount RP2350 in BOOTSEL mode and copy UF2
 at() {
-    rt
-    sudo mount /dev/sdb1 /media/rp2350/
-    sudo cp build/th160.elf.uf2 /media/rp2350/
-    sudo cp build/th160.elf.uf2 /media/rp2350/
-    sudo umount /media/rp2350
+    bt
+    # Adjust MOUNT_POINT to match your system
+    MOUNT_POINT=${RP2350_MOUNT:-/media/rp2350}
+    if [ ! -d "$MOUNT_POINT" ]; then
+        echo "Mount point $MOUNT_POINT not found. Set RP2350_MOUNT env var or mount manually."
+        return 1
+    fi
+    sudo cp "$BUILD_DIR/pico_tn160.elf.uf2" "$MOUNT_POINT/"
+    sudo sync
 }
 
 case "$1" in
@@ -63,6 +72,12 @@ a)
     at
     ;;
 *)
+    echo "Usage: $0 {b|r|c|f|a}"
+    echo "  b - format + build"
+    echo "  r - clean + build"
+    echo "  c - clean"
+    echo "  f - format only"
+    echo "  a - build + flash UF2"
     return 1
     ;;
 esac
