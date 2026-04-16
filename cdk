@@ -5,9 +5,59 @@ PROJECT_PATH=$(cd "$(dirname "$0")" && pwd)
 # build/ inside project is a symlink -> /home/slam/build/pico_tn160 (WSL native fs)
 BUILD_DIR=/home/slam/build/pico_tn160
 
-# Env defaults (can be overridden by environment)
+# Prefer the repo-pinned SDK by default. Callers may still override it explicitly.
 PICO_SDK_PATH=${PICO_SDK_PATH:-$PROJECT_PATH/tools/pico-sdk-2.2.0}
 PICO_TOOLCHAIN_PATH=${PICO_TOOLCHAIN_PATH:-/home/slam/Sipeed/tools/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi}
+
+require_file() {
+    local path="$1"
+    local hint="$2"
+    if [ ! -f "$path" ]; then
+        echo "Missing file: $path"
+        [ -n "$hint" ] && echo "$hint"
+        return 1
+    fi
+}
+
+require_dir() {
+    local path="$1"
+    local hint="$2"
+    if [ ! -d "$path" ]; then
+        echo "Missing directory: $path"
+        [ -n "$hint" ] && echo "$hint"
+        return 1
+    fi
+}
+
+validate_env() {
+    require_dir "$PICO_SDK_PATH" \
+        "Set PICO_SDK_PATH to a valid pico-sdk root." || return 1
+    require_file "$PICO_SDK_PATH/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake" \
+        "The selected PICO_SDK_PATH does not look like a compatible RP2350 pico-sdk." || return 1
+    require_file "$PICO_SDK_PATH/src/rp2_common/pico_platform_common/include/pico/platform/common.h" \
+        "This project expects pico/platform/common.h from the repo-pinned SDK layout." || return 1
+    require_dir "$PICO_TOOLCHAIN_PATH" \
+        "Set PICO_TOOLCHAIN_PATH to your Arm GNU Toolchain root." || return 1
+    require_file "$PICO_TOOLCHAIN_PATH/bin/arm-none-eabi-gcc" \
+        "The selected PICO_TOOLCHAIN_PATH is missing bin/arm-none-eabi-gcc." || return 1
+}
+
+check_cached_sdk() {
+    local cache="$BUILD_DIR/CMakeCache.txt"
+    if [ ! -f "$cache" ]; then
+        return 0
+    fi
+
+    local cached_sdk
+    cached_sdk=$(sed -n 's/^PICO_SDK_PATH:PATH=//p' "$cache" | head -n1)
+    if [ -n "$cached_sdk" ] && [ "$cached_sdk" != "$PICO_SDK_PATH" ]; then
+        echo "Build cache uses a different pico-sdk:"
+        echo "  cached : $cached_sdk"
+        echo "  current: $PICO_SDK_PATH"
+        echo "Run '$0 c' or delete $BUILD_DIR before rebuilding."
+        return 1
+    fi
+}
 
 ft() {
     find "$PROJECT_PATH" \( -path "$PROJECT_PATH/build" -o -path "$PROJECT_PATH/tools" \) -prune -o -type f -regex '.*\.\(c\|cpp\|cc\|cxx\|h\|hpp\|hh\|hxx\)$' -exec clang-format -i {} +
@@ -20,6 +70,8 @@ __cd() {
 bt() {
     ft
     __cd
+    validate_env || return 1
+    check_cached_sdk || return 1
     pushd "$BUILD_DIR"
     cmake "$PROJECT_PATH" \
         -DCMAKE_BUILD_TYPE=Release \

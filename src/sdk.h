@@ -182,9 +182,10 @@ struct yuv_cmap_simd {
 #define IO_ORX  17
 #define OUART   uart0
 #define IO_NTC  26
+#define IO_FPA  28
 #define IO_SVMS 3
-#define IO_SVM1 4
-#define IO_SVM2 5
+#define IO_SVM1 5
+#define IO_SVM2 4
 #define IO_BTN  0
 
 #define MAIN_FUNC_MODE_SPI_INIT_25MHZ        0
@@ -212,7 +213,7 @@ struct yuv_cmap_simd {
 #define CORE1_TIMEU_MODE  0
 #define CALI_PASS_MODE    0
 #define OCLK_180          1
-#define OUART_SETUP_DEF   true
+#define OUART_SETUP_DEF   false
 
 #define SENSOR_W          160
 #define SENSOR_H          120
@@ -227,6 +228,7 @@ struct yuv_cmap_simd {
 #define FLASH_OFS_GAIN      0x01a000
 #define FLASH_RETRY_MAX     3
 #define FLASH_HAS_DATA_F    0x78
+#define CLEAR_CALI_ON_BOOT  0
 
 struct __attribute__((packed)) FlashDataInfo {
     uint8_t has_data;
@@ -238,7 +240,9 @@ struct __attribute__((packed)) FlashDataInfo {
     uint32_t badpts_num;
     uint32_t gain_ofs;
     uint32_t gain_size;
-    uint8_t _pad1[32];
+    float mean_diff; /* avg(raw_h - raw_l) across valid pixels */
+    float t_ref_low; /* scene temperature (°C) of the low reference frame */
+    uint8_t _pad1[24];
 };
 
 struct FlashOpInfo {

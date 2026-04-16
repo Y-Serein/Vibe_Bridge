@@ -563,7 +563,7 @@ void th160_init()
 #define W            160
 #define H            120
 #define BSIZE        ((W * H) + 1)
-#define BUF_AT(y, x) buffer[1 + (y)*W + (x)]
+#define BUF_AT(y, x) buffer[1 + (y) * W + (x)]
 
 #define FPS_PRINT_INTERVAL_MS 2000
 

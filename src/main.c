@@ -142,12 +142,14 @@ enum rawbuf_state {
     RAWBUF_READING,
 };
 
-#define RAWBUFADCCNT     1
+#define RAWBUFADCCNT     2
 #define RAWBUFCNT        3
 #define RAWBUFSIZE       (SENSOR_W * SENSOR_H * 2)
 #define RAWBUFSIZEOFS    (SENSOR_H * 4)
 #define RAWBUFSIZEOFSADC (2 * RAWBUFADCCNT)
 #define RAWBUFSIZETOTAL  (RAWBUFSIZE + RAWBUFSIZEOFS + RAWBUFSIZEOFSADC)
+#define RAWBUF_OFS_ADC0  (RAWBUFSIZE + RAWBUFSIZEOFS)
+#define RAWBUF_OFS_ADC2  (RAWBUF_OFS_ADC0 + 2)
 static uint8_t rawbuf[RAWBUFCNT][RAWBUFSIZETOTAL];
 static volatile uint8_t rawbuf_state[RAWBUFCNT];
 static volatile int rawbuf_last_ready;
@@ -223,8 +225,8 @@ static inline __attribute__((always_inline)) int rawbuf_pick_ready()
 #define HIST_BUCKETS 1024
 #define HIST_SHIFT   4
 
-static inline __attribute__((always_inline)) uint16_t be16_to_u14(
-    const uint8_t* p)
+static inline __attribute__((always_inline)) uint16_t
+be16_to_u14(const uint8_t* p)
 {
     // uint16_t v;
     // v = ((uint16_t)p[0] << 8) | p[1];
@@ -270,8 +272,8 @@ static inline __attribute__((always_inline)) void calc_percentile_u14_be(
     }
 }
 
-static inline __attribute__((always_inline)) uint8_t norm_u14_to_u8(
-    uint16_t v, uint16_t low, uint16_t high)
+static inline __attribute__((always_inline)) uint8_t
+norm_u14_to_u8(uint16_t v, uint16_t low, uint16_t high)
 {
     uint32_t t;
 
@@ -323,6 +325,23 @@ static const float* caligain = nullptr;
 static const struct BadPt* calibadpt = nullptr;
 static uint16_t ram_calibg[PX_CNT];
 static struct BadPt ram_badpts[MAX_BADPT];
+static float ram_mean_diff = 0.0f;
+static float ram_t_ref_low = 0.0f;
+#define T_REF_HIGH 50.0f
+
+/* FFC: lifted from binary_calib_frame so FFC can reset them */
+static uint16_t g_smooth_low = 0;
+static uint16_t g_smooth_high = 0;
+static int32_t g_calib_mean = 0;
+static const uint16_t* g_last_calib = nullptr;
+
+/* FFC timing and state */
+#define FFC_INTERVAL_FIRST_MS  30000u
+#define FFC_INTERVAL_STABLE_MS 120000u
+#define FFC_TEMP_DELTA_ADC     150u
+static uint32_t ffc_last_ms = 0;
+static uint16_t ffc_last_fpa_adc = 0;
+static bool ffc_done_first = false;
 
 static inline __attribute__((always_inline)) void normalize_frame_be(
     uint8_t* raw, uint8_t* out)
@@ -854,7 +873,8 @@ static inline __attribute__((always_inline)) int cali_ref_stream_v4(
     const uint8_t* raw_l,
     float* gain_map,
     struct BadPt* badpts,
-    uint8_t* badpts_size_max)
+    uint8_t* badpts_size_max,
+    float* out_mean_diff)
 {
     const uint8_t badpts_size = *badpts_size_max;
     const size_t line_stride = SENSOR_W * 2;
@@ -983,6 +1003,9 @@ static inline __attribute__((always_inline)) int cali_ref_stream_v4(
     }
 
     *badpts_size_max = bad_idx;
+    if (out_mean_diff != nullptr) {
+        *out_mean_diff = avg_diff;
+    }
     return 0;
 }
 
@@ -1135,6 +1158,12 @@ static inline __attribute__((always_inline)) void be_u8_to_le_u16_inplace(
     }
 }
 
+void __not_in_flash_func(__flash_erase_cali__)(void* param)
+{
+    (void)param;
+    flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
+}
+
 void __not_in_flash_func(__flash_write2__)(void* param)
 {
     const struct FlashOpInfo* opinfo = (const struct FlashOpInfo*)param;
@@ -1257,11 +1286,13 @@ static inline __attribute__((always_inline)) bool start_cali()
     float* gain_map = (float*)rawbuf;
     static struct BadPt badpts[MAX_BADPT];
     uint8_t badpt_num = MAX_BADPT;
+    float mean_diff = 0.0f;
     const int caliret = cali_ref_stream_v4(calibuf[CALIBUF_IMG_H_IDX],
                                            calibuf[CALIBUF_IMG_L_IDX],
                                            gain_map,
                                            badpts,
-                                           &badpt_num);
+                                           &badpt_num,
+                                           &mean_diff);
     println("badpt_num: %u", badpt_num);
     if (caliret < 0) {
         println("cali failed: ret = %d", caliret);
@@ -1281,6 +1312,8 @@ static inline __attribute__((always_inline)) bool start_cali()
     fheader.badpts_ofs = FLASH_OFS_BADPTS;
     fheader.badpts_num = MAX_BADPT;
     fheader.badpts_size = badpt_size;
+    fheader.mean_diff = mean_diff;
+    fheader.t_ref_low = 0.0f;
 
     const uint8_t header[3] = {0xff, 0xff, 0xdd};
     println("send img_l...");
@@ -1531,24 +1564,20 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     uint8_t* out,
     const size_t px_cnt)
 {
-    static uint16_t smooth_low = 0;
-    static uint16_t smooth_high = 0;
     static uint8_t gamma_lut[256];
     static bool lut_inited = false;
-    static int32_t calib_mean = 0;
-    static const uint16_t* last_calib = nullptr;
     static uint16_t raw14[PX_CNT];
 
     uint16_t low = 0, high = 0;
     bool debad = false;
 
-    if (unlikely(calib != nullptr && calib != last_calib)) {
+    if (unlikely(calib != nullptr && calib != g_last_calib)) {
         uint64_t sum = 0;
         for (size_t i = 0; i < px_cnt; ++i) {
             sum += calib[i];
         }
-        calib_mean = (int32_t)(sum / px_cnt);
-        last_calib = calib;
+        g_calib_mean = (int32_t)(sum / px_cnt);
+        g_last_calib = calib;
     }
 
     if (unlikely(!lut_inited)) {
@@ -1564,7 +1593,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         for (size_t i = 0; i < px_cnt; i++) {
             uint16_t r = be16_to_u14(&raw[i * 2]);
             r = gray14_to_bin(r);
-            const int32_t diff = (int32_t)r - (int32_t)calib[i] + calib_mean;
+            const int32_t diff = (int32_t)r - (int32_t)calib[i] + g_calib_mean;
             raw14[i] = clip_u16(diff);
             if (dataomode == DOM_UVC && (i & 0x3FF) == 0) {
                 tud_task();
@@ -1576,7 +1605,8 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             uint16_t r = be16_to_u14(&raw[i * 2]);
             r = gray14_to_bin(r);
             const int32_t diff = (int32_t)r - (int32_t)calib[i];
-            const int32_t val = (int32_t)(calig[i] * (float)diff) + calib_mean;
+            const int32_t val =
+                (int32_t)(calig[i] * (float)diff) + g_calib_mean;
             raw14[i] = clip_u16(val);
             if (dataomode == DOM_UVC && (i & 0x3FF) == 0) {
                 tud_task();
@@ -1600,26 +1630,41 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     }
     calc_percentile_u14(raw14, PX_CNT, &low, &high);
 
-    if (unlikely(smooth_low == 0 && smooth_high == 0)) {
-        smooth_low = low;
-        smooth_high = high;
+    if (unlikely(g_smooth_low == 0 && g_smooth_high == 0)) {
+        g_smooth_low = low;
+        g_smooth_high = high;
     } else {
-        smooth_low = (uint16_t)(((uint32_t)smooth_low * 7 + low) >> 3);
-        smooth_high = (uint16_t)(((uint32_t)smooth_high * 7 + high) >> 3);
+        g_smooth_low = (uint16_t)(((uint32_t)g_smooth_low * 7 + low) >> 3);
+        g_smooth_high = (uint16_t)(((uint32_t)g_smooth_high * 7 + high) >> 3);
     }
 
-    if (unlikely(smooth_high <= smooth_low)) {
-        smooth_high = smooth_low + 1;
+    if (unlikely(g_smooth_high <= g_smooth_low)) {
+        g_smooth_high = g_smooth_low + 1;
     }
 
     out[0] = 0xff;
-    uint32_t range = smooth_high - smooth_low;
+
+    /* compute frame temperature range from calibration mapping */
+    int16_t t_lo_x10 = INT16_MAX;
+    int16_t t_hi_x10 = INT16_MAX;
+    if (ram_mean_diff > 0.0f && calib != nullptr) {
+        const float t_span = T_REF_HIGH - ram_t_ref_low;
+        const float k = t_span / ram_mean_diff;
+        const float t_lo =
+            ram_t_ref_low + (float)((int32_t)g_smooth_low - g_calib_mean) * k;
+        const float t_hi =
+            ram_t_ref_low + (float)((int32_t)g_smooth_high - g_calib_mean) * k;
+        t_lo_x10 = (int16_t)(t_lo * 10.0f);
+        t_hi_x10 = (int16_t)(t_hi * 10.0f);
+    }
+
+    uint32_t range = g_smooth_high - g_smooth_low;
     if (unlikely(range < MIN_THERMAL_RANGE)) {
-        const uint32_t center = smooth_low + (range >> 1);
-        smooth_low = (uint16_t)(center > (MIN_THERMAL_RANGE >> 1)
-                                    ? center - (MIN_THERMAL_RANGE >> 1)
-                                    : 0);
-        smooth_high = (uint16_t)(smooth_low + MIN_THERMAL_RANGE);
+        const uint32_t center = g_smooth_low + (range >> 1);
+        g_smooth_low = (uint16_t)(center > (MIN_THERMAL_RANGE >> 1)
+                                      ? center - (MIN_THERMAL_RANGE >> 1)
+                                      : 0);
+        g_smooth_high = (uint16_t)(g_smooth_low + MIN_THERMAL_RANGE);
         range = MIN_THERMAL_RANGE;
     } else if (unlikely(range == 0)) {
         range = 1;
@@ -1630,12 +1675,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         const uint16_t v = raw14[i];
         uint8_t linear_val;
 
-        if (v <= smooth_low) {
+        if (v <= g_smooth_low) {
             linear_val = 0;
-        } else if (v >= smooth_high) {
+        } else if (v >= g_smooth_high) {
             linear_val = 254;
         } else {
-            linear_val = (uint8_t)(((v - smooth_low) * mult) >> 16);
+            linear_val = (uint8_t)(((v - g_smooth_low) * mult) >> 16);
         }
 
         out[i + 1] = gamma_lut[linear_val];
@@ -1644,6 +1689,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             tud_task();
         }
     }
+
+    /* temperature range bytes at [PX_CNT+3..PX_CNT+6]; INT16_MAX = N/A */
+    out[PX_CNT + 3] = (uint8_t)((t_lo_x10 >> 8) & 0xFF);
+    out[PX_CNT + 4] = (uint8_t)(t_lo_x10 & 0xFF);
+    out[PX_CNT + 5] = (uint8_t)((t_hi_x10 >> 8) & 0xFF);
+    out[PX_CNT + 6] = (uint8_t)(t_hi_x10 & 0xFF);
 }
 
 static inline __attribute__((always_inline)) void binary_frame(
@@ -1749,7 +1800,7 @@ static inline __attribute__((always_inline)) void try_start_dma()
     if (ouomode == UOM_RAW_U16) {
         uart_tx_dma_start(norm_buf[b], TX_PAYLOAD);
     } else if (ouomode == UOM_CALI_U8) {
-        uart_tx_dma_start(norm_buf[b], PX_CNT + 1);
+        uart_tx_dma_start(norm_buf[b], PX_CNT + 7);
     }
 }
 
@@ -1780,6 +1831,8 @@ static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
                                calibadpt,
                                norm_buf[tx_idx],
                                PX_CNT);
+            norm_buf[tx_idx][PX_CNT + 1] = rawbuf[raw_idx][RAWBUF_OFS_ADC2];
+            norm_buf[tx_idx][PX_CNT + 2] = rawbuf[raw_idx][RAWBUF_OFS_ADC2 + 1];
         } else if (cmode == CM_ON) {
             if (caliidx < CALIBUF_CNT) {
                 binary_frame(rawbuf[raw_idx], calibuf[caliidx], PX_CNT);
@@ -1790,8 +1843,8 @@ static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
 
 static uint32_t curr_uartb;
 static bool flash_dm = false;
-static inline __attribute__((always_inline)) uint32_t baud_get2(
-    const uint8_t cmd)
+static inline __attribute__((always_inline)) uint32_t
+baud_get2(const uint8_t cmd)
 {
     uint32_t baud = 0;
     switch (cmd) {
@@ -1859,6 +1912,8 @@ static inline __attribute__((always_inline)) uint32_t baud_get2(
         baud = UBMCC;
         ouomode = UOM_CALI_U8;
         cmode = CM_ON;
+        dataomode = DOM_UART; /* override UVC mode so UART path runs */
+        caliidx = CALIBUF_IMG_L_IDX; /* reset capture index on each trigger */
         flash_dm = false;
         led_off();
         break;
@@ -1866,6 +1921,7 @@ static inline __attribute__((always_inline)) uint32_t baud_get2(
         baud = UBMDD;
         ouomode = UOM_CALI_U8;
         cmode = CM_OFF;
+        dataomode = DOM_UART; /* override UVC mode so dump path runs */
         flash_dm = true;
         break;
     default:
@@ -1922,8 +1978,37 @@ static inline __attribute__((always_inline)) void uart_poll2(
 {
     if (dataomode == DOM_UVC) {
         tud_task();
+        /* In UVC mode only accept explicit override commands (0xCC/0xDD).
+         * All other bytes are silently discarded to avoid corrupting UVC. */
+        if (!uart_is_readable(OUART)) {
+            return;
+        }
+        const uint8_t cmd = uart_getc(OUART);
+        if (cmd != 0xCC && cmd != 0xDD) {
+            return;
+        }
+        /* sel() sets dataomode = DOM_UART, cmode, caliidx, etc. */
+        const uint32_t baud = sel(cmd);
+        if (baud == 0 || baud == curr_uartb) {
+            return;
+        }
+        while (dma_busy) {
+            tight_loop_contents();
+        }
+        dma_channel_abort(uart_tx_dma_chan);
+        while (dma_channel_is_busy(uart_tx_dma_chan)) {
+            tight_loop_contents();
+        }
+        uart_deinit(OUART);
+        gpio_set_function(IO_OTX, GPIO_FUNC_UART);
+        gpio_set_function(IO_ORX, GPIO_FUNC_UART);
+        uart_init(OUART, baud);
+        uart_set_hw_flow(OUART, false, false);
+        uart_set_format(OUART, 8, 1, UART_PARITY_NONE);
+        curr_uartb = baud;
         return;
     }
+
     if (!uart_is_readable(OUART)) {
         return;
     }
@@ -2364,6 +2449,9 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
     return 0;
 }
 
+static void ffc_run(uint16_t cur_fpa_adc);
+static bool ffc_should_trigger(uint16_t cur_fpa_adc);
+
 void __time_critical_func(core1_rawbuf_consumer)()
 {
     int idx;
@@ -2477,6 +2565,24 @@ void __time_critical_func(core1_rawbuf_consumer)()
             }
         }
 
+        /* FFC: check trigger once per loop iteration when in normal output.
+         * Allow first FFC even without full calibration (calibg == nullptr);
+         * ffc_run() will set calibg = ram_calibg for subsequent frames. */
+        if (cmode == CM_OFF && (calibg != nullptr || !ffc_done_first)) {
+            const uint16_t cur_fpa =
+                (uint16_t)(((uint16_t)
+                                rawbuf[rawbuf_last_ready < 0
+                                           ? 0
+                                           : rawbuf_last_ready][RAWBUF_OFS_ADC2]
+                            << 8)
+                           | rawbuf[rawbuf_last_ready < 0 ? 0
+                                                          : rawbuf_last_ready]
+                                   [RAWBUF_OFS_ADC2 + 1]);
+            if (ffc_should_trigger(cur_fpa)) {
+                ffc_run(cur_fpa);
+            }
+        }
+
         if (!did_work) {
             __wfe();
         }
@@ -2540,6 +2646,93 @@ static inline __attribute__((always_inline)) void shutter_off()
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 0);
 #endif
+}
+
+/*
+ * ffc_run() — Flat-Field Correction, called from Core1.
+ *
+ * Closes the shutter, waits for one frame (now looking at a uniform surface),
+ * updates ram_calibg[] with that frame, resets calib_mean and the percentile
+ * smoother so the next output frame restarts from a clean baseline.
+ * Then opens the shutter and resumes normal capture.
+ *
+ * The update preserves the original gain map and mean_diff; only the
+ * per-pixel offset (background) and global mean are refreshed, correcting
+ * for FPA drift since the last full calibration.
+ */
+static void ffc_run(uint16_t cur_fpa_adc)
+{
+    println("FFC start");
+    led_on();
+
+    shutter_on(); /* close shutter (~200 ms) */
+
+    /* wait for Core0 to deliver a frame captured with shutter closed */
+    uint32_t timeout = 500;
+    while (rawbuf_pick_ready() < 0 && timeout--) {
+        sleep_ms(1);
+    }
+    int idx = rawbuf_pick_ready();
+    if (idx < 0) {
+        println("FFC: no frame, abort");
+        shutter_off();
+        led_off();
+        return;
+    }
+    __dmb();
+    rawbuf_state[idx] = RAWBUF_READING;
+
+    /* update per-pixel background from the shutter frame */
+    const uint8_t* src = rawbuf[idx];
+    uint64_t sum = 0;
+    for (size_t i = 0; i < PX_CNT; i++) {
+        /* must apply gray14_to_bin to match binary_calib_frame's processing */
+        const uint16_t v = gray14_to_bin(be16_to_u14(&src[i * 2]));
+        ram_calibg[i] = v;
+        sum += v;
+    }
+
+    rawbuf_state[idx] = RAWBUF_FREE;
+
+    /* ensure calibg points to the updated background even if no full
+     * calibration was loaded at boot (FFC provides offset-only correction) */
+    calibg = ram_calibg;
+
+    /* reset calib_mean and force binary_calib_frame to recompute it */
+    g_calib_mean = (int32_t)(sum / PX_CNT);
+    g_last_calib = nullptr; /* triggers recompute on next frame */
+
+    /* reset percentile smoother so display adapts immediately */
+    g_smooth_low = 0;
+    g_smooth_high = 0;
+
+    /* update FFC bookkeeping */
+    ffc_last_ms = to_ms_since_boot(get_absolute_time());
+    ffc_last_fpa_adc = cur_fpa_adc;
+    ffc_done_first = true;
+
+    shutter_off(); /* open shutter (~200 ms) */
+    led_off();
+    println("FFC done, calib_mean=%ld", (long)g_calib_mean);
+}
+
+static bool ffc_should_trigger(uint16_t cur_fpa_adc)
+{
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+    if (!ffc_done_first) {
+        return (now_ms >= FFC_INTERVAL_FIRST_MS);
+    }
+
+    const uint32_t elapsed = now_ms - ffc_last_ms;
+    if (elapsed >= FFC_INTERVAL_STABLE_MS) {
+        return true;
+    }
+
+    const uint16_t delta = (cur_fpa_adc > ffc_last_fpa_adc)
+        ? (cur_fpa_adc - ffc_last_fpa_adc)
+        : (ffc_last_fpa_adc - cur_fpa_adc);
+    return (delta >= FFC_TEMP_DELTA_ADC);
 }
 
 static inline __attribute__((always_inline)) uint16_t
@@ -2616,6 +2809,17 @@ int __time_critical_func(spi_init_40MHz4)()
     println("==========start==========");
     led_init();
 
+#if CLEAR_CALI_ON_BOOT
+    /* core1 not yet started — no multicore coordination needed,
+     * call erase function directly with interrupts disabled */
+    {
+        uint32_t save = save_and_disable_interrupts();
+        __flash_erase_cali__(nullptr);
+        restore_interrupts(save);
+    }
+    println("CLEAR_CALI_ON_BOOT: calibration flash erased.");
+#endif
+
     if (flash_header->has_data == FLASH_HAS_DATA_F) {
         memcpy(ram_badpts, flash_badpt, MAX_BADPT * sizeof(struct BadPt));
         calibadpt = ram_badpts;
@@ -2623,6 +2827,10 @@ int __time_critical_func(spi_init_40MHz4)()
         calibg = ram_calibg;
         memcpy(calibuf, flash_gain, PX_CNT * sizeof(float));
         caligain = (float*)calibuf;
+        if (flash_header->mean_diff > 0.0f) {
+            ram_mean_diff = flash_header->mean_diff;
+            ram_t_ref_low = flash_header->t_ref_low;
+        }
     }
 
 #define ADC_SAMPLES 1280
@@ -2680,6 +2888,9 @@ int __time_critical_func(spi_init_40MHz4)()
     extern void wspi_stop1();
     wspi_init1();
     println("spiclk = %llu", (uint64_t)spi1clk);
+
+    // Serein_Y
+    shutter_on();
 
     while (true) {
         rx_poll();
@@ -2763,21 +2974,31 @@ int __time_critical_func(spi_init_40MHz4)()
                             if (ntc < 100) {
                                 ntc = 0x1234;
                             }
-                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
+                            rawbuf[cur_buf][RAWBUF_OFS_ADC0] =
                                 (uint8_t)((ntc >> 8) & 0xFF);
-                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] =
+                            rawbuf[cur_buf][RAWBUF_OFS_ADC0 + 1] =
                                 (uint8_t)(ntc & 0xFF);
                             // shutter_off();
                             shutter_is_on = false;
                         } else {
-                            rawbuf[cur_buf][RAWBUFSIZETOTAL - 2] =
-                                rawbuf[cur_buf][RAWBUFSIZETOTAL - 1] = 0x00;
+                            rawbuf[cur_buf][RAWBUF_OFS_ADC0] =
+                                rawbuf[cur_buf][RAWBUF_OFS_ADC0 + 1] = 0x00;
                             // shutter_on();
                             shutter_is_on = true;
                         }
                     }
 
                     if (lidx == SENSOR_H && cur_buf >= 0) {
+                        /* D166 = VTEMP, big-endian 14-bit at bytes 338-339.
+                         * T(FPA) = 25 + (vtemp - 8192) / 70  [°C, factory cal]
+                         */
+                        const uint16_t vtemp =
+                            (((uint16_t)b->data[338] << 8) | b->data[339])
+                            & 0x3FFF;
+                        rawbuf[cur_buf][RAWBUF_OFS_ADC2] =
+                            (uint8_t)(vtemp >> 8);
+                        rawbuf[cur_buf][RAWBUF_OFS_ADC2 + 1] =
+                            (uint8_t)(vtemp & 0xFF);
                         __dmb();
                         rawbuf_state[cur_buf] = RAWBUF_READY;
                         rawbuf_last_ready = cur_buf;

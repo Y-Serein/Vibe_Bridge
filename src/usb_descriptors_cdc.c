@@ -123,7 +123,7 @@ enum {
 
 // array of pointer to string descriptors
 char const* string_desc_arr[] = {
-  // switched because board is little endian
+    // switched because board is little endian
     (const char[]) {0x09, 0x04}, // 0: supported language is English (0x0409)
     "Raspberry Pi", // 1: Manufacturer
     "Pico (2)", // 2: Product
