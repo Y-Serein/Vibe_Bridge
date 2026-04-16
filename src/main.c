@@ -328,6 +328,8 @@ static struct BadPt ram_badpts[MAX_BADPT];
 static float ram_mean_diff = 0.0f;
 static float ram_t_ref_low = 0.0f;
 #define T_REF_HIGH 50.0f
+#define BODY_ONLY_RESYNC_THRES    8u
+#define STARTUP_HEAD_SYNC_TIMEOUT 24u
 
 /* FFC: lifted from binary_calib_frame so FFC can reset them */
 static uint16_t g_smooth_low = 0;
@@ -2877,6 +2879,10 @@ int __time_critical_func(spi_init_40MHz4)()
     int32_t lidx = -1;
     int cur_buf = -1;
     uint8_t frame_group_cnt = 0;
+    uint8_t body_only_sync_cnt = 0;
+    uint8_t startup_sync_retry = 0;
+    bool sync_locked = false;
+    bool startup_synced = false;
 
     rawbuf_init();
 
@@ -2900,7 +2906,32 @@ int __time_critical_func(spi_init_40MHz4)()
             if (b->data[2] == 0xff && b->data[3] == 0x00
                 && b->data[BUFSIZE - 6] == 0xff
                 && b->data[BUFSIZE - 5] == 0x00) {
+                if (!startup_synced && !sync_locked) {
+                    if (b->data[5] == 0xec && b->data[BUFSIZE - 3] == 0xda) {
+                        sync_locked = true;
+                        startup_sync_retry = 0;
+                        body_only_sync_cnt = 0;
+                    } else {
+                        if (++startup_sync_retry >= STARTUP_HEAD_SYNC_TIMEOUT) {
+                            startup_sync_retry = 0;
+                            body_only_sync_cnt = 0;
+                            lidx = -1;
+                            cur_buf = -1;
+                            rawbuf_init();
+                            rxring.ridx = rxring.widx;
+                            wspi_stop1();
+                            sleep_ms(5);
+                            wspi_reinit1();
+                        }
+                        rxring.ridx = (rxring.ridx + 1) % BUFCOUNT;
+                        continue;
+                    }
+                }
+
                 if (b->data[5] == 0xec && b->data[BUFSIZE - 3] == 0xda) {
+                    if (!startup_synced) {
+                        body_only_sync_cnt = 0;
+                    }
                     frame_group_cnt++;
 
                     if (false
@@ -2933,6 +2964,22 @@ int __time_critical_func(spi_init_40MHz4)()
                     }
 
                 } else if (b->data[5] == 0xc7 && b->data[BUFSIZE - 3] == 0xda) {
+                    if (!startup_synced && (lidx < 0 || cur_buf < 0)) {
+                        if (++body_only_sync_cnt >= BODY_ONLY_RESYNC_THRES) {
+                            body_only_sync_cnt = 0;
+                            lidx = -1;
+                            cur_buf = -1;
+                            rawbuf_init();
+                            rxring.ridx = rxring.widx;
+                            wspi_stop1();
+                            sleep_ms(2);
+                            wspi_reinit1();
+                            rxring.ridx = rxring.widx;
+                            continue;
+                        }
+                    } else if (!startup_synced) {
+                        body_only_sync_cnt = 0;
+                    }
                     if (lidx >= 0 && cur_buf >= 0) {
                         if (lidx < SENSOR_H) {
                             rawbuf_copy_line(
@@ -3004,6 +3051,7 @@ int __time_critical_func(spi_init_40MHz4)()
                         rawbuf_last_ready = cur_buf;
                         __sev();
 
+                        startup_synced = true;
                         cur_buf = -1;
                         lidx = -1;
                     } else {
