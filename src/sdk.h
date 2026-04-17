@@ -184,8 +184,8 @@ struct yuv_cmap_simd {
 #define IO_NTC  26
 #define IO_FPA  28
 #define IO_SVMS 3
-#define IO_SVM1 5
-#define IO_SVM2 4
+#define IO_SVM1 4
+#define IO_SVM2 5
 #define IO_BTN  0
 
 #define MAIN_FUNC_MODE_SPI_INIT_25MHZ        0

@@ -327,6 +327,8 @@ static uint16_t ram_calibg[PX_CNT];
 static struct BadPt ram_badpts[MAX_BADPT];
 static float ram_mean_diff = 0.0f;
 static float ram_t_ref_low = 0.0f;
+static int32_t ram_l_ref_mean = 0;   /* mean of low-ref frame; fixed at boot, never changes */
+static int32_t ram_temp_anchor = 0;  /* temperature zero-point in corrected ADU; updated each FFC */
 #define T_REF_HIGH 50.0f
 #define BODY_ONLY_RESYNC_THRES    8u
 #define STARTUP_HEAD_SYNC_TIMEOUT 24u
@@ -338,7 +340,7 @@ static int32_t g_calib_mean = 0;
 static const uint16_t* g_last_calib = nullptr;
 
 /* FFC timing and state */
-#define FFC_INTERVAL_FIRST_MS  30000u
+#define FFC_INTERVAL_FIRST_MS  3000u
 #define FFC_INTERVAL_STABLE_MS 120000u
 #define FFC_TEMP_DELTA_ADC     150u
 static uint32_t ffc_last_ms = 0;
@@ -1646,16 +1648,19 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
 
     out[0] = 0xff;
 
-    /* compute frame temperature range from calibration mapping */
+    /* compute frame temperature range from calibration mapping.
+     * Use ram_l_ref_mean (low-ref frame mean, fixed at calibration time) as
+     * anchor instead of g_calib_mean, which drifts to shutter temperature
+     * after each FFC and would cause ~35°C absolute offset error. */
     int16_t t_lo_x10 = INT16_MAX;
     int16_t t_hi_x10 = INT16_MAX;
-    if (ram_mean_diff > 0.0f && calib != nullptr) {
+    if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
         const float t_span = T_REF_HIGH - ram_t_ref_low;
         const float k = t_span / ram_mean_diff;
         const float t_lo =
-            ram_t_ref_low + (float)((int32_t)g_smooth_low - g_calib_mean) * k;
+            ram_t_ref_low + (float)((int32_t)g_smooth_low - ram_temp_anchor) * k;
         const float t_hi =
-            ram_t_ref_low + (float)((int32_t)g_smooth_high - g_calib_mean) * k;
+            ram_t_ref_low + (float)((int32_t)g_smooth_high - ram_temp_anchor) * k;
         t_lo_x10 = (int16_t)(t_lo * 10.0f);
         t_hi_x10 = (int16_t)(t_hi * 10.0f);
     }
@@ -2704,6 +2709,23 @@ static void ffc_run(uint16_t cur_fpa_adc)
     g_calib_mean = (int32_t)(sum / PX_CNT);
     g_last_calib = nullptr; /* triggers recompute on next frame */
 
+    /* recompute temperature anchor to compensate for gain-weighted offset between
+     * the low-ref frame and this FFC shutter frame.  Without this, a shutter at a
+     * different temperature than the low-ref causes a constant offset on all
+     * temperature readings proportional to (avg_gain - 1) * ΔT_shutter.
+     *
+     * anchor = Σ(gain[i] * (l_ref[i] - shutter[i])) / N + shutter_mean
+     *
+     * Derivation: for scene at T, corrected_mean = anchor + avg_diff * α,
+     * so T_reading = T_L + (corrected_mean - anchor) * k = T_L + avg_diff*α*k = T_scene ✓ */
+    if (caligain != nullptr && ram_l_ref_mean > 0) {
+        float fsum = 0.0f;
+        for (size_t i = 0; i < PX_CNT; i++)
+            fsum += flash_gain[i] * ((float)flash_imgbg[i] - (float)ram_calibg[i]);
+        ram_temp_anchor = (int32_t)roundf(fsum / (float)PX_CNT + (float)g_calib_mean);
+        println("FFC anchor updated: %ld (was %ld)", (long)ram_temp_anchor, (long)ram_l_ref_mean);
+    }
+
     /* reset percentile smoother so display adapts immediately */
     g_smooth_low = 0;
     g_smooth_high = 0;
@@ -2827,6 +2849,12 @@ int __time_critical_func(spi_init_40MHz4)()
         calibadpt = ram_badpts;
         memcpy(ram_calibg, flash_imgbg, sizeof(ram_calibg));
         calibg = ram_calibg;
+        {
+            uint64_t sum = 0;
+            for (size_t i = 0; i < PX_CNT; i++) sum += ram_calibg[i];
+            ram_l_ref_mean  = (int32_t)(sum / PX_CNT);
+            ram_temp_anchor = ram_l_ref_mean; /* before first FFC, calibg == l_ref so anchor == l_ref_mean */
+        }
         memcpy(calibuf, flash_gain, PX_CNT * sizeof(float));
         caligain = (float*)calibuf;
         if (flash_header->mean_diff > 0.0f) {
