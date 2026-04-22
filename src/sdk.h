@@ -181,11 +181,9 @@ struct yuv_cmap_simd {
 #define IO_OTX  16
 #define IO_ORX  17
 #define OUART   uart0
-#define IO_NTC  26
-#define IO_FPA  28
 #define IO_SVMS 3
-#define IO_SVM1 4
-#define IO_SVM2 5
+#define IO_SVM1 5
+#define IO_SVM2 4
 #define IO_BTN  0
 
 #define MAIN_FUNC_MODE_SPI_INIT_25MHZ        0
@@ -198,7 +196,6 @@ struct yuv_cmap_simd {
 #define MAIN_FUNC_MODE_SPI_INIT_40MHZ_3      7
 #define MAIN_FUNC_MODE_SPI_INIT_40MHZ_4      8
 #define MAIN_FUNC_MODE_BAUD_SEL              9
-#define MAIN_FUNC_MODE_ADC                   10
 #define MAIN_FUNC_MODE_SHUTTER               11
 #define MAIN_FUNC_MODE_FLASH                 12
 #define MAIN_FUNC_MODE_GPIO0                 13

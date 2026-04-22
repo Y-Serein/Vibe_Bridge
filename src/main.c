@@ -1,6 +1,5 @@
 #include <bsp/board_api.h>
 #include <cmap/cmap.h>
-#include <hardware/adc.h>
 #include <hardware/clocks.h>
 #include <hardware/dma.h>
 #include <hardware/flash.h>
@@ -67,7 +66,6 @@ int uvc_func();
 int cdc_func();
 int spi_init_40MHz2_noinit();
 int baud_sel();
-int adc_func();
 int shutter_func();
 int flash_func();
 int gpio0_func();
@@ -116,8 +114,6 @@ int main()
     return spi_init_40MHz4();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_BAUD_SEL
     return baud_sel();
-#elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_ADC
-    return adc_func();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_SHUTTER
     return shutter_func();
 #elif MAIN_FUNC_MODE == MAIN_FUNC_MODE_FLASH
@@ -142,14 +138,18 @@ enum rawbuf_state {
     RAWBUF_READING,
 };
 
-#define RAWBUFADCCNT     2
 #define RAWBUFCNT        3
 #define RAWBUFSIZE       (SENSOR_W * SENSOR_H * 2)
 #define RAWBUFSIZEOFS    (SENSOR_H * 4)
-#define RAWBUFSIZEOFSADC (2 * RAWBUFADCCNT)
-#define RAWBUFSIZETOTAL  (RAWBUFSIZE + RAWBUFSIZEOFS + RAWBUFSIZEOFSADC)
-#define RAWBUF_OFS_ADC0  (RAWBUFSIZE + RAWBUFSIZEOFS)
-#define RAWBUF_OFS_ADC2  (RAWBUF_OFS_ADC0 + 2)
+#define RAWBUFSIZEOFSTAIL 2 /* trailing 2 bytes for VTEMP (BE 14-bit) */
+#define RAWBUFSIZETOTAL  (RAWBUFSIZE + RAWBUFSIZEOFS + RAWBUFSIZEOFSTAIL)
+/* Trailing metadata appended to each rawbuf after the pixel data:
+ *   RAWBUF_OFS_VTEMP : Sensor-internal FPA temperature register D166
+ *                      (2 bytes, BE, 14-bit).  Read from the SPI data
+ *                      stream, NOT from any Pico ADC.
+ *                      T_FPA = 25 + (vtemp - 8192) / 70  [°C, factory cal].
+ *                      FFC drift detection uses this field. */
+#define RAWBUF_OFS_VTEMP (RAWBUFSIZE + RAWBUFSIZEOFS)
 static uint8_t rawbuf[RAWBUFCNT][RAWBUFSIZETOTAL];
 static volatile uint8_t rawbuf_state[RAWBUFCNT];
 static volatile int rawbuf_last_ready;
@@ -342,10 +342,40 @@ static const uint16_t* g_last_calib = nullptr;
 /* FFC timing and state */
 #define FFC_INTERVAL_FIRST_MS  3000u
 #define FFC_INTERVAL_STABLE_MS 120000u
-#define FFC_TEMP_DELTA_ADC     150u
+#define FFC_VTEMP_DELTA_ADU     150u
 static uint32_t ffc_last_ms = 0;
-static uint16_t ffc_last_fpa_adc = 0;
+static uint16_t ffc_last_fpa_vtemp = 0;
+static uint16_t baseline_fpa_vtemp = 0;  /* VTEMP at 2nd FFC; never overwritten */
+static uint16_t ffc_count = 0;           /* number of FFCs run since boot */
 static bool ffc_done_first = false;
+
+/* FPA-drift-tracking anchor compensation.
+ *
+ * Physics: `ram_mean_diff` and the `ram_temp_anchor` FFC formula conspire to
+ * keep the anchor numerically pinned at mean(flash_imgbg), but the corrected
+ * frame mean for a scene at T_L actually drifts by mean(δ), where δ is the
+ * FPA self-emission drift from factory temperature. FFC updates `ram_calibg`
+ * but does NOT shift the anchor by mean(δ), so the drift persists and
+ * accumulates from power-on — matching the user-observed uniform 2–4°C drop
+ * that grows over 25 min and is NOT reset by FFC firings.
+ *
+ * Compensation:  effective_anchor = ram_temp_anchor
+ *                                 + FPA_ANCHOR_COMP_K * (cur_vtemp - baseline)
+ * where baseline = VTEMP at first FFC (assumed FPA≈factory temp at boot).
+ *
+ * Sign of K: empirical. This sensor's observed drift direction suggests
+ * negative K (readings drop while VTEMP evolution is small/noisy). Leave at 0
+ * until a timed single-target log pins down K vs ΔVTEMP correlation. */
+#define FPA_ANCHOR_COMP_K   0.0f
+
+/* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
+ *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
+ *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
+ *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
+ *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
+ *    [PX_CNT+19 .. +20] baseline_fpa_vtemp  u16   BE (first-FFC VTEMP; 0 before)
+ * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
+#define FRAME_DIAG_TAIL     14
 
 static inline __attribute__((always_inline)) void normalize_frame_be(
     uint8_t* raw, uint8_t* out)
@@ -1569,7 +1599,6 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     const size_t px_cnt)
 {
     static uint8_t gamma_lut[256];
-    static bool lut_inited = false;
     static uint16_t raw14[PX_CNT];
 
     uint16_t low = 0, high = 0;
@@ -1582,15 +1611,6 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         }
         g_calib_mean = (int32_t)(sum / px_cnt);
         g_last_calib = calib;
-    }
-
-    if (unlikely(!lut_inited)) {
-        for (int i = 0; i < 256; ++i) {
-            const float norm = (float)i / 254.0f;
-            const uint32_t val = (uint32_t)(powf(norm, 0.6f) * 254.0f);
-            gamma_lut[i] = (uint8_t)(val > 254 ? 254 : val);
-        }
-        lut_inited = true;
     }
 
     if (calib != nullptr && calig == nullptr) {
@@ -1649,20 +1669,73 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[0] = 0xff;
 
     /* compute frame temperature range from calibration mapping.
-     * Use ram_l_ref_mean (low-ref frame mean, fixed at calibration time) as
-     * anchor instead of g_calib_mean, which drifts to shutter temperature
-     * after each FFC and would cause ~35°C absolute offset error. */
+     * Bolometer ADU ∝ scene radiance ∝ T_K^4 (Stefan-Boltzmann), so two-point
+     * interpolation must be done in T^4 space, not linear-in-°C, otherwise a
+     * 0°C / 50°C calibration under-reads midrange by several degrees. */
+    /* VTEMP is the last two bytes of the rawbuf (BE 14-bit).  Used for
+     * between-FFC anchor drift compensation, see FPA_ANCHOR_COMP_K. */
+    const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
+
     int16_t t_lo_x10 = INT16_MAX;
     int16_t t_hi_x10 = INT16_MAX;
+    float t_lo_c_f = 0.0f, t_hi_c_f = 0.0f;
+    bool temp_map_ok = false;
+    int32_t eff_anchor = ram_temp_anchor;
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        const float t_span = T_REF_HIGH - ram_t_ref_low;
-        const float k = t_span / ram_mean_diff;
-        const float t_lo =
-            ram_t_ref_low + (float)((int32_t)g_smooth_low - ram_temp_anchor) * k;
-        const float t_hi =
-            ram_t_ref_low + (float)((int32_t)g_smooth_high - ram_temp_anchor) * k;
-        t_lo_x10 = (int16_t)(t_lo * 10.0f);
-        t_hi_x10 = (int16_t)(t_hi * 10.0f);
+        if (baseline_fpa_vtemp != 0 && FPA_ANCHOR_COMP_K != 0.0f) {
+            const int32_t dv =
+                (int32_t)cur_vtemp - (int32_t)baseline_fpa_vtemp;
+            eff_anchor += (int32_t)(FPA_ANCHOR_COMP_K * (float)dv);
+        }
+        const float T_L_K = ram_t_ref_low + 273.15f;
+        const float T_H_K = T_REF_HIGH + 273.15f;
+        const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
+        const float T_H_K4 = T_H_K * T_H_K * T_H_K * T_H_K;
+        const float dK4 = T_H_K4 - T_L_K4;
+        const float inv_md = 1.0f / ram_mean_diff;
+        const float f_lo =
+            (float)((int32_t)g_smooth_low - eff_anchor) * inv_md;
+        const float f_hi =
+            (float)((int32_t)g_smooth_high - eff_anchor) * inv_md;
+        float lo_K4 = T_L_K4 + f_lo * dK4;
+        float hi_K4 = T_L_K4 + f_hi * dK4;
+        if (lo_K4 < 1.0f) lo_K4 = 1.0f;
+        if (hi_K4 < 1.0f) hi_K4 = 1.0f;
+        t_lo_c_f = sqrtf(sqrtf(lo_K4)) - 273.15f;
+        t_hi_c_f = sqrtf(sqrtf(hi_K4)) - 273.15f;
+        t_lo_x10 = (int16_t)(t_lo_c_f * 10.0f);
+        t_hi_x10 = (int16_t)(t_hi_c_f * 10.0f);
+        temp_map_ok = true;
+    }
+
+    /* Per-frame temperature-linear LUT: map the ADU-linear intensity 0..254
+     * (which is linear in radiance within the scene window) to an output that
+     * is linear in °C within [t_lo_c_f, t_hi_c_f]. Replaces the old static
+     * gamma=0.6 LUT. Falls back to identity when no temperature mapping. */
+    {
+        const float t_span_c = t_hi_c_f - t_lo_c_f;
+        if (temp_map_ok && t_span_c > 0.01f) {
+            const float t_lo_k = t_lo_c_f + 273.15f;
+            const float t_hi_k = t_hi_c_f + 273.15f;
+            const float lo_K4 = t_lo_k * t_lo_k * t_lo_k * t_lo_k;
+            const float hi_K4 = t_hi_k * t_hi_k * t_hi_k * t_hi_k;
+            const float dK4 = hi_K4 - lo_K4;
+            const float inv_span = 254.0f / t_span_c;
+            for (int i = 0; i < 256; ++i) {
+                const float f = (float)i * (1.0f / 254.0f);
+                float k4 = lo_K4 + f * dK4;
+                if (k4 < 1.0f) k4 = 1.0f;
+                const float t_c = sqrtf(sqrtf(k4)) - 273.15f;
+                float o = (t_c - t_lo_c_f) * inv_span;
+                if (o < 0.0f) o = 0.0f;
+                if (o > 254.0f) o = 254.0f;
+                gamma_lut[i] = (uint8_t)o;
+            }
+        } else {
+            for (int i = 0; i < 256; ++i) {
+                gamma_lut[i] = (uint8_t)(i > 254 ? 254 : i);
+            }
+        }
     }
 
     uint32_t range = g_smooth_high - g_smooth_low;
@@ -1702,6 +1775,25 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[PX_CNT + 4] = (uint8_t)(t_lo_x10 & 0xFF);
     out[PX_CNT + 5] = (uint8_t)((t_hi_x10 >> 8) & 0xFF);
     out[PX_CNT + 6] = (uint8_t)(t_hi_x10 & 0xFF);
+
+    /* diagnostic tail — all big-endian, see FRAME_DIAG_TAIL comment */
+    const uint32_t anch_u = (uint32_t)ram_temp_anchor;
+    out[PX_CNT +  7] = (uint8_t)(anch_u >> 24);
+    out[PX_CNT +  8] = (uint8_t)(anch_u >> 16);
+    out[PX_CNT +  9] = (uint8_t)(anch_u >>  8);
+    out[PX_CNT + 10] = (uint8_t)(anch_u      );
+    out[PX_CNT + 11] = (uint8_t)(g_smooth_low  >> 8);
+    out[PX_CNT + 12] = (uint8_t)(g_smooth_low      );
+    out[PX_CNT + 13] = (uint8_t)(g_smooth_high >> 8);
+    out[PX_CNT + 14] = (uint8_t)(g_smooth_high     );
+    uint32_t md_u;
+    memcpy(&md_u, &ram_mean_diff, sizeof(md_u));
+    out[PX_CNT + 15] = (uint8_t)(md_u >> 24);
+    out[PX_CNT + 16] = (uint8_t)(md_u >> 16);
+    out[PX_CNT + 17] = (uint8_t)(md_u >>  8);
+    out[PX_CNT + 18] = (uint8_t)(md_u      );
+    out[PX_CNT + 19] = (uint8_t)(baseline_fpa_vtemp >> 8);
+    out[PX_CNT + 20] = (uint8_t)(baseline_fpa_vtemp     );
 }
 
 static inline __attribute__((always_inline)) void binary_frame(
@@ -1807,7 +1899,7 @@ static inline __attribute__((always_inline)) void try_start_dma()
     if (ouomode == UOM_RAW_U16) {
         uart_tx_dma_start(norm_buf[b], TX_PAYLOAD);
     } else if (ouomode == UOM_CALI_U8) {
-        uart_tx_dma_start(norm_buf[b], PX_CNT + 7);
+        uart_tx_dma_start(norm_buf[b], PX_CNT + 7 + FRAME_DIAG_TAIL);
     }
 }
 
@@ -1838,8 +1930,8 @@ static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
                                calibadpt,
                                norm_buf[tx_idx],
                                PX_CNT);
-            norm_buf[tx_idx][PX_CNT + 1] = rawbuf[raw_idx][RAWBUF_OFS_ADC2];
-            norm_buf[tx_idx][PX_CNT + 2] = rawbuf[raw_idx][RAWBUF_OFS_ADC2 + 1];
+            norm_buf[tx_idx][PX_CNT + 1] = rawbuf[raw_idx][RAWBUF_OFS_VTEMP];
+            norm_buf[tx_idx][PX_CNT + 2] = rawbuf[raw_idx][RAWBUF_OFS_VTEMP + 1];
         } else if (cmode == CM_ON) {
             if (caliidx < CALIBUF_CNT) {
                 binary_frame(rawbuf[raw_idx], calibuf[caliidx], PX_CNT);
@@ -2456,8 +2548,8 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
     return 0;
 }
 
-static void ffc_run(uint16_t cur_fpa_adc);
-static bool ffc_should_trigger(uint16_t cur_fpa_adc);
+static void ffc_run(uint16_t cur_fpa_vtemp);
+static bool ffc_should_trigger(uint16_t cur_fpa_vtemp);
 
 void __time_critical_func(core1_rawbuf_consumer)()
 {
@@ -2580,11 +2672,11 @@ void __time_critical_func(core1_rawbuf_consumer)()
                 (uint16_t)(((uint16_t)
                                 rawbuf[rawbuf_last_ready < 0
                                            ? 0
-                                           : rawbuf_last_ready][RAWBUF_OFS_ADC2]
+                                           : rawbuf_last_ready][RAWBUF_OFS_VTEMP]
                             << 8)
                            | rawbuf[rawbuf_last_ready < 0 ? 0
                                                           : rawbuf_last_ready]
-                                   [RAWBUF_OFS_ADC2 + 1]);
+                                   [RAWBUF_OFS_VTEMP + 1]);
             if (ffc_should_trigger(cur_fpa)) {
                 ffc_run(cur_fpa);
             }
@@ -2667,24 +2759,56 @@ static inline __attribute__((always_inline)) void shutter_off()
  * per-pixel offset (background) and global mean are refreshed, correcting
  * for FPA drift since the last full calibration.
  */
-static void ffc_run(uint16_t cur_fpa_adc)
+static void ffc_run(uint16_t cur_fpa_vtemp)
 {
     println("FFC start");
     led_on();
 
     shutter_on(); /* close shutter (~200 ms) */
 
-    /* wait for Core0 to deliver a frame captured with shutter closed */
-    uint32_t timeout = 500;
-    while (rawbuf_pick_ready() < 0 && timeout--) {
-        sleep_ms(1);
+    /* Discard all frames currently in the ring: they may have been captured
+     * while the shutter was still mechanically closing (or entirely before
+     * the pulse), and using such a frame as ram_calibg bakes the scene into
+     * the background, producing a negative ghost on every subsequent frame. */
+    for (int i = 0; i < RAWBUFCNT; i++) {
+        if (rawbuf_state[i] == RAWBUF_READY) {
+            rawbuf_state[i] = RAWBUF_FREE;
+        }
     }
-    int idx = rawbuf_pick_ready();
-    if (idx < 0) {
-        println("FFC: no frame, abort");
-        shutter_off();
-        led_off();
-        return;
+    __dmb();
+    rawbuf_last_ready = -1;
+    __sev();
+
+    /* Wait for TWO fresh frames from Core0.  The first new frame may still
+     * straddle the shutter-close boundary (started before, finished after),
+     * so we drop it and use the second, which is guaranteed to be captured
+     * entirely with the shutter closed. */
+    int idx = -1;
+    for (int pass = 0; pass < 2; pass++) {
+        idx = -1;
+        uint32_t timeout = 300;
+        while (idx < 0 && timeout--) {
+            for (int i = 0; i < RAWBUFCNT; i++) {
+                if (rawbuf_state[i] == RAWBUF_READY) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                sleep_ms(1);
+            }
+        }
+        if (idx < 0) {
+            println("FFC: no frame, abort");
+            shutter_off();
+            led_off();
+            return;
+        }
+        if (pass == 0) {
+            /* drop the straddle frame */
+            rawbuf_state[idx] = RAWBUF_FREE;
+            __dmb();
+        }
     }
     __dmb();
     rawbuf_state[idx] = RAWBUF_READING;
@@ -2732,7 +2856,15 @@ static void ffc_run(uint16_t cur_fpa_adc)
 
     /* update FFC bookkeeping */
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
-    ffc_last_fpa_adc = cur_fpa_adc;
+    ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    ffc_count++;
+    if (ffc_count == 2) {
+        /* Skip the 1st FFC (~3 s after boot): shutter just opened and VTEMP
+         * is still in a transient (observed ~100+ ADU off steady-state).
+         * The 2nd FFC (~123 s) runs on a settled sensor and gives a stable
+         * VTEMP reference point for the K·ΔVTEMP compensation below. */
+        baseline_fpa_vtemp = cur_fpa_vtemp;
+    }
     ffc_done_first = true;
 
     shutter_off(); /* open shutter (~200 ms) */
@@ -2740,7 +2872,7 @@ static void ffc_run(uint16_t cur_fpa_adc)
     println("FFC done, calib_mean=%ld", (long)g_calib_mean);
 }
 
-static bool ffc_should_trigger(uint16_t cur_fpa_adc)
+static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
 {
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
@@ -2753,40 +2885,10 @@ static bool ffc_should_trigger(uint16_t cur_fpa_adc)
         return true;
     }
 
-    const uint16_t delta = (cur_fpa_adc > ffc_last_fpa_adc)
-        ? (cur_fpa_adc - ffc_last_fpa_adc)
-        : (ffc_last_fpa_adc - cur_fpa_adc);
-    return (delta >= FFC_TEMP_DELTA_ADC);
-}
-
-static inline __attribute__((always_inline)) uint16_t
-adc_read_trimmed_mean_from_buf(const uint16_t* data, const uint32_t size)
-{
-    uint32_t sum = 0;
-    uint16_t min = 0xffff;
-    uint16_t max = 0x0000;
-
-    if (!data || size < 3) {
-        return 0;
-    }
-
-    for (uint32_t i = 0; i < size; i++) {
-        uint16_t v = data[i];
-
-        sum += v;
-
-        if (v < min) {
-            min = v;
-        }
-        if (v > max) {
-            max = v;
-        }
-    }
-
-    sum -= min;
-    sum -= max;
-
-    return (uint16_t)(sum / (size - 2));
+    const uint16_t delta = (cur_fpa_vtemp > ffc_last_fpa_vtemp)
+        ? (cur_fpa_vtemp - ffc_last_fpa_vtemp)
+        : (ffc_last_fpa_vtemp - cur_fpa_vtemp);
+    return (delta >= FFC_VTEMP_DELTA_ADU);
 }
 
 int __time_critical_func(spi_init_40MHz4)()
@@ -2863,26 +2965,6 @@ int __time_critical_func(spi_init_40MHz4)()
         }
     }
 
-#define ADC_SAMPLES 1280
-    const uint32_t adcsamp = ADC_SAMPLES;
-    static uint16_t adcbuf[ADC_SAMPLES];
-#undef ADC_SAMPLES
-    memset(adcbuf, 0x00, adcsamp * sizeof(uint16_t));
-
-    gpio_deinit(IO_NTC);
-    adc_init();
-    adc_gpio_init(IO_NTC);
-    adc_select_input(0);
-    adc_fifo_setup(true, true, 1, false, false);
-    int adcdch = dma_claim_unused_channel(true);
-    dma_channel_config adcdcfg = dma_channel_get_default_config(adcdch);
-    channel_config_set_transfer_data_size(&adcdcfg, DMA_SIZE_16);
-    channel_config_set_read_increment(&adcdcfg, false);
-    channel_config_set_write_increment(&adcdcfg, true);
-    channel_config_set_dreq(&adcdcfg, DREQ_ADC);
-    dma_channel_configure(
-        adcdch, &adcdcfg, adcbuf, &adc_hw->fifo, adcsamp, false);
-
     gpio_init(IO_SVMS);
     gpio_set_dir(IO_SVMS, true);
     gpio_put(IO_SVMS, 0);
@@ -2900,7 +2982,6 @@ int __time_critical_func(spi_init_40MHz4)()
     gpio_put(IO_SVMS, 0);
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 0);
-    bool shutter_is_on = false;
 
     extern uint spi1clk;
     spi1clk = 45000000;
@@ -2979,10 +3060,6 @@ int __time_critical_func(spi_init_40MHz4)()
                         }
 
                         if (cur_buf >= 0) {
-                            if (ouomode == UOM_RAW_U16) {
-                                adc_run(true);
-                                dma_channel_start(adcdch);
-                            }
                             rawbuf_copy_line(
                                 cur_buf, lidx, &b->data[14], SENSOR_W * 2);
                             lidx++;
@@ -3029,40 +3106,6 @@ int __time_critical_func(spi_init_40MHz4)()
                         }
                     }
 
-                    if (ouomode == UOM_RAW_U16) {
-                        if (lidx == SENSOR_H) {
-                            dma_channel_wait_for_finish_blocking(adcdch);
-                        } else {
-                            dma_channel_abort(adcdch);
-                        }
-
-                        adc_run(false);
-                        dma_channel_configure(adcdch,
-                                              &adcdcfg,
-                                              adcbuf,
-                                              &adc_hw->fifo,
-                                              adcsamp,
-                                              false);
-                        if (shutter_is_on) {
-                            uint16_t ntc =
-                                adc_read_trimmed_mean_from_buf(adcbuf, adcsamp);
-                            if (ntc < 100) {
-                                ntc = 0x1234;
-                            }
-                            rawbuf[cur_buf][RAWBUF_OFS_ADC0] =
-                                (uint8_t)((ntc >> 8) & 0xFF);
-                            rawbuf[cur_buf][RAWBUF_OFS_ADC0 + 1] =
-                                (uint8_t)(ntc & 0xFF);
-                            // shutter_off();
-                            shutter_is_on = false;
-                        } else {
-                            rawbuf[cur_buf][RAWBUF_OFS_ADC0] =
-                                rawbuf[cur_buf][RAWBUF_OFS_ADC0 + 1] = 0x00;
-                            // shutter_on();
-                            shutter_is_on = true;
-                        }
-                    }
-
                     if (lidx == SENSOR_H && cur_buf >= 0) {
                         /* D166 = VTEMP, big-endian 14-bit at bytes 338-339.
                          * T(FPA) = 25 + (vtemp - 8192) / 70  [°C, factory cal]
@@ -3070,9 +3113,9 @@ int __time_critical_func(spi_init_40MHz4)()
                         const uint16_t vtemp =
                             (((uint16_t)b->data[338] << 8) | b->data[339])
                             & 0x3FFF;
-                        rawbuf[cur_buf][RAWBUF_OFS_ADC2] =
+                        rawbuf[cur_buf][RAWBUF_OFS_VTEMP] =
                             (uint8_t)(vtemp >> 8);
-                        rawbuf[cur_buf][RAWBUF_OFS_ADC2 + 1] =
+                        rawbuf[cur_buf][RAWBUF_OFS_VTEMP + 1] =
                             (uint8_t)(vtemp & 0xFF);
                         __dmb();
                         rawbuf_state[cur_buf] = RAWBUF_READY;
@@ -3210,39 +3253,6 @@ int baud_sel()
     while (true) {
         uart_poll(baud_get);
         uart_write_blocking(OUART, (const uint8_t*)string, strlen(string));
-        sleep_ms(1000);
-    }
-#endif
-
-    errh(nullptr);
-    return 0;
-}
-
-int adc_func()
-{
-#if MAIN_FUNC_MODE == MAIN_FUNC_MODE_ADC
-    set_sys_clock_khz(160000, true);
-    sleep_ms(10);
-    clock_configure(clk_peri,
-                    0,
-                    CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-                    160 * MHZ,
-                    160 * MHZ);
-    extern void dutx_init();
-    dutx_init();
-
-    println("MODE: %s", __PRETTY_FUNCTION__);
-    println("==========start==========");
-    gpio_init(IO_LED);
-    gpio_set_dir(IO_LED, true);
-    adc_init();
-    adc_gpio_init(IO_NTC);
-    adc_select_input(0);
-
-    while (true) {
-        uint16_t value = adc_read();
-        println("%llu", (uint64_t)value);
-        gpio_put(IO_LED, !gpio_get(IO_LED));
         sleep_ms(1000);
     }
 #endif
