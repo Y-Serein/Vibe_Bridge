@@ -155,6 +155,15 @@ static volatile uint8_t rawbuf_state[RAWBUFCNT];
 static volatile int rawbuf_last_ready;
 static enum UartOutMode ouomode = UART_OUT_MODE_DEF;
 
+/* Per-frame VTEMP accumulator.  The sensor emits 2 u16 VTEMP samples at the
+ * end of every row (bytes 324-325 in each per-row SPI buffer = the first u16
+ * of the 4-byte per-row tail).  Averaging all 120 rows reduces VTEMP noise
+ * ~11× (√120) vs. reading a single row at end-of-frame.  Without this the
+ * FPA-temperature signal is buried under single-sample noise — apparent
+ * VTEMP swings are too small to reliably track sensor self-heating. */
+static uint32_t rawbuf_vtemp_sum[RAWBUFCNT];
+static uint16_t rawbuf_vtemp_cnt[RAWBUFCNT];
+
 static inline __attribute__((always_inline)) void rawbuf_init(void)
 {
     for (int i = 0; i < RAWBUFCNT; i++) {
@@ -179,6 +188,20 @@ static inline __attribute__((always_inline)) void rawbuf_copy_line(
     if (line >= SENSOR_H) {
         return;
     }
+
+    /* Per-line VTEMP accumulation.  Row tail starts at src + SENSOR_W*2 + 4
+     * (after the 4 skipped bytes between pixels and row-ext); first u16 is
+     * the FPA temperature register (same as the single-sample extraction
+     * that the end-of-frame block does at b->data[338..339]). */
+    if (line == 0) {
+        rawbuf_vtemp_sum[buf_idx] = 0;
+        rawbuf_vtemp_cnt[buf_idx] = 0;
+    }
+    const uint16_t line_vtemp =
+        ((((uint16_t)src[SENSOR_W * 2 + 4]) << 8) | src[SENSOR_W * 2 + 5])
+        & 0x3FFF;
+    rawbuf_vtemp_sum[buf_idx] += line_vtemp;
+    rawbuf_vtemp_cnt[buf_idx]++;
 
     if (ouomode == UOM_RAW_U16) {
         const size_t line_stride = SENSOR_W * 2 + 4;
@@ -339,34 +362,55 @@ static uint16_t g_smooth_high = 0;
 static int32_t g_calib_mean = 0;
 static const uint16_t* g_last_calib = nullptr;
 
-/* FFC timing and state */
-#define FFC_INTERVAL_FIRST_MS  3000u
+/* FFC timing and state.
+ *
+ * Warmup schedule: the first ~25 s after boot sees ~2000 ADU of VTEMP travel
+ * from bolometer self-heating, which directly drives scene-reading drift.
+ * To cancel this we need K auto-fit (requires ≥ 3 FFCs) to activate BEFORE
+ * warmup ends — so we force three rapid FFCs during warmup (t≈3, 6, 10 s),
+ * one more at the tail end (t≈30 s) to freshen calibg at the settled FPA,
+ * and only then switch to the 120 s stable cadence. */
+#define FFC_INTERVAL_FIRST_MS  3000u    /* 1st FFC at t≈3 s */
+#define FFC_INTERVAL_WARMUP_2  3000u    /* 2nd FFC 3 s after 1st → t≈6 s */
+#define FFC_INTERVAL_WARMUP_3  4000u    /* 3rd FFC 4 s after 2nd → t≈10 s (K-fit activates) */
+#define FFC_INTERVAL_WARMUP_4  20000u   /* 4th FFC 20 s after 3rd → t≈30 s (post-warmup) */
 #define FFC_INTERVAL_STABLE_MS 120000u
 #define FFC_VTEMP_DELTA_ADU     150u
 static uint32_t ffc_last_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
-static uint16_t baseline_fpa_vtemp = 0;  /* VTEMP at 2nd FFC; never overwritten */
-static uint16_t ffc_count = 0;           /* number of FFCs run since boot */
-static bool ffc_done_first = false;
+static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
+static uint16_t baseline_fpa_vtemp = 0;      /* VTEMP at 2nd FFC; K-fit reference */
+static int32_t  baseline_g_calib_mean = 0;   /* g_calib_mean at 2nd FFC; K-fit reference */
+static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
+static bool     ffc_done_first = false;
 
-/* FPA-drift-tracking anchor compensation.
+/* Runtime-fit FPA-drift compensation.
  *
- * Physics: `ram_mean_diff` and the `ram_temp_anchor` FFC formula conspire to
- * keep the anchor numerically pinned at mean(flash_imgbg), but the corrected
- * frame mean for a scene at T_L actually drifts by mean(δ), where δ is the
- * FPA self-emission drift from factory temperature. FFC updates `ram_calibg`
- * but does NOT shift the anchor by mean(δ), so the drift persists and
- * accumulates from power-on — matching the user-observed uniform 2–4°C drop
- * that grows over 25 min and is NOT reset by FFC firings.
+ * Problem: with near-uniform per-pixel gain, the FFC anchor formula
+ *   anchor = mean(gain*(flash_imgbg - ram_calibg)) + g_calib_mean
+ * collapses to mean(flash_imgbg) = ram_l_ref_mean, a compile-time constant.
+ * Between FFCs, ram_calibg and g_calib_mean are frozen, so corrected_mean of
+ * a fixed scene drifts linearly with FPA self-emission (≈ with VTEMP). The
+ * reported T therefore drifts without bound across the 2-min FFC interval.
  *
- * Compensation:  effective_anchor = ram_temp_anchor
- *                                 + FPA_ANCHOR_COMP_K * (cur_vtemp - baseline)
- * where baseline = VTEMP at first FFC (assumed FPA≈factory temp at boot).
- *
- * Sign of K: empirical. This sensor's observed drift direction suggests
- * negative K (readings drop while VTEMP evolution is small/noisy). Leave at 0
- * until a timed single-target log pins down K vs ΔVTEMP correlation. */
-#define FPA_ANCHOR_COMP_K   0.0f
+ * Fix: eff_anchor = ram_temp_anchor + K * (cur_vtemp - ffc_last_fpa_vtemp)
+ * where K is auto-fit at each FFC (≥ 3rd) as dg_calib_mean/dVTEMP across FFCs.
+ * g_calib_mean is the mean of the shutter frame; the shutter is a uniform
+ * FPA-temperature blackbody, so its drift across FFCs directly measures
+ * dmean(raw)/dVTEMP for a fixed scene — which is exactly what eff_anchor
+ * must cancel between FFCs to hold the report steady. */
+
+/* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
+ *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
+ *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
+ *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
+ *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
+ *    [PX_CNT+19 .. +20] baseline_fpa_vtemp  u16   BE (2nd-FFC VTEMP; 0 before)
+ * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
+#define FRAME_DIAG_TAIL     14
+
+static float runtime_k_ancomp = 0.0f;   /* dg_calib_mean / dVTEMP, fit across FFCs */
+static bool  runtime_k_valid  = false;
 
 /* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
  *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
@@ -1668,12 +1712,29 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
 
     out[0] = 0xff;
 
+    /* Floor the displayed scene window to MIN_THERMAL_RANGE *before* computing
+     * t_lo/t_hi and the gamma LUT, so color-bar labels, LUT, and per-pixel
+     * mapping all use the same window.  Without this floor, static / uniform
+     * scenes (occluded lens, blank wall) with Δsmooth ≈ 100 ADU would stretch
+     * the full color map over that tiny range, exposing FPN and ghost
+     * artifacts that are otherwise masked by scene dynamics. */
+    {
+        const uint32_t range0 = g_smooth_high - g_smooth_low;
+        if (unlikely(range0 < MIN_THERMAL_RANGE)) {
+            const uint32_t center = g_smooth_low + (range0 >> 1);
+            g_smooth_low = (uint16_t)(center > (MIN_THERMAL_RANGE >> 1)
+                                          ? center - (MIN_THERMAL_RANGE >> 1)
+                                          : 0);
+            g_smooth_high = (uint16_t)(g_smooth_low + MIN_THERMAL_RANGE);
+        }
+    }
+
     /* compute frame temperature range from calibration mapping.
      * Bolometer ADU ∝ scene radiance ∝ T_K^4 (Stefan-Boltzmann), so two-point
      * interpolation must be done in T^4 space, not linear-in-°C, otherwise a
      * 0°C / 50°C calibration under-reads midrange by several degrees. */
     /* VTEMP is the last two bytes of the rawbuf (BE 14-bit).  Used for
-     * between-FFC anchor drift compensation, see FPA_ANCHOR_COMP_K. */
+     * between-FFC anchor drift compensation via runtime_k_ancomp. */
     const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
 
     int16_t t_lo_x10 = INT16_MAX;
@@ -1682,10 +1743,10 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     bool temp_map_ok = false;
     int32_t eff_anchor = ram_temp_anchor;
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        if (baseline_fpa_vtemp != 0 && FPA_ANCHOR_COMP_K != 0.0f) {
+        if (runtime_k_valid && ffc_last_fpa_vtemp != 0) {
             const int32_t dv =
-                (int32_t)cur_vtemp - (int32_t)baseline_fpa_vtemp;
-            eff_anchor += (int32_t)(FPA_ANCHOR_COMP_K * (float)dv);
+                (int32_t)cur_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            eff_anchor += (int32_t)(runtime_k_ancomp * (float)dv);
         }
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
@@ -1738,17 +1799,8 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         }
     }
 
-    uint32_t range = g_smooth_high - g_smooth_low;
-    if (unlikely(range < MIN_THERMAL_RANGE)) {
-        const uint32_t center = g_smooth_low + (range >> 1);
-        g_smooth_low = (uint16_t)(center > (MIN_THERMAL_RANGE >> 1)
-                                      ? center - (MIN_THERMAL_RANGE >> 1)
-                                      : 0);
-        g_smooth_high = (uint16_t)(g_smooth_low + MIN_THERMAL_RANGE);
-        range = MIN_THERMAL_RANGE;
-    } else if (unlikely(range == 0)) {
-        range = 1;
-    }
+    /* range is already ≥ MIN_THERMAL_RANGE (floored above). */
+    const uint32_t range = g_smooth_high - g_smooth_low;
     const uint32_t mult = (254 << 16) / range;
 
     for (int i = 0; i < PX_CNT; i++) {
@@ -2842,28 +2894,92 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      *
      * Derivation: for scene at T, corrected_mean = anchor + avg_diff * α,
      * so T_reading = T_L + (corrected_mean - anchor) * k = T_L + avg_diff*α*k = T_scene ✓ */
+    const int32_t anchor_old = ram_temp_anchor;
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
         for (size_t i = 0; i < PX_CNT; i++)
             fsum += flash_gain[i] * ((float)flash_imgbg[i] - (float)ram_calibg[i]);
         ram_temp_anchor = (int32_t)roundf(fsum / (float)PX_CNT + (float)g_calib_mean);
-        println("FFC anchor updated: %ld (was %ld)", (long)ram_temp_anchor, (long)ram_l_ref_mean);
+
+        /* Persist the K·ΔVTEMP compensation accumulated since last FFC into
+         * ram_temp_anchor. Without this, the compensation term resets to 0
+         * right after FFC (because ffc_last_fpa_vtemp gets refreshed to the
+         * current VTEMP below), and each FFC silently rolls back the drift
+         * correction — producing a sawtooth drift pattern instead of fixing
+         * the underlying problem. */
+        if (runtime_k_valid && ffc_last_fpa_vtemp != 0) {
+            const int32_t dv_acc =
+                (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            const int32_t comp_acc =
+                (int32_t)(runtime_k_ancomp * (float)dv_acc);
+            ram_temp_anchor += comp_acc;
+            println("FFC anchor+K: base=%ld comp_acc=%ld final=%ld",
+                    (long)(ram_temp_anchor - comp_acc), (long)comp_acc,
+                    (long)ram_temp_anchor);
+        } else {
+            println("FFC anchor updated: %ld (was %ld)",
+                    (long)ram_temp_anchor, (long)anchor_old);
+        }
     }
 
-    /* reset percentile smoother so display adapts immediately */
-    g_smooth_low = 0;
-    g_smooth_high = 0;
+    /* Auto-fit K = dg_calib_mean / dVTEMP across FFCs, taking the 2nd FFC as
+     * the K-fit baseline (sensor settled). Need enough VTEMP travel to avoid
+     * fitting on ADU noise; 30 ADU ≈ ~0.4 °C FPA swing, balanced between
+     * "fit activates early" and "don't fit on jitter". Clamp the result to a
+     * physically plausible range — a runaway K (tiny dv, large dg, or sign
+     * flip during non-monotonic VTEMP) would drive eff_anchor far off and
+     * make the report worse than the un-compensated baseline. */
+    if (ffc_count >= 2 && baseline_fpa_vtemp != 0) {
+        const int32_t dv = (int32_t)cur_fpa_vtemp - (int32_t)baseline_fpa_vtemp;
+        const int32_t dg = g_calib_mean - baseline_g_calib_mean;
+        if (dv > 100 || dv < -100) {
+            const float k_new = (float)dg / (float)dv;
+            if (k_new > -5.0f && k_new < 5.0f) {
+                runtime_k_ancomp = k_new;
+                runtime_k_valid = true;
+                println("K fit: dv=%ld dg=%ld k=%.4f",
+                        (long)dv, (long)dg, (double)runtime_k_ancomp);
+            } else {
+                println("K skip: dv=%ld dg=%ld k=%.4f out of range",
+                        (long)dv, (long)dg, (double)k_new);
+            }
+        } else {
+            println("K skip: |dv|=%ld below threshold", (long)(dv < 0 ? -dv : dv));
+        }
+    }
+
+    /* Carry the percentile smoother across FFC by shifting with Δanchor,
+     * instead of resetting to 0. A full reset causes a one-frame spike on
+     * trend plots because the next frame reseeds g_smooth from raw percentiles.
+     * Shifting keeps (g_smooth - anchor)/mean_diff continuous, so the reported
+     * temperature window stays stable across the shutter event. The first FFC
+     * still clears: any pre-first-FFC smoother state was computed with a stale
+     * calibg and is not salvageable. */
+    if (ffc_done_first && g_smooth_low != 0 && g_smooth_high != 0) {
+        const int32_t delta = ram_temp_anchor - anchor_old;
+        int32_t nl = (int32_t)g_smooth_low  + delta;
+        int32_t nh = (int32_t)g_smooth_high + delta;
+        if (nl < 0) nl = 0; else if (nl > 0xFFFF) nl = 0xFFFF;
+        if (nh < 0) nh = 0; else if (nh > 0xFFFF) nh = 0xFFFF;
+        g_smooth_low  = (uint16_t)nl;
+        g_smooth_high = (uint16_t)nh;
+    } else {
+        g_smooth_low  = 0;
+        g_smooth_high = 0;
+    }
 
     /* update FFC bookkeeping */
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
     ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
     if (ffc_count == 2) {
         /* Skip the 1st FFC (~3 s after boot): shutter just opened and VTEMP
          * is still in a transient (observed ~100+ ADU off steady-state).
          * The 2nd FFC (~123 s) runs on a settled sensor and gives a stable
-         * VTEMP reference point for the K·ΔVTEMP compensation below. */
-        baseline_fpa_vtemp = cur_fpa_vtemp;
+         * (VTEMP, g_calib_mean) baseline for the K auto-fit above. */
+        baseline_fpa_vtemp    = cur_fpa_vtemp;
+        baseline_g_calib_mean = g_calib_mean;
     }
     ffc_done_first = true;
 
@@ -2880,8 +2996,19 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
         return (now_ms >= FFC_INTERVAL_FIRST_MS);
     }
 
+    /* Select target interval based on which FFC we're waiting for.
+     * ffc_count here is the number of FFCs COMPLETED, so ffc_count==1 means
+     * we're deciding when to fire FFC #2, etc. */
+    uint32_t target_interval;
+    switch (ffc_count) {
+        case 1:  target_interval = FFC_INTERVAL_WARMUP_2; break;
+        case 2:  target_interval = FFC_INTERVAL_WARMUP_3; break;
+        case 3:  target_interval = FFC_INTERVAL_WARMUP_4; break;
+        default: target_interval = FFC_INTERVAL_STABLE_MS; break;
+    }
+
     const uint32_t elapsed = now_ms - ffc_last_ms;
-    if (elapsed >= FFC_INTERVAL_STABLE_MS) {
+    if (elapsed >= target_interval) {
         return true;
     }
 
@@ -3107,12 +3234,15 @@ int __time_critical_func(spi_init_40MHz4)()
                     }
 
                     if (lidx == SENSOR_H && cur_buf >= 0) {
-                        /* D166 = VTEMP, big-endian 14-bit at bytes 338-339.
-                         * T(FPA) = 25 + (vtemp - 8192) / 70  [°C, factory cal]
-                         */
+                        /* VTEMP = mean of per-row D166 samples accumulated
+                         * in rawbuf_copy_line (≈120 samples, √120 noise
+                         * reduction vs. single-row extraction).
+                         * T(FPA) = 25 + (vtemp - 8192) / 70  [°C, factory cal] */
                         const uint16_t vtemp =
-                            (((uint16_t)b->data[338] << 8) | b->data[339])
-                            & 0x3FFF;
+                            rawbuf_vtemp_cnt[cur_buf] > 0
+                                ? (uint16_t)(rawbuf_vtemp_sum[cur_buf]
+                                             / rawbuf_vtemp_cnt[cur_buf])
+                                : 0;
                         rawbuf[cur_buf][RAWBUF_OFS_VTEMP] =
                             (uint8_t)(vtemp >> 8);
                         rawbuf[cur_buf][RAWBUF_OFS_VTEMP + 1] =

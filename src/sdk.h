@@ -214,7 +214,7 @@ struct yuv_cmap_simd {
 
 #define SENSOR_W          160
 #define SENSOR_H          120
-#define MIN_THERMAL_RANGE 128
+#define MIN_THERMAL_RANGE 384
 
 #define FLASH_SIZE          (4 * 1024 * 1024)
 #define FLASH_TARGET_SIZE   (512 * 1024)
