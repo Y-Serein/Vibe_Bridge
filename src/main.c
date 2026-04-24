@@ -2922,23 +2922,31 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         }
     }
 
-    /* Auto-fit K = dg_calib_mean / dVTEMP across FFCs, taking the 2nd FFC as
-     * the K-fit baseline (sensor settled). Need enough VTEMP travel to avoid
-     * fitting on ADU noise; 30 ADU ≈ ~0.4 °C FPA swing, balanced between
-     * "fit activates early" and "don't fit on jitter". Clamp the result to a
-     * physically plausible range — a runaway K (tiny dv, large dg, or sign
-     * flip during non-monotonic VTEMP) would drive eff_anchor far off and
-     * make the report worse than the un-compensated baseline. */
-    if (ffc_count >= 2 && baseline_fpa_vtemp != 0) {
+    /* Auto-fit K = dg_calib_mean / dVTEMP across FFCs, taking the 1st FFC as
+     * the K-fit baseline so the fit window opens as early as the 2nd FFC
+     * (~t=6 s with the warmup schedule). Need enough VTEMP travel to avoid
+     * fitting on ADU noise; 50 ADU ≈ ~0.7 °C FPA swing — low enough that
+     * slow-warming units still trigger a fit within the warmup window, high
+     * enough to reject jitter. Clamp the result to ±2 (physically plausible
+     * for this sensor) — a runaway K would drive eff_anchor far off and make
+     * the report worse than the un-compensated baseline. After the first
+     * valid fit, apply EMA smoothing to absorb noise on subsequent fits
+     * without throwing away the already-validated estimate. */
+    if (ffc_count >= 1 && baseline_fpa_vtemp != 0) {
         const int32_t dv = (int32_t)cur_fpa_vtemp - (int32_t)baseline_fpa_vtemp;
         const int32_t dg = g_calib_mean - baseline_g_calib_mean;
-        if (dv > 100 || dv < -100) {
+        if (dv > 50 || dv < -50) {
             const float k_new = (float)dg / (float)dv;
-            if (k_new > -5.0f && k_new < 5.0f) {
-                runtime_k_ancomp = k_new;
-                runtime_k_valid = true;
-                println("K fit: dv=%ld dg=%ld k=%.4f",
-                        (long)dv, (long)dg, (double)runtime_k_ancomp);
+            if (k_new > -2.0f && k_new < 2.0f) {
+                if (runtime_k_valid) {
+                    runtime_k_ancomp = 0.3f * runtime_k_ancomp + 0.7f * k_new;
+                } else {
+                    runtime_k_ancomp = k_new;
+                    runtime_k_valid = true;
+                }
+                println("K fit: dv=%ld dg=%ld k_new=%.4f k=%.4f",
+                        (long)dv, (long)dg, (double)k_new,
+                        (double)runtime_k_ancomp);
             } else {
                 println("K skip: dv=%ld dg=%ld k=%.4f out of range",
                         (long)dv, (long)dg, (double)k_new);
@@ -2973,11 +2981,12 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     ffc_last_fpa_vtemp = cur_fpa_vtemp;
     ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
-    if (ffc_count == 2) {
-        /* Skip the 1st FFC (~3 s after boot): shutter just opened and VTEMP
-         * is still in a transient (observed ~100+ ADU off steady-state).
-         * The 2nd FFC (~123 s) runs on a settled sensor and gives a stable
-         * (VTEMP, g_calib_mean) baseline for the K auto-fit above. */
+    if (ffc_count == 1) {
+        /* Baseline at 1st FFC (~t=3 s). Earlier we deferred to 2nd FFC to
+         * skip a settling transient, but with the warmup FFC schedule that
+         * costs us the largest VTEMP-travel window (3 s → ~30 s) — the
+         * window where K can actually be measured before the FPA stabilises.
+         * Capturing at 1st FFC lets the 2nd FFC already attempt a fit. */
         baseline_fpa_vtemp    = cur_fpa_vtemp;
         baseline_g_calib_mean = g_calib_mean;
     }
