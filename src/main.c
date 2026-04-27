@@ -373,15 +373,21 @@ static const uint16_t* g_last_calib = nullptr;
  * and only then switch to the 120 s stable cadence. */
 #define FFC_INTERVAL_FIRST_MS  3000u    /* 1st FFC at t≈3 s */
 #define FFC_INTERVAL_WARMUP_2  3000u    /* 2nd FFC 3 s after 1st → t≈6 s */
-#define FFC_INTERVAL_WARMUP_3  4000u    /* 3rd FFC 4 s after 2nd → t≈10 s (K-fit activates) */
-#define FFC_INTERVAL_WARMUP_4  20000u   /* 4th FFC 20 s after 3rd → t≈30 s (post-warmup) */
-/* Stable-cadence FFC: 30 s caps the worst-case inter-FFC bolometer drift
- * to ~1–2 °C even when VTEMP is flat. Previously 120 s, which let slow
- * post-warmup bolometer settling (uncoupled to D166) accumulate ~8 °C
- * scene drift between FFCs (see trend_20260425_124236.png). The K·ΔVTEMP
- * compensator can only cancel drift correlated with D166; non-VTEMP drift
- * sources (bolometer thermal lag, ROIC reference drift) require periodic
- * calibg refresh, which only FFC provides. */
+#define FFC_INTERVAL_WARMUP_3  4000u    /* 3rd FFC 4 s after 2nd → t≈10 s */
+#define FFC_INTERVAL_WARMUP_4  20000u   /* 4th FFC 20 s after 3rd → t≈30 s */
+/* Extended warmup window (0…180 s after boot). The shutter blade, lens
+ * housing, and other body parts thermally settle on a ~50 s time
+ * constant — during this window scene drift rate is ~0.13 °C/s even
+ * with K_NTC compensation enabled (see trend_20260427_150825.png:
+ * scene drops 23 °C in the first 3 min, then only 2 °C in the next
+ * 2 min). At 15 s cadence the worst-case inter-FFC drift is bounded
+ * to ~2 °C; at 30 s it is ~4 °C. Pay the extra shutter wear during
+ * warmup to keep the displayed reading honest. */
+#define FFC_INTERVAL_EXT_WARMUP_MS 15000u
+#define FFC_EXT_WARMUP_END_MS      180000u
+/* Stable-cadence FFC after extended warmup: 30 s caps the worst-case
+ * inter-FFC bolometer drift in the quasi-equilibrium regime where the
+ * remaining drift is small. */
 #define FFC_INTERVAL_STABLE_MS 30000u
 #define FFC_VTEMP_DELTA_ADU     150u
 /* Minimum elapsed time before the |ΔVTEMP| trigger can fire — prevents
@@ -3103,13 +3109,19 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
 
     /* Select target interval based on which FFC we're waiting for.
      * ffc_count here is the number of FFCs COMPLETED, so ffc_count==1 means
-     * we're deciding when to fire FFC #2, etc. */
+     * we're deciding when to fire FFC #2, etc. After the explicit warmup
+     * schedule (FFCs #1–#4 over t=0…30 s), use 15 s extended-warmup
+     * cadence until t=180 s, then switch to 30 s stable cadence. */
     uint32_t target_interval;
     switch (ffc_count) {
         case 1:  target_interval = FFC_INTERVAL_WARMUP_2; break;
         case 2:  target_interval = FFC_INTERVAL_WARMUP_3; break;
         case 3:  target_interval = FFC_INTERVAL_WARMUP_4; break;
-        default: target_interval = FFC_INTERVAL_STABLE_MS; break;
+        default:
+            target_interval = (now_ms < FFC_EXT_WARMUP_END_MS)
+                                  ? FFC_INTERVAL_EXT_WARMUP_MS
+                                  : FFC_INTERVAL_STABLE_MS;
+            break;
     }
 
     const uint32_t elapsed = now_ms - ffc_last_ms;
