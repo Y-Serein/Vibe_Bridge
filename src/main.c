@@ -1,5 +1,6 @@
 #include <bsp/board_api.h>
 #include <cmap/cmap.h>
+#include <hardware/adc.h>
 #include <hardware/clocks.h>
 #include <hardware/dma.h>
 #include <hardware/flash.h>
@@ -374,43 +375,102 @@ static const uint16_t* g_last_calib = nullptr;
 #define FFC_INTERVAL_WARMUP_2  3000u    /* 2nd FFC 3 s after 1st → t≈6 s */
 #define FFC_INTERVAL_WARMUP_3  4000u    /* 3rd FFC 4 s after 2nd → t≈10 s (K-fit activates) */
 #define FFC_INTERVAL_WARMUP_4  20000u   /* 4th FFC 20 s after 3rd → t≈30 s (post-warmup) */
-#define FFC_INTERVAL_STABLE_MS 120000u
+/* Stable-cadence FFC: 30 s caps the worst-case inter-FFC bolometer drift
+ * to ~1–2 °C even when VTEMP is flat. Previously 120 s, which let slow
+ * post-warmup bolometer settling (uncoupled to D166) accumulate ~8 °C
+ * scene drift between FFCs (see trend_20260425_124236.png). The K·ΔVTEMP
+ * compensator can only cancel drift correlated with D166; non-VTEMP drift
+ * sources (bolometer thermal lag, ROIC reference drift) require periodic
+ * calibg refresh, which only FFC provides. */
+#define FFC_INTERVAL_STABLE_MS 30000u
 #define FFC_VTEMP_DELTA_ADU     150u
+/* Minimum elapsed time before the |ΔVTEMP| trigger can fire — prevents
+ * back-to-back FFCs during fast warmup where VTEMP can swing > 150 ADU
+ * within 1–2 s, which would otherwise machine-gun the shutter. */
+#define FFC_MIN_ELAPSED_MS      2000u
+/* FFC sanity check: reject the FFC outright if the new shutter frame mean
+ * (or VTEMP) differs from the previous FFC's value by more than these
+ * thresholds. Between FFCs (≤ 30 s) the bolometer + FPA can realistically
+ * change by ~3 °C ≈ 200 ADU VTEMP and at most ~K·200 ≈ 1500 ADU shutter
+ * mean (for K ≤ 5). Anything larger is a sensor sync glitch, partial-
+ * shutter capture, or VTEMP register glitch — committing such an FFC
+ * poisons calibg/anchor and drives subsequent scene reads wildly off
+ * (see trend_20260427_110503.png: scene crashed to −55 °C after one bad
+ * FFC absorbed a +2000 ADU VTEMP glitch). Rejecting keeps the previous
+ * known-good calibration in use until the next FFC attempt. */
+#define FFC_REJECT_DG_ADU       2500
+#define FFC_REJECT_DV_ADU       1000
+/* Between-FFC drift compensation: STATIC (compile-time) coefficients
+ * for two independent compensators, applied to eff_anchor as
+ *   eff_anchor = ram_temp_anchor + K_V·(V_now - V_lastFFC)
+ *                                + K_N·(NTC_now - NTC_lastFFC)
+ *
+ * K_V (VTEMP-based, FPA-coupled drift):
+ *   Targets the bolometer-DC-vs-FPA-temperature coupling that the
+ *   gain-weighted anchor formula does not cancel. Effective when FPA
+ *   temperature changes (warm-up, ambient swing, thermal disturbance).
+ *
+ * K_N (NTC-based, shutter/body-coupled drift):
+ *   Targets shutter-blade and lens-housing thermal lag — these heat
+ *   on a much longer time constant (~50 s) than the FPA, and the
+ *   bolometer raw counts respond to (T_shutter - T_scene) via the
+ *   (raw - calibg) term. trend_20260427_143902.png shows the canonical
+ *   case: FPA stable at 130 °C from t=0–130 s but scene reading drops
+ *   31 °C as shutter blade warms toward equilibrium with the hot FPA.
+ *   K_V·ΔV = 0 in this regime; only NTC tracks the slow body warming
+ *   and so only K_N can cancel the residual.
+ *
+ * Sign of K_N depends on the NTC voltage divider topology (thermistor
+ * pull-up vs pull-down). If shutter heating produces a scene drift
+ * opposite to the compensation (i.e. the residual gets WORSE, not
+ * better), flip the sign. Magnitude estimated from the trend:
+ *   Δscene ≈ 31 °C → Δsmooth ≈ md/50.4·31 ≈ 120 ADU (md ≈ 200)
+ *   ΔNTC ≈ 500–1000 ADU over the 130 s warming window
+ *   |K_N| ≈ 0.12–0.24 → start at 0.20.
+ *
+ * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
+#define K_ANCHOR_COMP_STATIC    0.20f   /* K_V — VTEMP-based */
+#define K_NTC_COMP_STATIC       (-0.20f)/* K_N — NTC-based; flip sign if wrong */
+#define K_COMP_MAX_ADU          1500
 static uint32_t ffc_last_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
+static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
-static uint16_t baseline_fpa_vtemp = 0;      /* VTEMP at 2nd FFC; K-fit reference */
-static int32_t  baseline_g_calib_mean = 0;   /* g_calib_mean at 2nd FFC; K-fit reference */
 static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
 static bool     ffc_done_first = false;
-
-/* Runtime-fit FPA-drift compensation.
- *
- * Problem: with near-uniform per-pixel gain, the FFC anchor formula
- *   anchor = mean(gain*(flash_imgbg - ram_calibg)) + g_calib_mean
- * collapses to mean(flash_imgbg) = ram_l_ref_mean, a compile-time constant.
- * Between FFCs, ram_calibg and g_calib_mean are frozen, so corrected_mean of
- * a fixed scene drifts linearly with FPA self-emission (≈ with VTEMP). The
- * reported T therefore drifts without bound across the 2-min FFC interval.
- *
- * Fix: eff_anchor = ram_temp_anchor + K * (cur_vtemp - ffc_last_fpa_vtemp)
- * where K is auto-fit at each FFC (≥ 3rd) as dg_calib_mean/dVTEMP across FFCs.
- * g_calib_mean is the mean of the shutter frame; the shutter is a uniform
- * FPA-temperature blackbody, so its drift across FFCs directly measures
- * dmean(raw)/dVTEMP for a fixed scene — which is exactly what eff_anchor
- * must cancel between FFCs to hold the report steady. */
 
 /* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
  *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
  *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
  *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
  *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
- *    [PX_CNT+19 .. +20] baseline_fpa_vtemp  u16   BE (2nd-FFC VTEMP; 0 before)
+ *    [PX_CNT+19 .. +20] reserved (was baseline_fpa_vtemp; emit 0 for protocol compat)
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
-#define FRAME_DIAG_TAIL     14
+#define FRAME_DIAG_TAIL     16
 
-static float runtime_k_ancomp = 0.0f;   /* dg_calib_mean / dVTEMP, fit across FFCs */
-static bool  runtime_k_valid  = false;
+/* NTC diagnostic-only sampling. ADC2 = GPIO28 board-NTC.  EMA-smoothed sample
+ * exposed in the diag tail at out[PX_CNT+21..22] for GUI monitoring.  No
+ * compensation logic uses this value — purely passive read-out. */
+static volatile uint16_t g_cur_ntc_adc = 0;
+static inline uint16_t ntc_read_avg(int n)
+{
+    if (n < 1) n = 1;
+    adc_select_input(ADC_CH_NTC);
+    uint32_t acc = 0;
+    for (int i = 0; i < n; i++) acc += adc_read();
+    return (uint16_t)(acc / (uint32_t)n);
+}
+static inline void ntc_tick(void)
+{
+    static uint8_t tick = 0;
+    tick++;
+    if ((tick & 0x07) != 0) return;
+    adc_select_input(ADC_CH_NTC);
+    const uint16_t v = adc_read();
+    const uint16_t cur = g_cur_ntc_adc;
+    g_cur_ntc_adc = (cur == 0) ? v
+                                : (uint16_t)(((uint32_t)cur * 31 + v) >> 5);
+}
 
 /* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
  *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
@@ -419,7 +479,7 @@ static bool  runtime_k_valid  = false;
  *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
  *    [PX_CNT+19 .. +20] baseline_fpa_vtemp  u16   BE (first-FFC VTEMP; 0 before)
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
-#define FRAME_DIAG_TAIL     14
+#define FRAME_DIAG_TAIL     16
 
 static inline __attribute__((always_inline)) void normalize_frame_be(
     uint8_t* raw, uint8_t* out)
@@ -1733,9 +1793,10 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
      * Bolometer ADU ∝ scene radiance ∝ T_K^4 (Stefan-Boltzmann), so two-point
      * interpolation must be done in T^4 space, not linear-in-°C, otherwise a
      * 0°C / 50°C calibration under-reads midrange by several degrees. */
-    /* VTEMP is the last two bytes of the rawbuf (BE 14-bit).  Used for
-     * between-FFC anchor drift compensation via runtime_k_ancomp. */
+    /* VTEMP feeds the static K_V·ΔVTEMP between-FFC compensation;
+     * NTC feeds the K_N·ΔNTC shutter/body-thermal-lag compensation. */
     const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
+    const uint16_t cur_ntc   = g_cur_ntc_adc;
 
     int16_t t_lo_x10 = INT16_MAX;
     int16_t t_hi_x10 = INT16_MAX;
@@ -1743,11 +1804,20 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     bool temp_map_ok = false;
     int32_t eff_anchor = ram_temp_anchor;
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        if (runtime_k_valid && ffc_last_fpa_vtemp != 0) {
+        int32_t comp = 0;
+        if (ffc_last_fpa_vtemp != 0) {
             const int32_t dv =
                 (int32_t)cur_vtemp - (int32_t)ffc_last_fpa_vtemp;
-            eff_anchor += (int32_t)(runtime_k_ancomp * (float)dv);
+            comp += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv);
         }
+        if (ffc_last_ntc != 0 && cur_ntc != 0) {
+            const int32_t dn =
+                (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
+            comp += (int32_t)(K_NTC_COMP_STATIC * (float)dn);
+        }
+        if (comp >  K_COMP_MAX_ADU) comp =  K_COMP_MAX_ADU;
+        if (comp < -K_COMP_MAX_ADU) comp = -K_COMP_MAX_ADU;
+        eff_anchor += comp;
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
         const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
@@ -1844,8 +1914,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[PX_CNT + 16] = (uint8_t)(md_u >> 16);
     out[PX_CNT + 17] = (uint8_t)(md_u >>  8);
     out[PX_CNT + 18] = (uint8_t)(md_u      );
-    out[PX_CNT + 19] = (uint8_t)(baseline_fpa_vtemp >> 8);
-    out[PX_CNT + 20] = (uint8_t)(baseline_fpa_vtemp     );
+    /* slot 19..20 reserved (was baseline_fpa_vtemp under runtime K-fit) */
+    out[PX_CNT + 19] = 0;
+    out[PX_CNT + 20] = 0;
+    const uint16_t ntc_snap = g_cur_ntc_adc;
+    out[PX_CNT + 21] = (uint8_t)(ntc_snap >> 8);
+    out[PX_CNT + 22] = (uint8_t)(ntc_snap     );
 }
 
 static inline __attribute__((always_inline)) void binary_frame(
@@ -2642,11 +2716,15 @@ void __time_critical_func(core1_rawbuf_consumer)()
     cur_cmap_idx = 0;
     init_yuv_cmap(active_cmap);
 
+    /* Seed NTC EMA so the first frames don't emit 0 in the diag tail. */
+    g_cur_ntc_adc = ntc_read_avg(8);
+
     while (true) {
         uart_poll2(baud_get2);
         if (flash_dm) {
             goto dump_start;
         }
+        ntc_tick();
         bool did_work = false;
 
         idx = rawbuf_pick_ready();
@@ -2865,14 +2943,46 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     __dmb();
     rawbuf_state[idx] = RAWBUF_READING;
 
-    /* update per-pixel background from the shutter frame */
+    /* Compute new shutter mean WITHOUT yet writing into ram_calibg, so a
+     * sanity-check failure can roll back without leaving partially-updated
+     * calibration state. */
     const uint8_t* src = rawbuf[idx];
     uint64_t sum = 0;
     for (size_t i = 0; i < PX_CNT; i++) {
-        /* must apply gray14_to_bin to match binary_calib_frame's processing */
-        const uint16_t v = gray14_to_bin(be16_to_u14(&src[i * 2]));
-        ram_calibg[i] = v;
-        sum += v;
+        sum += gray14_to_bin(be16_to_u14(&src[i * 2]));
+    }
+    const int32_t new_calib_mean = (int32_t)(sum / PX_CNT);
+
+    /* FFC sanity check: an FFC across a healthy 30 s interval should
+     * produce only modest dG (shutter mean change) and dV (VTEMP change).
+     * Anything large indicates a sensor glitch or a partial-shutter
+     * capture. Reject by leaving calibg/anchor/K-fit untouched and
+     * exiting; the next scheduled FFC will retry. */
+    if (ffc_done_first && ffc_last_g_calib_mean != 0) {
+        const int32_t dg_check = new_calib_mean - ffc_last_g_calib_mean;
+        const int32_t dv_check =
+            (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+        const int32_t adg = dg_check < 0 ? -dg_check : dg_check;
+        const int32_t adv = dv_check < 0 ? -dv_check : dv_check;
+        if (adg > FFC_REJECT_DG_ADU || adv > FFC_REJECT_DV_ADU) {
+            println("FFC reject: dg=%ld dv=%ld (limits dg=%d dv=%d)",
+                    (long)dg_check, (long)dv_check,
+                    FFC_REJECT_DG_ADU, FFC_REJECT_DV_ADU);
+            rawbuf_state[idx] = RAWBUF_FREE;
+            shutter_off();
+            led_off();
+            /* Reset the time anchor so the next FFC waits the full
+             * stable interval — avoids back-to-back retries on a stuck
+             * glitch. The |ΔVTEMP| condition can still trigger sooner
+             * if VTEMP recovers and re-deviates by FFC_VTEMP_DELTA_ADU. */
+            ffc_last_ms = to_ms_since_boot(get_absolute_time());
+            return;
+        }
+    }
+
+    /* Sanity check passed — commit the new shutter frame */
+    for (size_t i = 0; i < PX_CNT; i++) {
+        ram_calibg[i] = gray14_to_bin(be16_to_u14(&src[i * 2]));
     }
 
     rawbuf_state[idx] = RAWBUF_FREE;
@@ -2882,7 +2992,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     calibg = ram_calibg;
 
     /* reset calib_mean and force binary_calib_frame to recompute it */
-    g_calib_mean = (int32_t)(sum / PX_CNT);
+    g_calib_mean = new_calib_mean;
     g_last_calib = nullptr; /* triggers recompute on next frame */
 
     /* recompute temperature anchor to compensate for gain-weighted offset between
@@ -2894,77 +3004,71 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      *
      * Derivation: for scene at T, corrected_mean = anchor + avg_diff * α,
      * so T_reading = T_L + (corrected_mean - anchor) * k = T_L + avg_diff*α*k = T_scene ✓ */
+    /* recompute temperature anchor to compensate for gain-weighted offset
+     * between the low-ref frame (cold cal scene at T_L) and this FFC
+     * shutter frame (uniform metal at shutter T). The formula transforms
+     * the shutter-temperature reference back to the cold-cal-scene
+     * reference, so displayed T = T_L when actual scene T = T_L. */
     const int32_t anchor_old = ram_temp_anchor;
+    const uint16_t cur_ntc_at_ffc = g_cur_ntc_adc;
+    /* eff_anchor_old = the eff_anchor the renderer used in the last
+     * frame before this FFC. Includes BOTH K_V·ΔVTEMP and K_N·ΔNTC
+     * accumulated since the previous FFC. The smoother shift below
+     * uses eff_anchor_old (not bare anchor_old) to keep displayed
+     * scene continuous. */
+    int32_t eff_anchor_old = anchor_old;
+    {
+        int32_t comp_pre = 0;
+        if (ffc_last_fpa_vtemp != 0) {
+            const int32_t dv_pre =
+                (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            comp_pre += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_pre);
+        }
+        if (ffc_last_ntc != 0 && cur_ntc_at_ffc != 0) {
+            const int32_t dn_pre =
+                (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
+            comp_pre += (int32_t)(K_NTC_COMP_STATIC * (float)dn_pre);
+        }
+        if (comp_pre >  K_COMP_MAX_ADU) comp_pre =  K_COMP_MAX_ADU;
+        if (comp_pre < -K_COMP_MAX_ADU) comp_pre = -K_COMP_MAX_ADU;
+        eff_anchor_old += comp_pre;
+    }
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
         for (size_t i = 0; i < PX_CNT; i++)
             fsum += flash_gain[i] * ((float)flash_imgbg[i] - (float)ram_calibg[i]);
         ram_temp_anchor = (int32_t)roundf(fsum / (float)PX_CNT + (float)g_calib_mean);
 
-        /* Persist the K·ΔVTEMP compensation accumulated since last FFC into
-         * ram_temp_anchor. Without this, the compensation term resets to 0
-         * right after FFC (because ffc_last_fpa_vtemp gets refreshed to the
-         * current VTEMP below), and each FFC silently rolls back the drift
-         * correction — producing a sawtooth drift pattern instead of fixing
-         * the underlying problem. */
-        if (runtime_k_valid && ffc_last_fpa_vtemp != 0) {
+        /* Persist accumulated K_V·ΔVTEMP + K_N·ΔNTC into ram_temp_anchor
+         * so the inter-FFC drift correction survives the V/NTC reference
+         * refresh below. Without this, the per-frame compensation term
+         * resets to 0 right after FFC and the correction is silently
+         * lost (sawtooth pattern instead of fix). */
+        int32_t comp_acc = 0;
+        if (ffc_last_fpa_vtemp != 0) {
             const int32_t dv_acc =
                 (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
-            const int32_t comp_acc =
-                (int32_t)(runtime_k_ancomp * (float)dv_acc);
-            ram_temp_anchor += comp_acc;
-            println("FFC anchor+K: base=%ld comp_acc=%ld final=%ld",
-                    (long)(ram_temp_anchor - comp_acc), (long)comp_acc,
-                    (long)ram_temp_anchor);
-        } else {
-            println("FFC anchor updated: %ld (was %ld)",
-                    (long)ram_temp_anchor, (long)anchor_old);
+            comp_acc += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_acc);
         }
+        if (ffc_last_ntc != 0 && cur_ntc_at_ffc != 0) {
+            const int32_t dn_acc =
+                (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
+            comp_acc += (int32_t)(K_NTC_COMP_STATIC * (float)dn_acc);
+        }
+        if (comp_acc >  K_COMP_MAX_ADU) comp_acc =  K_COMP_MAX_ADU;
+        if (comp_acc < -K_COMP_MAX_ADU) comp_acc = -K_COMP_MAX_ADU;
+        ram_temp_anchor += comp_acc;
+        println("FFC anchor+K: base=%ld comp=%ld final=%ld ntc=%u",
+                (long)(ram_temp_anchor - comp_acc), (long)comp_acc,
+                (long)ram_temp_anchor, cur_ntc_at_ffc);
     }
 
-    /* Auto-fit K = dg_calib_mean / dVTEMP across FFCs, taking the 1st FFC as
-     * the K-fit baseline so the fit window opens as early as the 2nd FFC
-     * (~t=6 s with the warmup schedule). Need enough VTEMP travel to avoid
-     * fitting on ADU noise; 50 ADU ≈ ~0.7 °C FPA swing — low enough that
-     * slow-warming units still trigger a fit within the warmup window, high
-     * enough to reject jitter. Clamp the result to ±2 (physically plausible
-     * for this sensor) — a runaway K would drive eff_anchor far off and make
-     * the report worse than the un-compensated baseline. After the first
-     * valid fit, apply EMA smoothing to absorb noise on subsequent fits
-     * without throwing away the already-validated estimate. */
-    if (ffc_count >= 1 && baseline_fpa_vtemp != 0) {
-        const int32_t dv = (int32_t)cur_fpa_vtemp - (int32_t)baseline_fpa_vtemp;
-        const int32_t dg = g_calib_mean - baseline_g_calib_mean;
-        if (dv > 50 || dv < -50) {
-            const float k_new = (float)dg / (float)dv;
-            if (k_new > -2.0f && k_new < 2.0f) {
-                if (runtime_k_valid) {
-                    runtime_k_ancomp = 0.3f * runtime_k_ancomp + 0.7f * k_new;
-                } else {
-                    runtime_k_ancomp = k_new;
-                    runtime_k_valid = true;
-                }
-                println("K fit: dv=%ld dg=%ld k_new=%.4f k=%.4f",
-                        (long)dv, (long)dg, (double)k_new,
-                        (double)runtime_k_ancomp);
-            } else {
-                println("K skip: dv=%ld dg=%ld k=%.4f out of range",
-                        (long)dv, (long)dg, (double)k_new);
-            }
-        } else {
-            println("K skip: |dv|=%ld below threshold", (long)(dv < 0 ? -dv : dv));
-        }
-    }
-
-    /* Carry the percentile smoother across FFC by shifting with Δanchor,
-     * instead of resetting to 0. A full reset causes a one-frame spike on
-     * trend plots because the next frame reseeds g_smooth from raw percentiles.
-     * Shifting keeps (g_smooth - anchor)/mean_diff continuous, so the reported
-     * temperature window stays stable across the shutter event. The first FFC
-     * still clears: any pre-first-FFC smoother state was computed with a stale
-     * calibg and is not salvageable. */
+    /* Carry the percentile smoother across FFC by shifting with Δeff_anchor.
+     * Using eff_anchor_old (not bare anchor_old) accounts for the K·ΔVTEMP
+     * compensation already applied to the renderer; otherwise every FFC
+     * introduces a momentary scene-reading offset of K·ΔVTEMP/mean_diff. */
     if (ffc_done_first && g_smooth_low != 0 && g_smooth_high != 0) {
-        const int32_t delta = ram_temp_anchor - anchor_old;
+        const int32_t delta = ram_temp_anchor - eff_anchor_old;
         int32_t nl = (int32_t)g_smooth_low  + delta;
         int32_t nh = (int32_t)g_smooth_high + delta;
         if (nl < 0) nl = 0; else if (nl > 0xFFFF) nl = 0xFFFF;
@@ -2979,17 +3083,9 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     /* update FFC bookkeeping */
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
     ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    ffc_last_ntc = cur_ntc_at_ffc;
     ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
-    if (ffc_count == 1) {
-        /* Baseline at 1st FFC (~t=3 s). Earlier we deferred to 2nd FFC to
-         * skip a settling transient, but with the warmup FFC schedule that
-         * costs us the largest VTEMP-travel window (3 s → ~30 s) — the
-         * window where K can actually be measured before the FPA stabilises.
-         * Capturing at 1st FFC lets the 2nd FFC already attempt a fit. */
-        baseline_fpa_vtemp    = cur_fpa_vtemp;
-        baseline_g_calib_mean = g_calib_mean;
-    }
     ffc_done_first = true;
 
     shutter_off(); /* open shutter (~200 ms) */
@@ -3021,6 +3117,9 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
         return true;
     }
 
+    if (elapsed < FFC_MIN_ELAPSED_MS) {
+        return false;
+    }
     const uint16_t delta = (cur_fpa_vtemp > ffc_last_fpa_vtemp)
         ? (cur_fpa_vtemp - ffc_last_fpa_vtemp)
         : (ffc_last_fpa_vtemp - cur_fpa_vtemp);
@@ -3062,6 +3161,12 @@ int __time_critical_func(spi_init_40MHz4)()
                     CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
                     48 * MHZ,
                     48 * MHZ);
+
+    /* Init board NTC on ADC2 / GPIO28 — diagnostic only, no compensation. */
+    adc_init();
+    adc_gpio_init(IO_NTC);
+    adc_select_input(ADC_CH_NTC);
+
     extern void dutx_init();
     dutx_init();
     pico_get_unique_board_id_string(uid, UID_LEN);

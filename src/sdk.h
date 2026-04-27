@@ -185,6 +185,9 @@ struct yuv_cmap_simd {
 #define IO_SVM1 5
 #define IO_SVM2 4
 #define IO_BTN  0
+/* Board NTC on RP2350 ADC2 = GPIO28 (diagnostic only). */
+#define IO_NTC      28
+#define ADC_CH_NTC  2
 
 #define MAIN_FUNC_MODE_SPI_INIT_25MHZ        0
 #define MAIN_FUNC_MODE_240MHZ                1
