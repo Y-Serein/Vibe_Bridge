@@ -406,15 +406,25 @@ static const uint16_t* g_last_calib = nullptr;
  * known-good calibration in use until the next FFC attempt. */
 #define FFC_REJECT_DG_ADU       2500
 #define FFC_REJECT_DV_ADU       1000
+/* Thermal-settled gate: defer FFC entirely when |raw_vtemp − smooth_vtemp|
+ * exceeds this threshold. During a fast FPA transient (e.g. external heat
+ * shock) raw races ahead of the EMA smoother by 100s of ADU; committing
+ * FFC at that moment bakes a wildly off K_V·ΔV into ram_temp_anchor and
+ * permanently corrupts the scene reading. Wait for the smoother to catch
+ * up (~6 s @ τ=3 s) before allowing FFC. 100 ADU ≈ 1.4 °C-equivalent. */
+#define FFC_VTEMP_SETTLED_ADU   100
 /* Between-FFC drift compensation: STATIC (compile-time) coefficients
  * for two independent compensators, applied to eff_anchor as
  *   eff_anchor = ram_temp_anchor + K_V·(V_now - V_lastFFC)
  *                                + K_N·(NTC_now - NTC_lastFFC)
  *
  * K_V (VTEMP-based, FPA-coupled drift):
- *   Targets the bolometer-DC-vs-FPA-temperature coupling that the
- *   gain-weighted anchor formula does not cancel. Effective when FPA
- *   temperature changes (warm-up, ambient swing, thermal disturbance).
+ *   Disabled for temperature-anchor compensation.  The sensor VTEMP register
+ *   is useful for FFC scheduling/sanity checks, but bench tests show it can
+ *   move independently of a fixed blackbody scene and can also glitch.  Feeding
+ *   that signal into eff_anchor creates false absolute-temperature drift
+ *   (50°C blackbody falling toward ~41°C), so keep K_V at zero unless VTEMP is
+ *   proven correlated on this hardware revision.
  *
  * K_N (NTC-based, shutter/body-coupled drift):
  *   Targets shutter-blade and lens-housing thermal lag — these heat
@@ -435,8 +445,36 @@ static const uint16_t* g_last_calib = nullptr;
  *   |K_N| ≈ 0.12–0.24 → start at 0.20.
  *
  * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
-#define K_ANCHOR_COMP_STATIC    0.50f   /* K_V — VTEMP-based */
-#define K_NTC_COMP_STATIC       (+7.0f) /* K_N — NTC-based; flip sign if wrong */
+#define K_ANCHOR_COMP_STATIC    0.0f    /* K_V — disabled: VTEMP can be false */
+#define K_NTC_COMP_STATIC       (+3.0f) /* K_N — NTC-based; flip sign if wrong */
+/* dV input clamp for K_V·ΔV. The K_V model (linear bolometer drift with
+ * FPA temperature) holds for slow drift (ΔV < ~300 ADU between FFCs) but
+ * breaks for thermal shocks (ΔV > 1000 ADU): the bolometer doesn't actually
+ * follow the linear extrapolation, so K_V·ΔV over-corrects and crashes the
+ * scene reading. Clamping dV at the input bounds the per-frame and per-FFC
+ * scene shift to ≤ K_V·CLAMP / mean_diff·range ≈ 8 °C even on a 30 °C FPA
+ * jump. Normal operation (dV < 400) is unaffected. */
+#define DV_CLAMP_ADU            400
+/* NTC plausibility cross-check for dV. The VTEMP register can spontaneously
+ * glitch (jumps 30 °C-equivalent without any real die heating — confirmed
+ * by user: putting hand on lens does NOT change FPA reading, yet FPA jumps
+ * by itself in static conditions). NTC measures real PCB body temp via a
+ * physical thermistor; it cannot glitch. Real thermal events show NTC and
+ * VTEMP changing together (die heats faster than body, so dV/dN is bounded
+ * but positive). VTEMP glitches show dN≈0 with huge dV. Bounding |dV| by
+ * DV_DN_RATIO_MAX·|dN| makes K_V·dV completely inert during glitches while
+ * preserving full strength for real thermal drift. Ratio 10 covers the
+ * worst-case warmup phase where die leads body. */
+#define DV_DN_RATIO_MAX         10
+/* FFC hard plausibility gate. Board NTC uses a 10K pull-up, so ADC falls when
+ * body temperature rises, while VTEMP rises when the die/FPA warms. Real
+ * thermal motion should therefore drive dV and dN in opposite signs. A
+ * same-sign large move (for example VTEMP falling while NTC temperature rises)
+ * is a VTEMP-register false event; do not commit an FFC in that window. */
+#define FFC_VTEMP_NTC_FREE_ADU      80
+#define FFC_VTEMP_NTC_RATIO_MAX     6
+#define FFC_NTC_SIGN_DEADBAND_ADU   3
+#define FFC_RETRY_COOLDOWN_MS       15000u
 /* Consecutive FFC rejections allowed before forcing commit. After a real
  * thermal shock (e.g. hand on device, sudden ambient change) the FPA jumps
  * persistently and dV exceeds FFC_REJECT_DV_ADU forever; without an escape
@@ -446,6 +484,7 @@ static const uint16_t* g_last_calib = nullptr;
 #define FFC_FORCE_ACCEPT_AFTER  3
 #define K_COMP_MAX_ADU          1500
 static uint32_t ffc_last_ms = 0;
+static uint32_t ffc_retry_after_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
@@ -466,6 +505,13 @@ static bool     ffc_done_first = false;
  *    [PX_CNT+29 .. +30] ntc_adc_cs_low16    u16   BE
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
 #define FRAME_DIAG_TAIL     24
+
+/* VTEMP EMA smoother (x256 fixed-point). The raw VTEMP register has
+ * frame-to-frame ADC jitter of ~50–100 ADU (~0.7–1.4 °C-equivalent),
+ * which K_V·ΔV would otherwise turn into visible scene jitter. EMA with
+ * α = 1/32 gives τ ≈ 3 s @ 10 fps — fast enough to track FPA settling
+ * over tens of seconds, slow enough to reject per-frame ADC noise. */
+static volatile uint32_t g_vtemp_smooth_x256 = 0;
 
 /* NTC sampling. ADC2 = GPIO28 on the current board.  EMA-smoothed sample is
  * exposed in the diag tail at out[PX_CNT+21..22] and feeds K_NTC compensation
@@ -488,6 +534,41 @@ static bool ntc_adc_dma_ready = false;
 static inline bool ntc_adc_valid(uint16_t v)
 {
     return v > 8 && v < 4088;
+}
+
+static bool ffc_vtemp_ntc_plausible(
+    uint16_t cur_fpa_vtemp,
+    uint16_t cur_ntc,
+    int32_t* dv_out,
+    int32_t* dn_out)
+{
+    if (ffc_last_fpa_vtemp == 0
+        || !ntc_adc_valid(ffc_last_ntc)
+        || !ntc_adc_valid(cur_ntc)) {
+        return true;
+    }
+
+    const int32_t dv = (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+    const int32_t dn = (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
+    if (dv_out != nullptr) *dv_out = dv;
+    if (dn_out != nullptr) *dn_out = dn;
+
+    const int32_t adv = dv < 0 ? -dv : dv;
+    if (adv <= FFC_VTEMP_NTC_FREE_ADU) {
+        return true;
+    }
+
+    const int32_t adn = dn < 0 ? -dn : dn;
+    if (adn <= FFC_NTC_SIGN_DEADBAND_ADU) {
+        return false;
+    }
+
+    if ((dv > 0 && dn > 0) || (dv < 0 && dn < 0)) {
+        return false;
+    }
+
+    return adv <= (FFC_VTEMP_NTC_FREE_ADU
+                   + adn * FFC_VTEMP_NTC_RATIO_MAX);
 }
 
 static inline uint16_t adc_trimmed_mean_from_buf(
@@ -1986,6 +2067,16 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
     const uint16_t cur_ntc   = g_cur_ntc_adc;
 
+    /* Update VTEMP EMA smoother — used by K_V to avoid amplifying
+     * frame-to-frame ADC jitter into visible scene swing. */
+    if (g_vtemp_smooth_x256 == 0) {
+        g_vtemp_smooth_x256 = (uint32_t)cur_vtemp << 8;
+    } else {
+        g_vtemp_smooth_x256 =
+            (g_vtemp_smooth_x256 * 31 + ((uint32_t)cur_vtemp << 8)) >> 5;
+    }
+    const uint16_t smooth_vtemp = (uint16_t)(g_vtemp_smooth_x256 >> 8);
+
     int16_t t_lo_x10 = INT16_MAX;
     int16_t t_hi_x10 = INT16_MAX;
     float t_lo_c_f = 0.0f, t_hi_c_f = 0.0f;
@@ -1993,14 +2084,25 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     int32_t eff_anchor = ram_temp_anchor;
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
         int32_t comp = 0;
+        const bool ntc_ok =
+            ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc);
+        const int32_t dn = ntc_ok
+            ? (int32_t)cur_ntc - (int32_t)ffc_last_ntc
+            : 0;
         if (ffc_last_fpa_vtemp != 0) {
-            const int32_t dv =
-                (int32_t)cur_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            int32_t dv =
+                (int32_t)smooth_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            if (ntc_ok) {
+                const int32_t adn = dn < 0 ? -dn : dn;
+                const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
+                if (dv >  dv_ntc_cap) dv =  dv_ntc_cap;
+                if (dv < -dv_ntc_cap) dv = -dv_ntc_cap;
+            }
+            if (dv >  DV_CLAMP_ADU) dv =  DV_CLAMP_ADU;
+            if (dv < -DV_CLAMP_ADU) dv = -DV_CLAMP_ADU;
             comp += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv);
         }
-        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc)) {
-            const int32_t dn =
-                (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
+        if (ntc_ok) {
             comp += (int32_t)(K_NTC_COMP_STATIC * (float)dn);
         }
         if (comp >  K_COMP_MAX_ADU) comp =  K_COMP_MAX_ADU;
@@ -3166,6 +3268,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         sum += gray14_to_bin(be16_to_u14(&src[i * 2]));
     }
     const int32_t new_calib_mean = (int32_t)(sum / PX_CNT);
+    const uint16_t cur_ntc_at_ffc = g_cur_ntc_adc;
 
     /* FFC sanity check: an FFC across a healthy 30 s interval should
      * produce only modest dG (shutter mean change) and dV (VTEMP change).
@@ -3178,6 +3281,20 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
         const int32_t adg = dg_check < 0 ? -dg_check : dg_check;
         const int32_t adv = dv_check < 0 ? -dv_check : dv_check;
+        int32_t dv_ntc = 0, dn_ntc = 0;
+        if (!ffc_vtemp_ntc_plausible(
+                cur_fpa_vtemp, cur_ntc_at_ffc, &dv_ntc, &dn_ntc)) {
+            println("FFC defer: VTEMP/NTC mismatch dv=%ld dn=%ld",
+                    (long)dv_ntc, (long)dn_ntc);
+            ffc_consec_reject = 0;
+            rawbuf_state[idx] = RAWBUF_FREE;
+            shutter_off();
+            led_off();
+            const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            ffc_last_ms = now_ms;
+            ffc_retry_after_ms = now_ms + FFC_RETRY_COOLDOWN_MS;
+            return;
+        }
         const bool over_limits =
             (adg > FFC_REJECT_DG_ADU) || (adv > FFC_REJECT_DV_ADU);
         if (over_limits && ffc_consec_reject < FFC_FORCE_ACCEPT_AFTER) {
@@ -3195,6 +3312,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
              * glitch. The |ΔVTEMP| condition can still trigger sooner
              * if VTEMP recovers and re-deviates by FFC_VTEMP_DELTA_ADU. */
             ffc_last_ms = to_ms_since_boot(get_absolute_time());
+            ffc_retry_after_ms = ffc_last_ms + FFC_RETRY_COOLDOWN_MS;
             return;
         }
         if (over_limits) {
@@ -3235,23 +3353,34 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      * the shutter-temperature reference back to the cold-cal-scene
      * reference, so displayed T = T_L when actual scene T = T_L. */
     const int32_t anchor_old = ram_temp_anchor;
-    const uint16_t cur_ntc_at_ffc = g_cur_ntc_adc;
     /* eff_anchor_old = the eff_anchor the renderer used in the last
      * frame before this FFC. Includes BOTH K_V·ΔVTEMP and K_N·ΔNTC
      * accumulated since the previous FFC. The smoother shift below
      * uses eff_anchor_old (not bare anchor_old) to keep displayed
      * scene continuous. */
+    const int32_t smooth_vtemp_at_ffc = (int32_t)(g_vtemp_smooth_x256 >> 8);
     int32_t eff_anchor_old = anchor_old;
     {
         int32_t comp_pre = 0;
+        const bool ntc_ok_pre =
+            ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc);
+        const int32_t dn_pre = ntc_ok_pre
+            ? (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc
+            : 0;
         if (ffc_last_fpa_vtemp != 0) {
-            const int32_t dv_pre =
-                (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            int32_t dv_pre =
+                smooth_vtemp_at_ffc - (int32_t)ffc_last_fpa_vtemp;
+            if (ntc_ok_pre) {
+                const int32_t adn = dn_pre < 0 ? -dn_pre : dn_pre;
+                const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
+                if (dv_pre >  dv_ntc_cap) dv_pre =  dv_ntc_cap;
+                if (dv_pre < -dv_ntc_cap) dv_pre = -dv_ntc_cap;
+            }
+            if (dv_pre >  DV_CLAMP_ADU) dv_pre =  DV_CLAMP_ADU;
+            if (dv_pre < -DV_CLAMP_ADU) dv_pre = -DV_CLAMP_ADU;
             comp_pre += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_pre);
         }
-        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc)) {
-            const int32_t dn_pre =
-                (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
+        if (ntc_ok_pre) {
             comp_pre += (int32_t)(K_NTC_COMP_STATIC * (float)dn_pre);
         }
         if (comp_pre >  K_COMP_MAX_ADU) comp_pre =  K_COMP_MAX_ADU;
@@ -3270,14 +3399,25 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
          * resets to 0 right after FFC and the correction is silently
          * lost (sawtooth pattern instead of fix). */
         int32_t comp_acc = 0;
+        const bool ntc_ok_acc =
+            ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc);
+        const int32_t dn_acc = ntc_ok_acc
+            ? (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc
+            : 0;
         if (ffc_last_fpa_vtemp != 0) {
-            const int32_t dv_acc =
-                (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
+            int32_t dv_acc =
+                smooth_vtemp_at_ffc - (int32_t)ffc_last_fpa_vtemp;
+            if (ntc_ok_acc) {
+                const int32_t adn = dn_acc < 0 ? -dn_acc : dn_acc;
+                const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
+                if (dv_acc >  dv_ntc_cap) dv_acc =  dv_ntc_cap;
+                if (dv_acc < -dv_ntc_cap) dv_acc = -dv_ntc_cap;
+            }
+            if (dv_acc >  DV_CLAMP_ADU) dv_acc =  DV_CLAMP_ADU;
+            if (dv_acc < -DV_CLAMP_ADU) dv_acc = -DV_CLAMP_ADU;
             comp_acc += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_acc);
         }
-        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc)) {
-            const int32_t dn_acc =
-                (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
+        if (ntc_ok_acc) {
             comp_acc += (int32_t)(K_NTC_COMP_STATIC * (float)dn_acc);
         }
         if (comp_acc >  K_COMP_MAX_ADU) comp_acc =  K_COMP_MAX_ADU;
@@ -3305,9 +3445,13 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         g_smooth_high = 0;
     }
 
-    /* update FFC bookkeeping */
+    /* update FFC bookkeeping. ffc_last_fpa_vtemp stores the SMOOTHED VTEMP
+     * so that K_V·ΔV in subsequent frames is consistent (smooth − smooth).
+     * The trigger and sanity check still compare raw cur vs this stored
+     * smoothed value — close enough since they're separated by ≥30 s. */
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
-    ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    ffc_retry_after_ms = 0;
+    ffc_last_fpa_vtemp = (uint16_t)smooth_vtemp_at_ffc;
     ffc_last_ntc = cur_ntc_at_ffc;
     ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
@@ -3326,6 +3470,13 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
         return (now_ms >= FFC_INTERVAL_FIRST_MS);
     }
 
+    if (ffc_retry_after_ms != 0) {
+        if ((int32_t)(now_ms - ffc_retry_after_ms) < 0) {
+            return false;
+        }
+        ffc_retry_after_ms = 0;
+    }
+
     /* Select target interval based on which FFC we're waiting for.
      * ffc_count here is the number of FFCs COMPLETED, so ffc_count==1 means
      * we're deciding when to fire FFC #2, etc. After the explicit warmup
@@ -3341,6 +3492,26 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
                                   ? FFC_INTERVAL_EXT_WARMUP_MS
                                   : FFC_INTERVAL_STABLE_MS;
             break;
+    }
+
+    /* Post-warmup thermal-settled gate: if VTEMP raw is far from its EMA
+     * smoothed value, FPA is mid-transient (e.g. external thermal shock).
+     * Defer FFC entirely until smoother catches up — committing now would
+     * bake an enormous K_V·ΔV into ram_temp_anchor and shift the scene
+     * reading permanently. The first three warmup FFCs still lock cold-start
+     * calibration quickly; from the fourth attempt onward, require the signals
+     * to be settled before firing the shutter. */
+    if (ffc_count >= 3) {
+        const int32_t smooth = (int32_t)(g_vtemp_smooth_x256 >> 8);
+        int32_t vdiff = (int32_t)cur_fpa_vtemp - smooth;
+        if (vdiff < 0) vdiff = -vdiff;
+        if (vdiff > FFC_VTEMP_SETTLED_ADU) {
+            return false;
+        }
+        if (!ffc_vtemp_ntc_plausible(
+                cur_fpa_vtemp, g_cur_ntc_adc, nullptr, nullptr)) {
+            return false;
+        }
     }
 
     const uint32_t elapsed = now_ms - ffc_last_ms;
