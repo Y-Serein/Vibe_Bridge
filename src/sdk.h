@@ -185,7 +185,8 @@ struct yuv_cmap_simd {
 #define IO_SVM1 5
 #define IO_SVM2 4
 #define IO_BTN  0
-/* Board NTC on RP2350 ADC2 = GPIO28 (diagnostic only). */
+/* Current board NTC is RP2350 ADC2 = GPIO28.
+ * GPIO26/ADC0 is abandoned on the current hardware revision. */
 #define IO_NTC      28
 #define ADC_CH_NTC  2
 
@@ -217,6 +218,7 @@ struct yuv_cmap_simd {
 
 #define SENSOR_W          160
 #define SENSOR_H          120
+/* Keep this at 384: lower values make row fixed-pattern stripes visible. */
 #define MIN_THERMAL_RANGE 384
 
 #define FLASH_SIZE          (4 * 1024 * 1024)

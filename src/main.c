@@ -435,14 +435,22 @@ static const uint16_t* g_last_calib = nullptr;
  *   |K_N| ≈ 0.12–0.24 → start at 0.20.
  *
  * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
-#define K_ANCHOR_COMP_STATIC    0.20f   /* K_V — VTEMP-based */
-#define K_NTC_COMP_STATIC       (-0.20f)/* K_N — NTC-based; flip sign if wrong */
+#define K_ANCHOR_COMP_STATIC    0.50f   /* K_V — VTEMP-based */
+#define K_NTC_COMP_STATIC       (+7.0f) /* K_N — NTC-based; flip sign if wrong */
+/* Consecutive FFC rejections allowed before forcing commit. After a real
+ * thermal shock (e.g. hand on device, sudden ambient change) the FPA jumps
+ * persistently and dV exceeds FFC_REJECT_DV_ADU forever; without an escape
+ * hatch the |ΔVTEMP| trigger machine-guns rejected FFCs every 2 s. After
+ * this many rejects in a row, accept the next attempt regardless of
+ * dG/dV — the shock has settled into a new stable baseline. */
+#define FFC_FORCE_ACCEPT_AFTER  3
 #define K_COMP_MAX_ADU          1500
 static uint32_t ffc_last_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
 static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
+static uint8_t  ffc_consec_reject = 0;        /* consecutive sanity-rejects */
 static bool     ffc_done_first = false;
 
 /* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
@@ -450,42 +458,148 @@ static bool     ffc_done_first = false;
  *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
  *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
  *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
- *    [PX_CNT+19 .. +20] reserved (was baseline_fpa_vtemp; emit 0 for protocol compat)
+ *    [PX_CNT+19 .. +20] ffc_last_ntc        u16   BE (0 before first FFC)
+ *    [PX_CNT+21 .. +22] cur_ntc             u16   BE
+ *    [PX_CNT+23 .. +24] adc_temp_cs_low16   u16   BE
+ *    [PX_CNT+25 .. +26] adc_cfg             u16   BE
+ *    [PX_CNT+27 .. +28] adc_temp_sensor     u16   BE
+ *    [PX_CNT+29 .. +30] ntc_adc_cs_low16    u16   BE
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
-#define FRAME_DIAG_TAIL     16
+#define FRAME_DIAG_TAIL     24
 
-/* NTC diagnostic-only sampling. ADC2 = GPIO28 board-NTC.  EMA-smoothed sample
- * exposed in the diag tail at out[PX_CNT+21..22] for GUI monitoring.  No
- * compensation logic uses this value — purely passive read-out. */
+/* NTC sampling. ADC2 = GPIO28 on the current board.  EMA-smoothed sample is
+ * exposed in the diag tail at out[PX_CNT+21..22] and feeds K_NTC compensation
+ * only when it is not rail-saturated. */
 static volatile uint16_t g_cur_ntc_adc = 0;
-static inline uint16_t ntc_read_avg(int n)
+static volatile uint16_t g_adc_temp_adc = 0;
+static volatile uint16_t g_adc_temp_cs_low16 = 0;
+static volatile uint16_t g_ntc_adc_cs_low16 = 0;
+#define ADC_DIAG_CFG_WORD \
+    ((((uint16_t)ADC_BASE_PIN) << 8) \
+     | (((uint16_t)NUM_ADC_CHANNELS) << 4) \
+     | ((uint16_t)ADC_TEMPERATURE_CHANNEL_NUM))
+static volatile uint16_t g_adc_cfg_word = ADC_DIAG_CFG_WORD;
+#define NTC_ADC_SAMPLES 256
+static uint16_t ntc_adcbuf[NTC_ADC_SAMPLES];
+static int ntc_adc_dma_chan = -1;
+static dma_channel_config ntc_adc_dma_cfg;
+static bool ntc_adc_dma_ready = false;
+
+static inline bool ntc_adc_valid(uint16_t v)
+{
+    return v > 8 && v < 4088;
+}
+
+static inline uint16_t adc_trimmed_mean_from_buf(
+    const uint16_t* data, uint32_t size)
+{
+    uint32_t sum = 0;
+    uint16_t min = 0x0FFF;
+    uint16_t max = 0;
+
+    if (data == nullptr || size < 3) return 0;
+
+    for (uint32_t i = 0; i < size; i++) {
+        const uint16_t v = data[i] & 0x0FFF;
+        sum += v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+
+    sum -= min;
+    sum -= max;
+    return (uint16_t)(sum / (size - 2));
+}
+
+static inline void adc_clear_err_sticky(void)
+{
+    const uint32_t keep = adc_hw->cs
+        & (ADC_CS_EN_BITS | ADC_CS_TS_EN_BITS | ADC_CS_AINSEL_BITS
+           | ADC_CS_RROBIN_BITS);
+    adc_hw->cs = keep | ADC_CS_ERR_STICKY_BITS;
+}
+
+static inline uint16_t adc_read_single_avg_input(uint input, int n)
 {
     if (n < 1) n = 1;
-    adc_select_input(ADC_CH_NTC);
+    adc_select_input(input);
+    adc_clear_err_sticky();
+    (void)adc_read();
     uint32_t acc = 0;
     for (int i = 0; i < n; i++) acc += adc_read();
     return (uint16_t)(acc / (uint32_t)n);
 }
+
+static uint16_t adc_read_dma_trimmed_input(uint input)
+{
+    if (!ntc_adc_dma_ready) {
+        return adc_read_single_avg_input(input, 8);
+    }
+
+    adc_run(false);
+    adc_select_input(input);
+    adc_clear_err_sticky();
+    adc_fifo_drain();
+    adc_fifo_setup(true, true, 1, false, false);
+
+    dma_channel_configure(ntc_adc_dma_chan,
+                          &ntc_adc_dma_cfg,
+                          ntc_adcbuf,
+                          &adc_hw->fifo,
+                          NTC_ADC_SAMPLES,
+                          false);
+    adc_run(true);
+    dma_channel_start(ntc_adc_dma_chan);
+    dma_channel_wait_for_finish_blocking(ntc_adc_dma_chan);
+    adc_run(false);
+    adc_fifo_drain();
+
+    return adc_trimmed_mean_from_buf(ntc_adcbuf, NTC_ADC_SAMPLES);
+}
+
+static inline uint16_t ntc_read_avg(int n)
+{
+    (void)n;
+    const uint16_t v = adc_read_dma_trimmed_input(ADC_CH_NTC);
+    g_ntc_adc_cs_low16 = (uint16_t)(adc_hw->cs & 0xFFFFu);
+    return v;
+}
+
+static void ntc_adc_dma_init(void)
+{
+    memset(ntc_adcbuf, 0, sizeof(ntc_adcbuf));
+    adc_fifo_setup(true, true, 1, false, false);
+
+    ntc_adc_dma_chan = dma_claim_unused_channel(true);
+    ntc_adc_dma_cfg = dma_channel_get_default_config(ntc_adc_dma_chan);
+    channel_config_set_transfer_data_size(&ntc_adc_dma_cfg, DMA_SIZE_16);
+    channel_config_set_read_increment(&ntc_adc_dma_cfg, false);
+    channel_config_set_write_increment(&ntc_adc_dma_cfg, true);
+    channel_config_set_dreq(&ntc_adc_dma_cfg, DREQ_ADC);
+    ntc_adc_dma_ready = true;
+}
+
 static inline void ntc_tick(void)
 {
     static uint8_t tick = 0;
     tick++;
     if ((tick & 0x07) != 0) return;
-    adc_select_input(ADC_CH_NTC);
-    const uint16_t v = adc_read();
+    const uint16_t v = ntc_read_avg(4);
     const uint16_t cur = g_cur_ntc_adc;
     g_cur_ntc_adc = (cur == 0) ? v
                                 : (uint16_t)(((uint32_t)cur * 31 + v) >> 5);
 }
 
-/* Diagnostic tail appended after the 6-byte temperature tail (VTEMP+T_lo+T_hi):
- *    [PX_CNT+ 7 .. +10] ram_temp_anchor     int32 BE
- *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
- *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
- *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
- *    [PX_CNT+19 .. +20] baseline_fpa_vtemp  u16   BE (first-FFC VTEMP; 0 before)
- * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
-#define FRAME_DIAG_TAIL     16
+static void adc_probe_core(void)
+{
+    adc_set_temp_sensor_enabled(true);
+    g_adc_temp_adc = adc_read_dma_trimmed_input(ADC_TEMPERATURE_CHANNEL_NUM);
+    g_adc_temp_cs_low16 = (uint16_t)(adc_hw->cs & 0xFFFFu);
+    adc_set_temp_sensor_enabled(false);
+    g_adc_cfg_word = ADC_DIAG_CFG_WORD;
+
+    adc_select_input(ADC_CH_NTC);
+}
 
 static inline __attribute__((always_inline)) void normalize_frame_be(
     uint8_t* raw, uint8_t* out)
@@ -575,6 +689,72 @@ static inline __attribute__((always_inline)) uint16_t clip_u16(int32_t v)
         return 65535;
     }
     return (uint16_t)v;
+}
+
+#define DISPLAY_ROW_STRIPE_MAX_ADU 48
+#define DISPLAY_DETAIL_MAX_ADU     32
+
+static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static inline void display_row_destripe_u14(uint16_t* img)
+{
+    int32_t row_mean[SENSOR_H];
+
+    for (int y = 0; y < SENSOR_H; y++) {
+        uint32_t sum = 0;
+        const uint16_t* row = &img[y * SENSOR_W];
+        for (int x = 0; x < SENSOR_W; x++) {
+            sum += row[x];
+        }
+        row_mean[y] = (int32_t)(sum / SENSOR_W);
+    }
+
+    for (int y = 0; y < SENSOR_H; y++) {
+        int32_t ref_sum = 0;
+        int32_t ref_cnt = 0;
+        for (int dy = -2; dy <= 2; dy++) {
+            if (dy == 0) continue;
+            const int yy = y + dy;
+            if (yy < 0 || yy >= SENSOR_H) continue;
+            ref_sum += row_mean[yy];
+            ref_cnt++;
+        }
+        if (ref_cnt == 0) continue;
+
+        const int32_t local_ref = ref_sum / ref_cnt;
+        int32_t corr = row_mean[y] - local_ref;
+        corr = clamp_i32(corr, -DISPLAY_ROW_STRIPE_MAX_ADU,
+                         DISPLAY_ROW_STRIPE_MAX_ADU);
+        corr = (corr * 3) / 4;
+        if (corr == 0) continue;
+
+        uint16_t* row = &img[y * SENSOR_W];
+        for (int x = 0; x < SENSOR_W; x++) {
+            row[x] = clip_u16((int32_t)row[x] - corr);
+        }
+    }
+}
+
+static inline uint16_t display_detail_boost_u14(
+    const uint16_t* img, int x, int y)
+{
+    const int idx = y * SENSOR_W + x;
+    if (x <= 0 || x >= SENSOR_W - 1 || y <= 0 || y >= SENSOR_H - 1) {
+        return img[idx];
+    }
+
+    const int32_t blur =
+        ((int32_t)img[idx - 1] + (int32_t)img[idx + 1]
+         + (int32_t)img[idx - SENSOR_W] + (int32_t)img[idx + SENSOR_W]) >> 2;
+    int32_t detail = (int32_t)img[idx] - blur;
+    detail = clamp_i32(detail, -DISPLAY_DETAIL_MAX_ADU,
+                       DISPLAY_DETAIL_MAX_ADU);
+    return clip_u16((int32_t)img[idx] + (detail >> 1));
 }
 
 static inline __attribute__((always_inline)) void raw16_decode_to_normbuf(
@@ -1763,6 +1943,8 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         }
     }
     calc_percentile_u14(raw14, PX_CNT, &low, &high);
+    const uint32_t raw_scene_range = high > low ? high - low : 0;
+    const bool display_enhance = raw_scene_range < MIN_THERMAL_RANGE;
 
     if (unlikely(g_smooth_low == 0 && g_smooth_high == 0)) {
         g_smooth_low = low;
@@ -1816,7 +1998,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
                 (int32_t)cur_vtemp - (int32_t)ffc_last_fpa_vtemp;
             comp += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv);
         }
-        if (ffc_last_ntc != 0 && cur_ntc != 0) {
+        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc)) {
             const int32_t dn =
                 (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
             comp += (int32_t)(K_NTC_COMP_STATIC * (float)dn);
@@ -1879,8 +2061,14 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     const uint32_t range = g_smooth_high - g_smooth_low;
     const uint32_t mult = (254 << 16) / range;
 
-    for (int i = 0; i < PX_CNT; i++) {
-        const uint16_t v = raw14[i];
+    if (display_enhance) {
+        display_row_destripe_u14(raw14);
+    }
+
+    for (int i = 0, x = 0, y = 0; i < PX_CNT; i++) {
+        const uint16_t v = display_enhance
+                               ? display_detail_boost_u14(raw14, x, y)
+                               : raw14[i];
         uint8_t linear_val;
 
         if (v <= g_smooth_low) {
@@ -1895,6 +2083,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
 
         if (dataomode == DOM_UVC && (i & 0x3FF) == 0) {
             tud_task();
+        }
+
+        x++;
+        if (x >= SENSOR_W) {
+            x = 0;
+            y++;
         }
     }
 
@@ -1920,12 +2114,24 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[PX_CNT + 16] = (uint8_t)(md_u >> 16);
     out[PX_CNT + 17] = (uint8_t)(md_u >>  8);
     out[PX_CNT + 18] = (uint8_t)(md_u      );
-    /* slot 19..20 reserved (was baseline_fpa_vtemp under runtime K-fit) */
-    out[PX_CNT + 19] = 0;
-    out[PX_CNT + 20] = 0;
+    const uint16_t ntc_ref = ffc_last_ntc;
+    out[PX_CNT + 19] = (uint8_t)(ntc_ref >> 8);
+    out[PX_CNT + 20] = (uint8_t)(ntc_ref     );
     const uint16_t ntc_snap = g_cur_ntc_adc;
     out[PX_CNT + 21] = (uint8_t)(ntc_snap >> 8);
     out[PX_CNT + 22] = (uint8_t)(ntc_snap     );
+    const uint16_t adc_temp_cs = g_adc_temp_cs_low16;
+    out[PX_CNT + 23] = (uint8_t)(adc_temp_cs >> 8);
+    out[PX_CNT + 24] = (uint8_t)(adc_temp_cs     );
+    const uint16_t adc_cfg = g_adc_cfg_word;
+    out[PX_CNT + 25] = (uint8_t)(adc_cfg >> 8);
+    out[PX_CNT + 26] = (uint8_t)(adc_cfg     );
+    const uint16_t adc_temp = g_adc_temp_adc;
+    out[PX_CNT + 27] = (uint8_t)(adc_temp >> 8);
+    out[PX_CNT + 28] = (uint8_t)(adc_temp     );
+    const uint16_t adc_cs = g_ntc_adc_cs_low16;
+    out[PX_CNT + 29] = (uint8_t)(adc_cs >> 8);
+    out[PX_CNT + 30] = (uint8_t)(adc_cs     );
 }
 
 static inline __attribute__((always_inline)) void binary_frame(
@@ -2722,7 +2928,9 @@ void __time_critical_func(core1_rawbuf_consumer)()
     cur_cmap_idx = 0;
     init_yuv_cmap(active_cmap);
 
-    /* Seed NTC EMA so the first frames don't emit 0 in the diag tail. */
+    /* Seed ADC diagnostics before the first frame. */
+    g_adc_cfg_word = ADC_DIAG_CFG_WORD;
+    adc_probe_core();
     g_cur_ntc_adc = ntc_read_avg(8);
 
     while (true) {
@@ -2970,8 +3178,13 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
         const int32_t adg = dg_check < 0 ? -dg_check : dg_check;
         const int32_t adv = dv_check < 0 ? -dv_check : dv_check;
-        if (adg > FFC_REJECT_DG_ADU || adv > FFC_REJECT_DV_ADU) {
-            println("FFC reject: dg=%ld dv=%ld (limits dg=%d dv=%d)",
+        const bool over_limits =
+            (adg > FFC_REJECT_DG_ADU) || (adv > FFC_REJECT_DV_ADU);
+        if (over_limits && ffc_consec_reject < FFC_FORCE_ACCEPT_AFTER) {
+            ffc_consec_reject++;
+            println("FFC reject %u/%u: dg=%ld dv=%ld (limits dg=%d dv=%d)",
+                    (unsigned)ffc_consec_reject,
+                    (unsigned)FFC_FORCE_ACCEPT_AFTER,
                     (long)dg_check, (long)dv_check,
                     FFC_REJECT_DG_ADU, FFC_REJECT_DV_ADU);
             rawbuf_state[idx] = RAWBUF_FREE;
@@ -2984,7 +3197,13 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             ffc_last_ms = to_ms_since_boot(get_absolute_time());
             return;
         }
+        if (over_limits) {
+            println("FFC force-accept after %u rejects: dg=%ld dv=%ld",
+                    (unsigned)ffc_consec_reject,
+                    (long)dg_check, (long)dv_check);
+        }
     }
+    ffc_consec_reject = 0;
 
     /* Sanity check passed — commit the new shutter frame */
     for (size_t i = 0; i < PX_CNT; i++) {
@@ -3030,7 +3249,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
                 (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
             comp_pre += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_pre);
         }
-        if (ffc_last_ntc != 0 && cur_ntc_at_ffc != 0) {
+        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc)) {
             const int32_t dn_pre =
                 (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
             comp_pre += (int32_t)(K_NTC_COMP_STATIC * (float)dn_pre);
@@ -3056,7 +3275,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
                 (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
             comp_acc += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_acc);
         }
-        if (ffc_last_ntc != 0 && cur_ntc_at_ffc != 0) {
+        if (ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc)) {
             const int32_t dn_acc =
                 (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
             comp_acc += (int32_t)(K_NTC_COMP_STATIC * (float)dn_acc);
@@ -3174,10 +3393,14 @@ int __time_critical_func(spi_init_40MHz4)()
                     48 * MHZ,
                     48 * MHZ);
 
-    /* Init board NTC on ADC2 / GPIO28 — diagnostic only, no compensation. */
+    /* Init board NTC on ADC2 / GPIO28 for diagnostics and K_NTC.
+     * Keep the old working ADC0 init sequence: deinit GPIO before switching
+     * it to ADC, then sample through FIFO + DMA instead of single adc_read(). */
+    gpio_deinit(IO_NTC);
     adc_init();
     adc_gpio_init(IO_NTC);
     adc_select_input(ADC_CH_NTC);
+    ntc_adc_dma_init();
 
     extern void dutx_init();
     dutx_init();
