@@ -446,7 +446,7 @@ static const uint16_t* g_last_calib = nullptr;
  *
  * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
 #define K_ANCHOR_COMP_STATIC    0.0f    /* K_V — disabled: VTEMP can be false */
-#define K_NTC_COMP_STATIC       (+3.0f) /* K_N — NTC-based; flip sign if wrong */
+#define K_NTC_COMP_STATIC       (+2.3f) /* K_N — normal NTC-based */
 /* dV input clamp for K_V·ΔV. The K_V model (linear bolometer drift with
  * FPA temperature) holds for slow drift (ΔV < ~300 ADU between FFCs) but
  * breaks for thermal shocks (ΔV > 1000 ADU): the bolometer doesn't actually
@@ -475,6 +475,12 @@ static const uint16_t* g_last_calib = nullptr;
 #define FFC_VTEMP_NTC_RATIO_MAX     6
 #define FFC_NTC_SIGN_DEADBAND_ADU   3
 #define FFC_RETRY_COOLDOWN_MS       15000u
+#define NTC_WARMUP_CURVE_COMP_ADU   220
+#define NTC_WARMUP_CURVE_TAU_MS     12000u
+#define NTC_WARMUP_FADE_START_MS    70000u
+#define NTC_WARMUP_FADE_END_MS      150000u
+#define NTC_WARMUP_NTC_FADE_START_ADU 80
+#define NTC_WARMUP_NTC_FADE_END_ADU   160
 /* Consecutive FFC rejections allowed before forcing commit. After a real
  * thermal shock (e.g. hand on device, sudden ambient change) the FPA jumps
  * persistently and dV exceeds FFC_REJECT_DV_ADU forever; without an escape
@@ -487,6 +493,8 @@ static uint32_t ffc_last_ms = 0;
 static uint32_t ffc_retry_after_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
+static uint16_t boot_ntc = 0;                /* valid NTC ADC captured at power-on */
+static uint32_t boot_ntc_ms = 0;             /* timestamp of the first valid NTC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
 static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
 static uint8_t  ffc_consec_reject = 0;        /* consecutive sanity-rejects */
@@ -517,6 +525,7 @@ static volatile uint32_t g_vtemp_smooth_x256 = 0;
  * exposed in the diag tail at out[PX_CNT+21..22] and feeds K_NTC compensation
  * only when it is not rail-saturated. */
 static volatile uint16_t g_cur_ntc_adc = 0;
+static volatile uint32_t g_ntc_smooth_x256 = 0;
 static volatile uint16_t g_adc_temp_adc = 0;
 static volatile uint16_t g_adc_temp_cs_low16 = 0;
 static volatile uint16_t g_ntc_adc_cs_low16 = 0;
@@ -526,6 +535,9 @@ static volatile uint16_t g_ntc_adc_cs_low16 = 0;
      | ((uint16_t)ADC_TEMPERATURE_CHANNEL_NUM))
 static volatile uint16_t g_adc_cfg_word = ADC_DIAG_CFG_WORD;
 #define NTC_ADC_SAMPLES 256
+#define NTC_FAST_TRACK_MS 60000u
+#define NTC_EMA_FAST_SHIFT 3
+#define NTC_EMA_SLOW_SHIFT 5
 static uint16_t ntc_adcbuf[NTC_ADC_SAMPLES];
 static int ntc_adc_dma_chan = -1;
 static dma_channel_config ntc_adc_dma_cfg;
@@ -569,6 +581,66 @@ static bool ffc_vtemp_ntc_plausible(
 
     return adv <= (FFC_VTEMP_NTC_FREE_ADU
                    + adn * FFC_VTEMP_NTC_RATIO_MAX);
+}
+
+static inline uint16_t u16_absdiff(uint16_t a, uint16_t b)
+{
+    return (a > b) ? (a - b) : (b - a);
+}
+
+static inline int32_t ntc_warmup_curve_comp_for(uint16_t cur_ntc)
+{
+    if (!ntc_adc_valid(boot_ntc) || !ntc_adc_valid(cur_ntc)) {
+        return 0;
+    }
+
+    /* The board NTC lags the shutter/lens during cold start.  The latest
+     * trend shows scene keeps falling even after NTC has started moving, so
+     * this curve exits only after a larger body-temperature rise or a long
+     * timeout, then the normal K_NTC path owns the residual drift. */
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    const uint32_t start_ms = boot_ntc_ms ? boot_ntc_ms : now_ms;
+    const uint32_t elapsed_ms = now_ms - start_ms;
+    if (elapsed_ms >= NTC_WARMUP_FADE_END_MS) {
+        return 0;
+    }
+
+    uint32_t mag = ((uint32_t)NTC_WARMUP_CURVE_COMP_ADU * elapsed_ms)
+                   / (elapsed_ms + NTC_WARMUP_CURVE_TAU_MS);
+
+    if (elapsed_ms > NTC_WARMUP_FADE_START_MS) {
+        mag = mag * (NTC_WARMUP_FADE_END_MS - elapsed_ms)
+              / (NTC_WARMUP_FADE_END_MS - NTC_WARMUP_FADE_START_MS);
+    }
+
+    const uint16_t boot_delta = u16_absdiff(cur_ntc, boot_ntc);
+    if (boot_delta > NTC_WARMUP_NTC_FADE_START_ADU) {
+        if (boot_delta >= NTC_WARMUP_NTC_FADE_END_ADU) {
+            return 0;
+        }
+        mag = mag * (uint32_t)(NTC_WARMUP_NTC_FADE_END_ADU - boot_delta)
+              / (uint32_t)(NTC_WARMUP_NTC_FADE_END_ADU
+                           - NTC_WARMUP_NTC_FADE_START_ADU);
+    }
+
+    return -(int32_t)mag;
+}
+
+static inline int32_t ntc_normal_comp_for(uint16_t cur_ntc)
+{
+    if (!ntc_adc_valid(ffc_last_ntc) || !ntc_adc_valid(cur_ntc)) {
+        return 0;
+    }
+
+    const int32_t dn = (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
+    return (int32_t)(K_NTC_COMP_STATIC * (float)dn);
+}
+
+static inline int32_t ntc_frame_comp_for(uint16_t cur_ntc)
+{
+    int32_t comp = ntc_normal_comp_for(cur_ntc);
+    comp += ntc_warmup_curve_comp_for(cur_ntc);
+    return comp;
 }
 
 static inline uint16_t adc_trimmed_mean_from_buf(
@@ -663,12 +735,35 @@ static void ntc_adc_dma_init(void)
 static inline void ntc_tick(void)
 {
     static uint8_t tick = 0;
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    const bool fast = (now_ms < NTC_FAST_TRACK_MS);
+
     tick++;
-    if ((tick & 0x07) != 0) return;
+    if ((tick & (fast ? 0x03u : 0x07u)) != 0) return;
+
     const uint16_t v = ntc_read_avg(4);
-    const uint16_t cur = g_cur_ntc_adc;
-    g_cur_ntc_adc = (cur == 0) ? v
-                                : (uint16_t)(((uint32_t)cur * 31 + v) >> 5);
+    if (!ntc_adc_valid(v)) return;
+
+    if (!ntc_adc_valid(boot_ntc)) {
+        boot_ntc = v;
+        boot_ntc_ms = now_ms;
+    }
+
+    uint32_t smooth = g_ntc_smooth_x256;
+    const uint32_t target = ((uint32_t)v) << 8;
+    if (smooth == 0) {
+        smooth = target;
+    } else {
+        const uint8_t shift = fast ? NTC_EMA_FAST_SHIFT : NTC_EMA_SLOW_SHIFT;
+        if (target >= smooth) {
+            smooth += (target - smooth) >> shift;
+        } else {
+            smooth -= (smooth - target) >> shift;
+        }
+    }
+
+    g_ntc_smooth_x256 = smooth;
+    g_cur_ntc_adc = (uint16_t)((smooth + 128u) >> 8);
 }
 
 static void adc_probe_core(void)
@@ -2103,7 +2198,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             comp += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv);
         }
         if (ntc_ok) {
-            comp += (int32_t)(K_NTC_COMP_STATIC * (float)dn);
+            comp += ntc_frame_comp_for(cur_ntc);
         }
         if (comp >  K_COMP_MAX_ADU) comp =  K_COMP_MAX_ADU;
         if (comp < -K_COMP_MAX_ADU) comp = -K_COMP_MAX_ADU;
@@ -3033,7 +3128,25 @@ void __time_critical_func(core1_rawbuf_consumer)()
     /* Seed ADC diagnostics before the first frame. */
     g_adc_cfg_word = ADC_DIAG_CFG_WORD;
     adc_probe_core();
-    g_cur_ntc_adc = ntc_read_avg(8);
+    for (int i = 0; i < 32; i++) {
+        const uint16_t v = ntc_read_avg(8);
+        if (ntc_adc_valid(v)) {
+            g_cur_ntc_adc = v;
+            g_ntc_smooth_x256 = ((uint32_t)v) << 8;
+            boot_ntc = v;
+            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
+            break;
+        }
+        sleep_ms(2);
+    }
+    if (!ntc_adc_valid(g_cur_ntc_adc)) {
+        g_cur_ntc_adc = ntc_read_avg(8);
+        if (ntc_adc_valid(g_cur_ntc_adc)) {
+            g_ntc_smooth_x256 = ((uint32_t)g_cur_ntc_adc) << 8;
+            boot_ntc = g_cur_ntc_adc;
+            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
+        }
+    }
 
     while (true) {
         uart_poll2(baud_get2);
@@ -3381,7 +3494,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             comp_pre += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_pre);
         }
         if (ntc_ok_pre) {
-            comp_pre += (int32_t)(K_NTC_COMP_STATIC * (float)dn_pre);
+            comp_pre += ntc_frame_comp_for(cur_ntc_at_ffc);
         }
         if (comp_pre >  K_COMP_MAX_ADU) comp_pre =  K_COMP_MAX_ADU;
         if (comp_pre < -K_COMP_MAX_ADU) comp_pre = -K_COMP_MAX_ADU;
@@ -3418,7 +3531,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             comp_acc += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_acc);
         }
         if (ntc_ok_acc) {
-            comp_acc += (int32_t)(K_NTC_COMP_STATIC * (float)dn_acc);
+            comp_acc += ntc_normal_comp_for(cur_ntc_at_ffc);
         }
         if (comp_acc >  K_COMP_MAX_ADU) comp_acc =  K_COMP_MAX_ADU;
         if (comp_acc < -K_COMP_MAX_ADU) comp_acc = -K_COMP_MAX_ADU;
@@ -3433,7 +3546,9 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      * compensation already applied to the renderer; otherwise every FFC
      * introduces a momentary scene-reading offset of K·ΔVTEMP/mean_diff. */
     if (ffc_done_first && g_smooth_low != 0 && g_smooth_high != 0) {
-        const int32_t delta = ram_temp_anchor - eff_anchor_old;
+        const int32_t eff_anchor_new =
+            ram_temp_anchor + ntc_warmup_curve_comp_for(cur_ntc_at_ffc);
+        const int32_t delta = eff_anchor_new - eff_anchor_old;
         int32_t nl = (int32_t)g_smooth_low  + delta;
         int32_t nh = (int32_t)g_smooth_high + delta;
         if (nl < 0) nl = 0; else if (nl > 0xFFFF) nl = 0xFFFF;
