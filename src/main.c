@@ -447,6 +447,7 @@ static const uint16_t* g_last_calib = nullptr;
  * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
 #define K_ANCHOR_COMP_STATIC    0.0f    /* K_V — disabled: VTEMP can be false */
 #define K_NTC_COMP_STATIC       (+2.3f) /* K_N — normal NTC-based */
+#define K_NTC_COMP_LATE_STATIC  (+3.0f) /* K_N — after warmup curve hands off */
 /* dV input clamp for K_V·ΔV. The K_V model (linear bolometer drift with
  * FPA temperature) holds for slow drift (ΔV < ~300 ADU between FFCs) but
  * breaks for thermal shocks (ΔV > 1000 ADU): the bolometer doesn't actually
@@ -477,8 +478,8 @@ static const uint16_t* g_last_calib = nullptr;
 #define FFC_RETRY_COOLDOWN_MS       15000u
 #define NTC_WARMUP_CURVE_COMP_ADU   220
 #define NTC_WARMUP_CURVE_TAU_MS     12000u
-#define NTC_WARMUP_FADE_START_MS    70000u
-#define NTC_WARMUP_FADE_END_MS      150000u
+#define NTC_WARMUP_FADE_START_MS    180000u
+#define NTC_WARMUP_FADE_END_MS      320000u
 #define NTC_WARMUP_NTC_FADE_START_ADU 80
 #define NTC_WARMUP_NTC_FADE_END_ADU   160
 /* Consecutive FFC rejections allowed before forcing commit. After a real
@@ -632,8 +633,21 @@ static inline int32_t ntc_normal_comp_for(uint16_t cur_ntc)
         return 0;
     }
 
+    float k = K_NTC_COMP_STATIC;
+    if (ntc_adc_valid(boot_ntc)) {
+        const uint16_t boot_delta = u16_absdiff(cur_ntc, boot_ntc);
+        if (boot_delta >= NTC_WARMUP_NTC_FADE_END_ADU) {
+            k = K_NTC_COMP_LATE_STATIC;
+        } else if (boot_delta > NTC_WARMUP_NTC_FADE_START_ADU) {
+            const float w = (float)(boot_delta - NTC_WARMUP_NTC_FADE_START_ADU)
+                            * (1.0f / (float)(NTC_WARMUP_NTC_FADE_END_ADU
+                                               - NTC_WARMUP_NTC_FADE_START_ADU));
+            k += (K_NTC_COMP_LATE_STATIC - K_NTC_COMP_STATIC) * w;
+        }
+    }
+
     const int32_t dn = (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
-    return (int32_t)(K_NTC_COMP_STATIC * (float)dn);
+    return (int32_t)(k * (float)dn);
 }
 
 static inline int32_t ntc_frame_comp_for(uint16_t cur_ntc)
