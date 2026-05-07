@@ -1,0 +1,26 @@
+/target/
+/node_modules/
+/dist/
+docs/
+
+# Local runtime/debug artifacts
+/_tmp_*
+*.tmp
+*.log
+/docs/logs.txt
+
+# Local screenshots captured while tuning the physical LCD
+/images/
+
+# Local handoff/planning notes and obsolete Node HID probe
+/HANDOFF.md
+/TODO.md
+/vibe_bridge_agent_task.md
+/package.json
+/test_hid.js
+
+# Local secrets and editor/OS noise
+.env
+.env.*
+.DS_Store
+Thumbs.db
