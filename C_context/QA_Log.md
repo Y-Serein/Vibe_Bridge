@@ -1,3 +1,22 @@
+## 2026-05-11｜v4l2/guvcview 排查命令作用
+
+### 原始问题
+v4l2-ctl --list-formats-ext -d /dev/videoX
+      - v4l2-ctl --stream-mmap --stream-count=30 -d /dev/videoX
+      - 同时看 dmesg -w这三个指令功能
+
+### 答案核心
+- `v4l2-ctl --list-formats-ext -d /dev/videoX` 查看该 video 节点向 Linux/V4L2 声明的格式、分辨率、帧率,用于确认 descriptor 协商结果是否符合预期。
+- `v4l2-ctl --stream-mmap --stream-count=30 -d /dev/videoX` 不经过 guvcview,直接用 V4L2 mmap 拉 30 帧,用于区分问题在 UVC/驱动层还是 guvcview UI/转换层。
+- `dmesg -w` 实时看内核日志,用于捕捉 UVC 驱动报错、带宽不足、payload/header/EOF/FID 异常、buffer corrupted 等信息。
+- 三个命令配合使用:先看设备宣称什么,再看实际能否拉流,同时看内核为什么失败。
+
+### 相关引用
+- 无。
+
+### 备注
+- `/dev/videoX` 需要替换成实际节点,例如 `/dev/video0` 或 `/dev/video2`。
+
 ## 2026-05-11｜guvcview UVC 兼容性判断
 
 ### 原始问题
