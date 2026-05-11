@@ -11,17 +11,17 @@
 
 #define FRAME_WIDTH  160
 #define FRAME_HEIGHT 120
-#define FRAME_RATE   10
+#define FRAME_RATE   5
 #define FRAME_SIZE   (FRAME_WIDTH * FRAME_HEIGHT * 2)
-#define UVC_FRAME_INTERVAL_100NS 1000000u
+#define UVC_FRAME_INTERVAL_100NS 2000000u
 #define UVC_BYTES_PER_SECOND     (FRAME_SIZE * FRAME_RATE)
 #define UVC_BIT_RATE             (UVC_BYTES_PER_SECOND * 8)
 
-#if UVC_FRAME_INTERVAL_100NS != 1000000u
-#    error "UVC frame interval must stay at 1000000 x 100 ns for 10fps"
+#if UVC_FRAME_INTERVAL_100NS != 2000000u
+#    error "UVC frame interval must stay at 2000000 x 100 ns for 5fps"
 #endif
-#if UVC_BIT_RATE != 3072000u
-#    error "UVC bitrate must match 160x120 YUY2 at 10fps"
+#if UVC_BIT_RATE != 1536000u
+#    error "UVC bitrate must match 160x120 YUY2 at 5fps"
 #endif
 
 #define CFG_EXAMPLE_VIDEO_DISABLE_MJPEG

@@ -52,16 +52,15 @@ extern "C" {
 // The number of video streaming interfaces
 #define CFG_TUD_VIDEO_STREAMING 1
 
-// Use bulk streaming for Linux/guvcview reliability on full-speed USB.
-// Isochronous transfer can deliver full-size V4L2 buffers that are still
-// flagged as corrupted after any packet error; bulk transfer retries instead.
-#define CFG_TUD_VIDEO_STREAMING_BULK 1
+// Keep isochronous streaming for Windows UVC class-driver compatibility.
+// Full-speed bandwidth is kept low by advertising 160x120 YUY2 at 5fps.
+#define CFG_TUD_VIDEO_STREAMING_BULK 0
 
 #if CFG_TUD_VIDEO_STREAMING_BULK
 #    define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 64
 #else
-// 160x120 YUY2 at 10fps: ceil(38400 bytes / 100 ms) + 2-byte UVC header.
-#    define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 386
+// 160x120 YUY2 at 5fps: ceil(38400 bytes / 200 ms) + 2-byte UVC header.
+#    define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 194
 #endif
 
 #endif /* _TUSB_CONFIG_H_ */
