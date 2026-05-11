@@ -1,8 +1,6 @@
 #ifndef _USB_DESCRIPTORS_H_
 #define _USB_DESCRIPTORS_H_
 
-#include "tusb_config.h"
-
 /* Time stamp base clock. It is a deprecated parameter. */
 #define UVC_CLOCK_FREQUENCY 27000000
 /* video capture path */
@@ -11,34 +9,21 @@
 
 #define FRAME_WIDTH  160
 #define FRAME_HEIGHT 120
-#define FRAME_RATE   5
+#define FRAME_RATE   10
 #define FRAME_SIZE   (FRAME_WIDTH * FRAME_HEIGHT * 2)
-#define UVC_FRAME_INTERVAL_100NS 2000000u
+#define UVC_FRAME_INTERVAL_100NS 1000000u
 #define UVC_BYTES_PER_SECOND     (FRAME_SIZE * FRAME_RATE)
 #define UVC_BIT_RATE             (UVC_BYTES_PER_SECOND * 8)
 
-#if UVC_FRAME_INTERVAL_100NS != 2000000u
-#    error "UVC frame interval must stay at 2000000 x 100 ns for 5fps"
+#if UVC_FRAME_INTERVAL_100NS != 1000000u
+#    error "UVC frame interval must stay at 1000000 x 100 ns for 10fps"
 #endif
-#if UVC_BIT_RATE != 1536000u
-#    error "UVC bitrate must match 160x120 YUY2 at 5fps"
+#if UVC_BIT_RATE != 3072000u
+#    error "UVC bitrate must match 160x120 YUY2 at 10fps"
 #endif
 
 #define CFG_EXAMPLE_VIDEO_DISABLE_MJPEG
 #define CFG_EXAMPLE_VIDEO_READONLY
-
-#if CFG_TUD_VIDEO_STREAMING_BULK
-#    define TUD_VIDEO_CAPTURE_STREAM_EP_LEN 7
-#    define TUD_VIDEO_CAPTURE_STD_VS_EPN    1
-#    define TUD_VIDEO_CAPTURE_STREAM_EP(_itf, _stridx, _epin, _epsize) \
-        TUD_VIDEO_DESC_EP_BULK(_epin, _epsize, 0)
-#else
-#    define TUD_VIDEO_CAPTURE_STREAM_EP_LEN (TUD_VIDEO_DESC_STD_VS_LEN + 7)
-#    define TUD_VIDEO_CAPTURE_STD_VS_EPN    0
-#    define TUD_VIDEO_CAPTURE_STREAM_EP(_itf, _stridx, _epin, _epsize) \
-        TUD_VIDEO_DESC_STD_VS(_itf, 1, 1, _stridx), \
-        TUD_VIDEO_DESC_EP_ISO(_epin, _epsize, 1)
-#endif
 
 enum {
     ITF_NUM_VIDEO_CONTROL,
@@ -57,7 +42,7 @@ enum {
      + TUD_VIDEO_DESC_CS_VS_FMT_UNCOMPR_LEN \
      + TUD_VIDEO_DESC_CS_VS_FRM_UNCOMPR_CONT_LEN \
      + TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING_LEN /* Interface 1, Alternate 1 */ \
-     + TUD_VIDEO_CAPTURE_STREAM_EP_LEN /* Endpoint */ \
+     + TUD_VIDEO_DESC_STD_VS_LEN + 7 /* Endpoint */ \
     )
 
 #define TUD_VIDEO_CAPTURE_DESC_MJPEG_LEN \
@@ -71,7 +56,7 @@ enum {
      + TUD_VIDEO_DESC_CS_VS_FMT_MJPEG_LEN \
      + (TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_DISC_LEN + 4) \
      + TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING_LEN /* Interface 1, Alternate 1 */ \
-     + TUD_VIDEO_CAPTURE_STREAM_EP_LEN /* Endpoint */ \
+     + TUD_VIDEO_DESC_STD_VS_LEN + 7 /* Endpoint */ \
     )
 
 /* Windows support YUY2 and NV12
@@ -148,7 +133,7 @@ enum {
                                    0), /* Video stream alt. 0 */ \
         TUD_VIDEO_DESC_STD_VS(ITF_NUM_VIDEO_STREAMING, \
                               0, \
-                              TUD_VIDEO_CAPTURE_STD_VS_EPN, \
+                              0, \
                               _stridx), /* Video stream header for without \
                                            still image capture */ \
         TUD_VIDEO_DESC_CS_VS_INPUT( \
@@ -186,10 +171,9 @@ enum {
             VIDEO_COLOR_PRIMARIES_BT709, \
             VIDEO_COLOR_XFER_CH_BT709, \
             VIDEO_COLOR_COEF_SMPTE170M), /* VS alt 1 */ \
-        TUD_VIDEO_CAPTURE_STREAM_EP(ITF_NUM_VIDEO_STREAMING, \
-                                    _stridx, \
-                                    _epin, \
-                                    _epsize)
+        TUD_VIDEO_DESC_STD_VS( \
+            ITF_NUM_VIDEO_STREAMING, 1, 1, _stridx), /* EP */ \
+        TUD_VIDEO_DESC_EP_ISO(_epin, _epsize, 1)
 
 #define TUD_VIDEO_CAPTURE_DESCRIPTOR_MJPEG( \
     _stridx, _epin, _width, _height, _fps, _epsize) \
@@ -216,7 +200,7 @@ enum {
                                    0), /* Video stream alt. 0 */ \
         TUD_VIDEO_DESC_STD_VS(ITF_NUM_VIDEO_STREAMING, \
                               0, \
-                              TUD_VIDEO_CAPTURE_STD_VS_EPN, \
+                              0, \
                               _stridx), /* Video stream header for without \
                                            still image capture */ \
         TUD_VIDEO_DESC_CS_VS_INPUT( \
@@ -253,9 +237,8 @@ enum {
             VIDEO_COLOR_PRIMARIES_BT709, \
             VIDEO_COLOR_XFER_CH_BT709, \
             VIDEO_COLOR_COEF_SMPTE170M), /* VS alt 1 */ \
-        TUD_VIDEO_CAPTURE_STREAM_EP(ITF_NUM_VIDEO_STREAMING, \
-                                    _stridx, \
-                                    _epin, \
-                                    _epsize)
+        TUD_VIDEO_DESC_STD_VS( \
+            ITF_NUM_VIDEO_STREAMING, 1, 1, _stridx), /* EP */ \
+        TUD_VIDEO_DESC_EP_ISO(_epin, _epsize, 1)
 
 #endif

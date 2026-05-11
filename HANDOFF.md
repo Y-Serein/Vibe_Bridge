@@ -3,7 +3,7 @@
 ## 当前在做什么
 解决 TN160 热成像 scene 温度持续漂移问题。最新状态:**ADC2 4095 根因找到——板上 RP2350 AVDD(QFN-60 第 43 脚)漏接电源,补焊后 NCS=0x2101 / TCS=0x4103,ERR 位全清,NTC ADC2 实测 ~1843,TADC ~866,数值合理。前 7~19 轮 K_NTC 调参基于"ADC 4095 等于 NTC 死值"的假数据,所以补偿等于 0,trend 表现完全反映静态 anchor 行为而不是 K_NTC 的真实效果**。固件已恢复 DMA 路径并移除诊断 println,K_NTC_COMP_STATIC=-0.20 启用,等用户在 AVDD 修好后重做对照 trend。
 
-本轮另处理 UVC/YUYV Windows/Linux/guvcview 识别问题:`ffmpeg/v4l2` 已能 dequeue `38400 bytes`,但报 `Dequeued v4l2 buffer contains corrupted data`。判断重点不是像素内容,而是 Linux uvcvideo 给 buffer 打了错误标记,guvcview 通常会直接丢这类帧。BULK 方案会导致 Windows UVC 不显示,已撤回。当前策略:保留 Windows 兼容的 full-speed ISO endpoint,YUY2 descriptor 使用 TinyUSB 官方 continuous frame descriptor,帧率从 10fps 降到 5fps,ISO 包从 386B 降到 194B,降低 Linux/guvcview 丢包/坏帧概率。已编译通过,未上板验证 Windows/Linux 端。
+本轮另处理 UVC/YUYV Windows/Linux/guvcview 识别问题:`ffmpeg/v4l2` 已能 dequeue `38400 bytes`,但报 `Dequeued v4l2 buffer contains corrupted data`。后续试过 BULK 和 ISO 5fps,结果 Windows 找不到/不显示 UVC 设备,说明这些兼容性试改不能作为默认路径。当前已回退到 Windows 优先的 ISO 10fps / EP 386B / TinyUSB continuous YUY2 descriptor,保留删除 UVC 热路径日志和正确 YUY2 打包。已编译通过,待用户重新烧录后先确认 Windows 能枚举。
 
 固件位置:`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
 最近一次 trend(待复测对照):`tools/pico_th160_thermocam_gui/dist/trend_20260427_143902.png`(t=0~130s FPA 稳定 130°C,scene 漂 48→17°C)
@@ -44,7 +44,7 @@
 | 30 | (a) 撤回 K_NTC `+8.0f → +7.0f` (b) 加 `DV_CLAMP_ADU=400` 在所有 K_V·dV 计算前对 `dv` 做对称钳位:binary_calib_frame 的 comp、ffc_run 的 comp_pre 和 comp_acc 三处 | **部分根因修复**:trend_20260428_141806 t=180 仍发生灾难,scene 永久偏移 -8°C(被钳位限到 K_V·400=200 ADU);**用户关键定位**:手放镜头前 FPA 不变 → FPA 测的是 ROIC 芯片自身,t=180 是 VTEMP 寄存器 spontaneous glitch,**不是真实热事件**;模型边界外 K_V·dV 不该应用 |
 | 31 | NTC plausibility 交叉验证:`DV_DN_RATIO_MAX=10` 用 `\|dN\|·10` 钳住 `\|dV\|`,放在三处 K_V·dv 计算前(early in the chain,DV_CLAMP=400 仍兜底)。NTC 是物理传感器(EMA+R-T 公式)不会 glitch,真实热漂时 dN/dV 同向且 dV/dN ratio 有界,VTEMP glitch 时 dN≈0 → dv 被钳到 0 → K_V comp=0 完全免疫 | **定稿候选**:期望 t=180 类 VTEMP glitch 完全不影响 scene;正常缓漂(dn=20 ADU,dv 上限 200)K_V 仍正常工作 |
 | 20 | 确认 ADC2 硬件死(永远 4095),GUI 删除 NTC/ΔNTC/SAT/ADCERR/TADC/TCS/NCS/ACFG 显示 + NTC 趋势曲线 + 保存 PNG 第三轴 | **完成**:`protocol.py` 不再 unpack 帧尾 NTC/ADC 字段,`monitor_tab.py` 删除 `tax3` 轴/`_trend_ntc`/`_hist_ntc`/`_ntc_ref`。固件帧尾仍发这些字节但 GUI 忽略,不需重烧 |
-| UVC-1 | Linux YUYV 仍报 `Dequeued v4l2 buffer contains corrupted data (38400 bytes)`,guvcview 不能正常显示;随后 BULK 方案导致 Windows UVC 不显示 | **已改待实测**:撤回 BULK,恢复 ISO 以兼容 Windows;YUY2 descriptor 保持 continuous frame descriptor;帧率降到 5fps,ISO EP size=194,降低 full-speed 带宽压力。`bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 \| tail -5` 编译通过 |
+| UVC-1 | Linux YUYV 仍报 `Dequeued v4l2 buffer contains corrupted data (38400 bytes)`;BULK/5fps 试改导致 Windows 找不到或不显示 UVC 设备 | **已回退待实测**:撤回 BULK 和 5fps 改动,恢复 ISO 10fps/EP 386B,先保证 Windows 枚举。保留 YUY2 正确打包和删除 UVC 热路径 printf。`bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 \| tail -5` 编译通过 |
 
 ## 下一步计划
 
@@ -57,7 +57,7 @@
 7. **NTC 通道**:当前硬件 NTC 必须读 `GPIO28/ADC2`;`GPIO26/ADC0` 是历史版本/已弃用。以后改硬件定义前必须先和用户确认最新版
 8. **NTC 4095 诊断**:已确认 `GPIO28≈0.9V`,`ACFG B26 N5 T4`,但 `NTC=4095,TADC=4095,NCS=2301,TCS=4703`。`NCS=2301`=AIN2/READY/ERR/EN;`TCS=4703`=AIN4/ERR/ERR_STICKY/READY/TS_EN/EN。外部 ADC2 和内部温度通道都当前转换报错,优先查 ADC_AVDD/3V3_ADC/AGND/参考/芯片 ADC 本体,而不是继续改平均/滤波算法
 9. **旧工程参考**:`docs/bin/th160/src/main.c` 旧 ADC0 是 `gpio_deinit(IO_NTC)` 后 `adc_init/adc_gpio_init/adc_select_input(0)`,再用 `adc_fifo_setup(true,true,1,false,false)` + DMA `DREQ_ADC` 采 `1280` 点并 trimmed mean。当前已迁移到 ADC2,采样点数为 `NTC_ADC_SAMPLES=256`
-10. **UVC Windows/Linux/guvcview 复测**:重新烧录 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`,拔插 USB。Windows 先确认相机能显示;Linux 用 `v4l2-ctl --list-formats-ext` 确认 `YUYV 160x120 5fps`,guvcview 选 YUYV/160x120/5fps。若仍 corrupted,抓 `dmesg -w` 的 uvcvideo 错误和 `v4l2-ctl --stream-mmap --stream-count=30 --stream-to=/tmp/tn160.yuyv`
+10. **UVC 复测顺序**:重新烧录 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`,拔插 USB。先在 Windows 设备管理器/相机应用确认能枚举和显示;Windows 恢复后再测 Linux `v4l2-ctl --list-formats-ext` 是否为 `YUYV 160x120 10fps`。若 Linux/guvcview 仍 corrupted,不要再改 BULK,下一步抓 `dmesg -w` 和 `v4l2-ctl --stream-mmap --stream-count=30 --stream-to=/tmp/tn160.yuyv`
 
 ## 关键文件路径(相对 `/home/slam/Sipeed/pico_tn160/`)
 
