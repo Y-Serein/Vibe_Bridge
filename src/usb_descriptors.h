@@ -9,8 +9,18 @@
 
 #define FRAME_WIDTH  160
 #define FRAME_HEIGHT 120
-#define FRAME_RATE   30
+#define FRAME_RATE   10
 #define FRAME_SIZE   (FRAME_WIDTH * FRAME_HEIGHT * 2)
+#define UVC_FRAME_INTERVAL_100NS 1000000u
+#define UVC_BYTES_PER_SECOND     (FRAME_SIZE * FRAME_RATE)
+#define UVC_BIT_RATE             (UVC_BYTES_PER_SECOND * 8)
+
+#if UVC_FRAME_INTERVAL_100NS != 1000000u
+#    error "UVC frame interval must stay at 1000000 x 100 ns for 10fps"
+#endif
+#if UVC_BIT_RATE != 3072000u
+#    error "UVC bitrate must match 160x120 YUY2 at 10fps"
+#endif
 
 #define CFG_EXAMPLE_VIDEO_DISABLE_MJPEG
 #define CFG_EXAMPLE_VIDEO_READONLY
@@ -44,7 +54,7 @@ enum {
      + TUD_VIDEO_DESC_STD_VS_LEN \
      + (TUD_VIDEO_DESC_CS_VS_IN_LEN + 1 /*bNumFormats x bControlSize*/) \
      + TUD_VIDEO_DESC_CS_VS_FMT_MJPEG_LEN \
-     + TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_CONT_LEN \
+     + (TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_DISC_LEN + 4) \
      + TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING_LEN /* Interface 1, Alternate 1 */ \
      + TUD_VIDEO_DESC_STD_VS_LEN + 7 /* Endpoint */ \
     )
@@ -150,13 +160,13 @@ enum {
                                               0, \
                                               _width, \
                                               _height, \
-                                              _width* _height * 16, \
-                                              _width * _height * 16 * _fps, \
-                                              _width * _height * 16, \
-                                              (10000000 / _fps), \
-                                              (10000000 / _fps), \
-                                              (10000000 / _fps) * _fps, \
-                                              (10000000 / _fps)), \
+                                              UVC_BIT_RATE, \
+                                              UVC_BIT_RATE, \
+                                              FRAME_SIZE, \
+                                              UVC_FRAME_INTERVAL_100NS, \
+                                              UVC_FRAME_INTERVAL_100NS, \
+                                              UVC_FRAME_INTERVAL_100NS, \
+                                              UVC_FRAME_INTERVAL_100NS), \
         TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING( \
             VIDEO_COLOR_PRIMARIES_BT709, \
             VIDEO_COLOR_XFER_CH_BT709, \
@@ -196,7 +206,7 @@ enum {
         TUD_VIDEO_DESC_CS_VS_INPUT( \
             /*bNumFormats*/ 1, /*wTotalLength - bLength */ \
             TUD_VIDEO_DESC_CS_VS_FMT_MJPEG_LEN \
-                + TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_CONT_LEN \
+                + (TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_DISC_LEN + 4) \
                 + TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING_LEN, \
             _epin, \
             /*bmInfo*/ 0, \
@@ -214,17 +224,15 @@ enum {
             0, \
             0, \
             /*bCopyProtect*/ 0), /* Video stream frame format */ \
-        TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_CONT(/*bFrameIndex */ 1, \
+        TUD_VIDEO_DESC_CS_VS_FRM_MJPEG_DISC(/*bFrameIndex */ 1, \
                                             0, \
                                             _width, \
                                             _height, \
-                                            _width* _height * 16, \
+                                            _width * _height * 16 * _fps, \
                                             _width * _height * 16 * _fps, \
                                             _width * _height * 16 / 8, \
                                             (10000000 / _fps), \
-                                            (10000000 / _fps), \
-                                            (10000000 / _fps) * _fps, \
-                                            (10000000 / _fps)), \
+                                            U32_TO_U8S_LE(10000000 / _fps)), \
         TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING( \
             VIDEO_COLOR_PRIMARIES_BT709, \
             VIDEO_COLOR_XFER_CH_BT709, \
