@@ -2825,56 +2825,54 @@ static inline __attribute__((always_inline)) void init_yuv_cmap(
     }
 }
 
-static inline __attribute__((always_inline)) void fill_uvc_yuyv_cmap_frame(
-    const uint8_t* cali_u8_frame,
-    const struct yuv_cmap_entry* yuv_cmap,
-    uint8_t* buf,
-    const size_t len)
-{
-    if (unlikely(!cali_u8_frame || !yuv_cmap || !buf || len != FRAME_SIZE)) {
-        return;
-    }
-
-    /* The UVC descriptor advertises YUY2. The source buffer is the existing
-     * CALI_U8 display frame: byte 0 is the UART marker, followed by 160x120
-     * 8-bit pixels. Expand those indices through the active pseudo-color map
-     * and pack two pixels as valid YUYV. Never submit raw 16-bit thermal data
-     * to UVC. */
-    const uint8_t* src = cali_u8_frame + 1;
-    size_t out_idx = 0;
-
-    for (size_t i = 0; i < PX_CNT; i += 2) {
-        const uint8_t g0 = src[i];
-        const uint8_t g1 = src[i + 1];
-        const uint8_t y0 = yuv_cmap[g0].y;
-        const uint8_t y1 = yuv_cmap[g1].y;
-        const uint8_t u =
-            (uint8_t)(((yuv_cmap[g0].u_raw + yuv_cmap[g1].u_raw + 256) >> 9)
-                      + 128);
-        const uint8_t v =
-            (uint8_t)(((yuv_cmap[g0].v_raw + yuv_cmap[g1].v_raw + 256) >> 9)
-                      + 128);
-
-        buf[out_idx++] = y0;
-        buf[out_idx++] = u;
-        buf[out_idx++] = y1;
-        buf[out_idx++] = v;
-
-        if ((out_idx & 0x1FF) == 0) {
-            tud_task();
-        }
-    }
-
-    return;
-}
-
 static inline __attribute__((always_inline)) void fill_uvc_frame2(
     const uint8_t* pixbuf,
     const struct yuv_cmap_entry* yuv_cmap,
     uint8_t* buf,
     const size_t len)
 {
-    fill_uvc_yuyv_cmap_frame(pixbuf, yuv_cmap, buf, len);
+    if (unlikely(!pixbuf || !yuv_cmap || !buf || len < 4)) {
+        return;
+    }
+
+    const uint8_t* src = pixbuf + 1;
+    size_t out_idx = 0;
+    const size_t chunk_bytes = SENSOR_W * 2 * 8;
+
+    while (out_idx + 3 < len) {
+        size_t end_idx = out_idx + chunk_bytes;
+        if (end_idx > len) {
+            end_idx = len;
+        }
+
+        while (out_idx + 3 < end_idx) {
+            const uint8_t g0 = *src++;
+            const uint8_t g1 = *src++;
+
+            const uint8_t y0 = yuv_cmap[g0].y;
+            const uint8_t y1 = yuv_cmap[g1].y;
+
+            const uint8_t u =
+                (uint8_t)(((yuv_cmap[g0].u_raw + yuv_cmap[g1].u_raw + 256) >> 9)
+                          + 128);
+            const uint8_t v =
+                (uint8_t)(((yuv_cmap[g0].v_raw + yuv_cmap[g1].v_raw + 256) >> 9)
+                          + 128);
+
+            buf[out_idx++] = y0;
+            buf[out_idx++] = u;
+            buf[out_idx++] = y1;
+            buf[out_idx++] = v;
+
+            if ((out_idx & 0x1FF) == 0) {
+                tud_task();
+            }
+        }
+
+        tud_task();
+    }
+
+    return;
 }
 
 static inline __attribute__((always_inline)) void fill_uvc_frame(
@@ -2938,10 +2936,7 @@ int tud_video_commit_cb(uint_fast8_t ctl_idx,
 {
     (void)ctl_idx;
     (void)stm_idx;
-    const uint32_t interval_100ns = parameters->dwFrameInterval
-                                        ? parameters->dwFrameInterval
-                                        : UVC_FRAME_INTERVAL_100NS;
-    uvc_inv_ms = interval_100ns / 10000;
+    uvc_inv_ms = parameters->dwFrameInterval / 10000;
     return VIDEO_ERROR_NONE;
 }
 
@@ -3051,7 +3046,7 @@ static inline __attribute__((always_inline)) void uvc_prepare_next(void)
     __dmb();
 
     tud_task();
-    fill_uvc_yuyv_cmap_frame(norm_buf[src], yuv_cmap, uvc_buf[b], FRAME_SIZE);
+    fill_uvc_frame2(norm_buf[src], yuv_cmap, uvc_buf[b], FRAME_SIZE);
     // fill_smpte_yuy2(uvc_buf[b], FRAME_SIZE);
     tud_task();
 
@@ -3075,22 +3070,7 @@ static inline __attribute__((always_inline)) void uvc_prepare_next(void)
 
 static inline __attribute__((always_inline)) uint32_t uvc_task()
 {
-    static bool last_streaming = false;
-    bool streaming = tud_video_n_streaming(0, 0);
-    if (streaming != last_streaming) {
-        if (!streaming) {
-            uvc_tx_busy = 0;
-            uvc_sending = -1;
-            for (int i = 0; i < UVC_BUF_CNT; i++) {
-                if (uvc_state[i] == UVCBUF_SENDING) {
-                    uvc_state[i] = UVCBUF_READY;
-                }
-            }
-        }
-        last_streaming = streaming;
-    }
-
-    if (!streaming) {
+    if (!tud_video_n_streaming(0, 0)) {
         return UINT32_MAX;
     }
 
@@ -3112,12 +3092,7 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
     __dmb();
     uvc_tx_busy = 1;
 
-    if (!tud_video_n_frame_xfer(0, 0, uvc_buf[b], FRAME_SIZE)) {
-        uvc_tx_busy = 0;
-        uvc_state[b] = UVCBUF_READY; // Put it back
-        uvc_sending = -1;
-        return UINT32_MAX;
-    }
+    tud_video_n_frame_xfer(0, 0, uvc_buf[b], FRAME_SIZE);
 
     return 0;
 }
@@ -4654,10 +4629,7 @@ int tud_video_commit_cb(uint_fast8_t ctl_idx,
 {
     (void)ctl_idx;
     (void)stm_idx;
-    const uint32_t interval_100ns = parameters->dwFrameInterval
-                                        ? parameters->dwFrameInterval
-                                        : UVC_FRAME_INTERVAL_100NS;
-    inv_ms = interval_100ns / 10000;
+    inv_ms = parameters->dwFrameInterval / 10000;
     return VIDEO_ERROR_NONE;
 }
 #endif

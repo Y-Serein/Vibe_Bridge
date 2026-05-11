@@ -53,9 +53,6 @@ extern "C" {
 #define CFG_TUD_VIDEO_STREAMING 1
 
 // video streaming endpoint size
-// 160x120 YUY2 at 10fps: ceil(38400 bytes / 100 ms) + 2-byte UVC header.
-// Match TinyUSB's negotiated dwMaxPayloadTransferSize to avoid over-reserving
-// full-speed isochronous bandwidth on Linux.
-#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 386
+#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 1023
 
 #endif /* _TUSB_CONFIG_H_ */
