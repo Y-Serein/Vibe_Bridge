@@ -1,3 +1,23 @@
+## 2026-05-11｜WSL 测试 UVC/guvcview 的适用性
+
+### 原始问题
+我能把这个挂载到wsl上测试吗，然后wsl能有和guvcview一样的工具吗
+
+### 答案核心
+- 可以用 `usbipd-win` 把 USB 设备 attach 到 WSL2,但 WSL 不是原生 USB 主机,而是 USB/IP 转发。
+- WSL2 可以运行 Linux GUI 应用,所以理论上可以安装 `guvcview`、`v4l-utils`、`ffmpeg` 等工具。
+- UVC 摄像头依赖 `uvcvideo`/V4L2 和 isochronous 传输;WSL/USB-IP 可能引入额外问题,因此不适合作为最终 guvcview 兼容性判定。
+- 更推荐用原生 Linux 或 Linux Live USB 做最终验证;WSL 只能作为快速 smoke test。
+- 如果 WSL 里只有 `lsusb` 能看到设备但没有 `/dev/video*`,通常说明内核/模块/V4L2 路径没起来,不是固件一定错。
+
+### 相关引用
+- Microsoft Learn: Connect USB devices to WSL
+- Microsoft Learn: Run Linux GUI apps with WSL
+- usbipd-win GitHub
+
+### 备注
+- 置信度:中。WSL/usbipd 版本和 WSL kernel 版本会影响结果。
+
 ## 2026-05-11｜v4l2/guvcview 排查命令作用
 
 ### 原始问题
