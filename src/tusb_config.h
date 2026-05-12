@@ -52,7 +52,11 @@ extern "C" {
 // The number of video streaming interfaces
 #define CFG_TUD_VIDEO_STREAMING 1
 
-// video streaming endpoint size
-#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 1023
+// Use full-speed bulk UVC on Linux/WSL; USB/IP is unreliable with FS ISO.
+#define CFG_TUD_VIDEO_STREAMING_BULK 1
+
+// TinyUSB video packet buffer / UVC dwMaxPayloadTransferSize for bulk.
+#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 256
+#define CFG_TUD_VIDEO_STREAMING_MAX_PAYLOAD_SIZE 256
 
 #endif /* _TUSB_CONFIG_H_ */

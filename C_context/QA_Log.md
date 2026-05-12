@@ -1,3 +1,24 @@
+## 2026-05-12｜guvcview 低帧率是否说明设备描述符问题
+
+### 原始问题
+现在Linux和Windows上都是可以看到的，Linux用直接抓取video的软件看是10帧，但是用guvcview看是1帧1帧出，但是也会一直出了！，好像是不是设备描述符的问题，我也不确定
+
+### 答案核心
+- Windows 和 Linux 都能看到画面,且 `v4l2-ctl` 能连续抓 5 帧,说明 UVC descriptor、YUYV 帧大小、payload header、Bulk 传输链路基本合法。
+- guvcview 能持续出画面但像 1fps,更像是 guvcview 选择了较慢的 frame interval、预览/转换路径慢,或 GUI 显示节流,不再是“设备完全不兼容”。
+- 当前 frame interval descriptor 是 continuous 范围:10fps 到 1fps;如果 guvcview 默认选最大 interval,就会表现成 1fps。
+- 先不要改坏当前成功基线;优先在 guvcview 里手动选 `YUYV 160x120 10fps`,或确认 guvcview 实际协商到的 fps。
+- 若确认 guvcview 默认总选 1fps,再考虑把 descriptor 的 frame interval 范围收窄到 10fps 附近,但不要恢复之前会破坏 Windows 的严格 commit/discrete 方案。
+
+### 相关引用
+- `src/usb_descriptors.h`
+- `src/tusb_config.h`
+- `src/usb_descriptors.c`
+- `HANDOFF.md`
+
+### 备注
+- 置信度:中。没有看到 guvcview 的实际协商日志,所以不能断言一定是 descriptor 默认 interval 选择。
+
 ## 2026-05-11｜WSL 测试 UVC/guvcview 的适用性
 
 ### 原始问题

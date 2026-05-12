@@ -1,14 +1,25 @@
 # pico_tn160 温漂调试 HANDOFF
 
 ## 当前在做什么
-解决 TN160 热成像 scene 温度持续漂移问题。最新状态:**ADC2 4095 根因找到——板上 RP2350 AVDD(QFN-60 第 43 脚)漏接电源,补焊后 NCS=0x2101 / TCS=0x4103,ERR 位全清,NTC ADC2 实测 ~1843,TADC ~866,数值合理。前 7~19 轮 K_NTC 调参基于"ADC 4095 等于 NTC 死值"的假数据,所以补偿等于 0,trend 表现完全反映静态 anchor 行为而不是 K_NTC 的真实效果**。固件已恢复 DMA 路径并移除诊断 println,K_NTC_COMP_STATIC=-0.20 启用,等用户在 AVDD 修好后重做对照 trend。
+当前主线是让 TN160 UVC 在 Linux/WSL `v4l2-ctl --stream-count=5` 下连续出帧成功。最新方向已从继续修 FS ISO 改为 Linux/WSL 优先的 UVC Bulk 传输:WSL/USB-IP 对 full-speed ISO 连续帧不稳定,而 Bulk 有重试机制,更适合先达成 Linux 可用。
 
-本轮另处理 UVC/YUYV Windows/Linux/guvcview 识别问题:`ffmpeg/v4l2` 已能 dequeue `38400 bytes`,但报 `Dequeued v4l2 buffer contains corrupted data`。后续试过 YUY2 descriptor/包长调整、BULK、ISO 5fps,结果 Windows 报 Code 10/找不到/不显示 UVC 设备。当前已撤销这些 UVC 试改,回到 `b1218d6 Distribution firmware` 的旧 UVC 形态:ISO、30fps、EP 1023、原 `fill_uvc_frame2()`。用户重新烧录后 Windows 已能看到设备且已出画面,说明 Windows UVC 基线恢复;下一步单独处理 Linux/guvcview。
+本轮已做最小 Bulk UVC 改动:
+1. `src/tusb_config.h` 增加 `CFG_TUD_VIDEO_STREAMING_BULK=1`,TinyUSB video buffer / UVC max payload 设为 256。
+2. `src/usb_descriptors.h` 增加 uncompressed Bulk descriptor:VS alt0 直接带 1 个 Bulk IN endpoint,不再走 ISO alt1。
+3. `src/usb_descriptors.c` 在 `CFG_TUD_VIDEO_STREAMING_BULK` 时选择 Bulk descriptor 和对应总长度。
+4. `src/usb_descriptors.h` 的 Bulk endpoint descriptor 固定 `wMaxPacketSize=64`,保持 full-speed Bulk 合法;256 只用于 UVC payload/设备侧 ep buffer。
+
+当前源码保持正式热成像模式:`MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`。当前正式固件已重新构建:
+`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
+
+注意:这是 Linux/WSL 优先固件,但用户反馈 Windows 也能看到画面。WSL 验证已通过:连续 5 个 `DQBUF`,每帧 `bytesused=38400`,文件 `/tmp/tn160.yuyv=192000` bytes。Linux 直接抓取 video 的软件显示 10fps。`guvcview` 曾只能选择 `1/1 fps` 并慢速刷新;已把 YUYV continuous frame interval 的 max 从 1s 收窄到 10fps,保持 continuous descriptor 形态,不恢复之前会破坏 Windows 的 discrete/strict commit 方案。用户复测确认 guvcview 现在可以正常使用。
+
+本轮另处理 UVC/YUYV Windows/Linux/guvcview 识别问题:`ffmpeg/v4l2` 已能 dequeue `38400 bytes`,但报 `Dequeued v4l2 buffer contains corrupted data`。后续试过 YUY2 descriptor/包长调整、BULK、ISO 5fps,结果 Windows 报 Code 10/找不到/不显示 UVC 设备。已撤销会破坏 Windows 枚举的 discrete 10fps descriptor 和严格 `dwFrameInterval` commit 校验,用户确认 Windows 已恢复。当前继续处理 Linux/guvcview:保持 ISO、10fps、EP 1023、continuous frame interval、原 `fill_uvc_frame2()`,并新增 UVC 实际发送节流。fallback 测试帧已被 Linux `DQBUF` 到,但 `/tmp/tn160.yuyv` 只有 36864 bytes,吻合 96 个 384-byte payload,说明 TinyUSB 之前按 10fps 把一帧摊满 100 个 1ms ISO 包,WSL/Linux 少几个包就短帧。后续试过直接 negotiated 1023,用户复测又变成 `STREAMON` 后无 `DQBUF`,说明 full 1023 对 WSL/USB-IP 或这条设备路径过激。770 档复测能 `DQBUF bytesused=38400`,但 `/tmp/tn160.yuyv` 仍为 36864 bytes,正好少 2 个 768-byte image payload。642 档复测 `STREAMON` 后 10s 内无 `DQBUF`,文件 0 字节,说明继续降 payload 是猜。当前构建回到 negotiated 770,并在 `uvc_task()` 启动一帧后同步泵 `tud_task()` 直到整帧完成或超时,避免主循环里 `fill_txbuf()`/FFC/`__wfe()` 让 TinyUSB ISO 分包链断掉。注意:根目录 `/home/slam/pico-sdk` 和 `/home/slam/pico-sdk-2.2.0` 已按用户要求删除,以后只改 `tools/pico-sdk-2.2.0`。
 
 固件位置:`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
 最近一次 trend(待复测对照):`tools/pico_th160_thermocam_gui/dist/trend_20260427_143902.png`(t=0~130s FPA 稳定 130°C,scene 漂 48→17°C)
 
-## 已经试过的方案和结果(含失败的)
+## 已经试过的方案和结果（含失败的）
 
 | 轮次 | 方案 | 结果 |
 |---|---|---|
@@ -45,21 +56,34 @@
 | 31 | NTC plausibility 交叉验证:`DV_DN_RATIO_MAX=10` 用 `\|dN\|·10` 钳住 `\|dV\|`,放在三处 K_V·dv 计算前(early in the chain,DV_CLAMP=400 仍兜底)。NTC 是物理传感器(EMA+R-T 公式)不会 glitch,真实热漂时 dN/dV 同向且 dV/dN ratio 有界,VTEMP glitch 时 dN≈0 → dv 被钳到 0 → K_V comp=0 完全免疫 | **定稿候选**:期望 t=180 类 VTEMP glitch 完全不影响 scene;正常缓漂(dn=20 ADU,dv 上限 200)K_V 仍正常工作 |
 | 20 | 确认 ADC2 硬件死(永远 4095),GUI 删除 NTC/ΔNTC/SAT/ADCERR/TADC/TCS/NCS/ACFG 显示 + NTC 趋势曲线 + 保存 PNG 第三轴 | **完成**:`protocol.py` 不再 unpack 帧尾 NTC/ADC 字段,`monitor_tab.py` 删除 `tax3` 轴/`_trend_ntc`/`_hist_ntc`/`_ntc_ref`。固件帧尾仍发这些字节但 GUI 忽略,不需重烧 |
 | UVC-1 | Linux YUYV 仍报 `Dequeued v4l2 buffer contains corrupted data (38400 bytes)`;后续 UVC 试改导致 Windows Code 10/找不到设备 | **Windows 已出画面**:撤销 `567f761` 及后续 BULK/5fps 试改后,用户确认 Windows 已能看到设备且有画面。当前基线为旧固件 UVC 形态(ISO/30fps/EP1023/原 `fill_uvc_frame2`)。guvcview 仍未解决,不要再用破坏 Windows 的 descriptor/传输参数试改。当前最可疑点:160x120 YUY2 30fps 约 1.152MB/s,超过 full-speed ISO 1023KB/s 上限,Linux/v4l2 可能因此把 buffer 标记为 corrupted;但改帧率/包长会影响 Windows,必须先抓 Linux 协商和内核日志。 |
+| UVC-2 | 用户提供 `tools/frame/frame*.raw`,反馈经常卡在第一帧 | **已做最小状态机修复,待上板验证**:6 个 raw 文件均为 38400 bytes,hash 全不同,`frame.raw -> frame2.raw` 有 99.04% 字节不同,`frame2 -> frame3` 有 79.84% 字节不同;按 YUYV 解析无全 0/全 FF/短帧。已修 `uvc_task()` 忽略 `tud_video_n_frame_xfer()` false 的问题:失败时恢复 `uvc_tx_busy=0`,`uvc_state[b]=UVCBUF_READY`,`uvc_sending=-1`;not streaming 时释放发送中 buffer;`find_ready_uvc_buf()` 增加 READY 兜底扫描。该改动不碰 descriptor/帧率/端点。 |
+| UVC-3 | 用户提供 WSL `dmesg -w` 日志和 `v4l2-ctl` 输出 | **descriptor 枚举正常,stream 阶段卡住**:`docs/logs.txt` 显示 `new full-speed USB device`,随后 `Found UVC 1.10 device Thermal160 (359f:4202)` 和 `registered new interface driver uvcvideo`;`sudo timeout 5s v4l2-ctl --list-formats-ext -d /dev/video0` 可返回 `YUYV 160x120`、interval `0.033s - 1.000s`。普通用户 stream 报 Permission denied;sudo stream 10s 无输出。当前证据说明 Linux 能读 descriptor,问题在 stream 拿帧阶段;但 `--stream-count=30` + `timeout 10s` 不能排除默认 1fps 导致未等够 30 帧,下一步应强制 30fps 并把 count 降到 1/5。 |
+| UVC-4 | 用户强制 stream 后能拿到帧但严重 dropped/不完整 | **已降默认 UVC 帧率到 10fps,待复测**:30fps 时收到 seq 2、116、117,中间 dropped 113。20fps 复测时驱动接受为 20fps,但 10s 只收到 1 帧,输出文件 36864 bytes=`48*768`,像是 20fps 每帧需要 50 个 768B 数据包但少了 2 包。说明 full-speed ISO/WSL USB-IP 下 20fps 仍太贴边。已把 `FRAME_RATE 20 -> 10`,并保留 `dwMaxVideoFrameBufferSize` 字节数修正。保留 ISO/EP1023/原发送格式,不改 BULK。 |
+| UVC-5 | 用户在 10fps 固件上仍用 `--set-parm=30`,驱动显示 `Frame rate set to 305.773 fps`;再用 `--set-parm=10` 后 `STREAMON` 成功但 10s 内 0 字节 | **已撤回**:把 YUYV frame descriptor 从 continuous 改为 discrete 单一 10fps,并在 `tud_video_commit_cb()` 里严格拒绝非单一 interval 后,用户反馈 Windows 也识别不到描述符。已撤回 discrete descriptor/严格 commit 校验,回到 continuous frame interval;保留 `FRAME_RATE=10`、`dwMaxVideoFrameBufferSize=38400` 和 UVC 发送状态机修复。构建通过,待上板确认 Windows 枚举。 |
+| UVC-6 | Windows 恢复后继续 Linux/guvcview | **已做最小节流修复,待上板验证**:`uvc_inv_ms` 原来只在 commit 回调赋值,但 `uvc_task()` 从未使用,所以实际会在上一帧传完后立刻发下一帧。现新增 `uvc_last_xfer_ms`,按 `uvc_inv_ms` 节流,并把 host commit interval 钳到 10fps~1fps 范围;不改 descriptor、不改 BULK/ISO、不严格拒绝 host commit。构建通过,有 `Clock skew detected` 警告。 |
+| UVC-7 | 用户复测节流版:`STREAMON` 成功,但 10s 内仍无 `DQBUF` 输出 | **已加 fallback 测试帧,待上板验证**:如果 streaming 已开、到发送时间且没有 `UVCBUF_READY`,固件会填充一帧内置 `fill_smpte_yuy2()` 测试图并发送。若 Linux 仍 0 字节,基本排除 sensor/norm_buf/YUYV 转换没准备好,重点转向 TinyUSB ISO xfer、WSL USB/IP 或主机端 ISO 兼容性。构建通过。 |
+| UVC-8 | 用户复测 fallback 版:`DQBUF seq 0 bytesused 38400`,但落盘 `/tmp/tn160.yuyv=36864` 且 10s 只出 1 帧 | **1023 方案失败后已降到 770,待上板验证**:36864=`96*384`,而 10fps 下 TinyUSB 原算法 `ceil(38400/100)+2=386`,每包数据约 384 bytes,一帧刚好需要 100 个 1ms ISO 包,没有时序余量。实际构建使用的是 `tools/pico-sdk-2.2.0`;曾改 TinyUSB 两处 negotiated `dwMaxPayloadTransferSize` 为 1023,但复测又回到 `STREAMON` 后无 `DQBUF`。当前 `src/tusb_config.h` 定义 `CFG_TUD_VIDEO_STREAMING_MAX_PAYLOAD_SIZE=770`,TinyUSB negotiation 使用该值并 clamp 到 EP 1023;项目 descriptor 不变,固件继续 10fps 节流。已删除旧 object 后重编,构建日志确认重新编译 `video_device.c.obj`,UF2 已更新。 |
+| UVC-9 | 用户又测试 `/dev/video0` 和 `/dev/video1` | **只测 `/dev/video0`**:`/dev/video0` 能 `VIDIOC_G_FMT/S_FMT/S_PARM/STREAMON`,是正确 capture 节点;`/dev/video1` 的 `VIDIOC_G_FMT` 返回 `Invalid argument`,`VIDIOC_S_PARM` 返回 `Inappropriate ioctl for device`,不是这路 YUYV 采集入口,后续不要用它判断 UVC 画面。 |
+| UVC-10 | 用户复测 770 档:`DQBUF seq 0 bytesused 38400`,但 `/tmp/tn160.yuyv=36864` | **已降到 642,待上板验证**:36864=`48*768`,说明 770 档每帧 50 个包里仍丢 2 个 image payload。`src/tusb_config.h` 现定义 `CFG_TUD_VIDEO_STREAMING_MAX_PAYLOAD_SIZE=642`,即 2-byte UVC header + 640 image bytes,一帧约 60 个包。构建通过,输出 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`。不改 descriptor、不改 BULK/ISO、不严格拒绝 host commit。 |
+| UVC-11 | 用户复测 642 档:`STREAMON` 成功但 10s 内无 `DQBUF`,文件 0 字节 | **停止 payload 猜测,改 TinyUSB 调度**:`dwMaxPayloadTransferSize` 只影响 UVC commit,endpoint descriptor 仍是 FS ISO 1023,继续降 payload 不能根治。代码查到 TinyUSB 后续分包依赖 `tud_task()` 驱动 `videod_xfer_cb()`,而主循环会执行 `fill_txbuf()`/FFC/`__wfe()`。当前 `src/main.c` 改为 `tud_video_n_frame_xfer()` 成功后同步泵 `tud_task()` 到整帧完成或超时;`src/tusb_config.h` 回到 770。构建通过,输出 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`。待上板验证。 |
+| UVC-12 | 用户提供 `docs/logs.txt` | **主机日志没有 UVC 协议错误**:最新片段只看到 `Found UVC 1.10 device Thermal160 (359f:4202)` 后多组 `vhci_hcd: unlink->seqnum ...` 和 `urb->status -104`。这些出现在 `timeout/v4l2-ctl` 结束取消 URB 时,不是 `uvcvideo` 报 payload/header/descriptor 非法。当前证据更支持“WSL vhci/USB-IP 没拿到完整 ISO 帧或设备侧没连续推出分包”,不支持继续改 descriptor 或降 payload。 |
+| UVC-13 | 同步泵版本复测仍卡在 `STREAMON` 后无 `DQBUF` | **已生成纯 UVC/SMPTE 诊断固件**:`src/sdk.h` 临时切到 `MAIN_FUNC_MODE_UVC_MAX`,不跑 sensor/FFC/双核缓冲/温度算法;`uvc_max_func()` 增加 10fps 节流和 `tud_video_n_frame_xfer()` 失败恢复。构建通过,当前 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2` 是诊断 UF2。若这个固件仍无 `DQBUF`,问题就在 TinyUSB/RP2350 FS ISO/WSL USB-IP 这一层;若能出帧,再回头查 sensor 主模式调度。注意测完要把 `MAIN_FUNC_MODE` 切回 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`。 |
+| UVC-14 | 继续查为什么 payload 改小无效 | **找到前面试法的错误点**:之前只改 `dwMaxPayloadTransferSize`,但 `TUD_VIDEO_DESC_EP_ISO()` 里的 endpoint `wMaxPacketSize` 仍来自 `CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE=1023`,主机/WSL/vhci 仍按满速 ISO 最大包调度。现把 `CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE` 也改为 770,使 endpoint descriptor 和 UVC commit payload 一致。当前 UF2 为 `MAIN_FUNC_MODE_UVC_MAX` 纯 SMPTE + FS ISO endpoint 770 + payload 770。构建通过,输出 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`。置信度:中。 |
+| UVC-15 | 用户反馈 Windows UVC 一直闪 RGB | **已恢复正式固件**:RGB 闪烁是因为上一轮 UF2 临时切到 `MAIN_FUNC_MODE_UVC_MAX` 纯 SMPTE 诊断模式,不是正式热成像固件。已把 `src/sdk.h` 恢复为 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`,并把 `CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE` 恢复 1023,重新构建 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`。当前 UF2 是正式热成像模式,不是诊断 RGB/SMPTE 模式。 |
+| UVC-16 | 用户允许继续测试,要求明确说明测试固件 | **已分离测试/正式 UF2**:测试固件统一为 `/home/slam/build/pico_tn160/pico_tn160_UVC_TEST_SMPTE_EP770.uf2`,配置为 `MAIN_FUNC_MODE_UVC_MAX` 纯 SMPTE + endpoint 770 + payload 770,只用于验证 WSL/Linux UVC,Windows 会显示 RGB/SMPTE 测试图。默认正式固件仍是 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`,源码已恢复 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4` 和 endpoint 1023。以后测试/正式 UF2 都放 `/home/slam/build/pico_tn160/`,不再让用户去 `D_deliverables/` 找。 |
+| UVC-17 | 测试固件 endpoint 770 能 `DQBUF bytesused=38400`,但 10s 只出 1 帧 | **已更新唯一测试固件**:第一帧完整说明 descriptor/YUYV/header/EOF 基本合法;后续无帧不是应用侧 `uvc_tx_busy` 门控,因为直接每 100ms 调 `tud_video_n_frame_xfer()` 仍只出 1 帧。当前判断: TinyUSB video 类内部可能出现 `stm->offset >= stm->bufsize` 但 `stm->buffer` 未清的 stale completed frame,导致后续 `tud_video_n_frame_xfer()` 被 `stm->buffer` 拦截。已在 `tools/pico-sdk-2.2.0/lib/tinyusb/src/class/video/video_device.c` 给 `tud_video_n_frame_xfer()` 增加 stale completed frame cleanup。唯一测试文件已更新为 `/home/slam/build/pico_tn160/pico_tn160_UVC_TEST_SMPTE_EP770.uf2`。 |
+| UVC-18 | 用户明确要求不要沿着历史失败方案继续,目标是在 Linux 环境实现 UVC 功能 | **成功**:已切 Linux/WSL 优先 Bulk UVC。第一版 payload/EP 都设为 64 时,用户复测 `VIDIOC_STREAMON returned -1 (Cannot allocate memory)`。按 TinyUSB video bulk example 修正为 UVC max payload / TinyUSB epbuf=256,但 Bulk endpoint descriptor `wMaxPacketSize=64` 后,用户 WSL 复测通过:5 个连续 `DQBUF seq 0..4 bytesused=38400`,间隔约 93ms,`/tmp/tn160.yuyv=192000` bytes。用户随后确认 Windows 也能看到,Linux 直接抓取 video 的软件显示 10fps;`guvcview` 能持续出画面但像 1fps 慢刷。当前成功固件 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`。 |
+| UVC-19 | guvcview 只能选择 `1/1 fps` | **成功**:当前 frame descriptor 使用 continuous interval,之前参数是 default=10fps,min=10fps,max=1fps,step=10fps;guvcview 只显示/选择 `1/1 fps` 符合它取了 max interval。已把 ISO 和 Bulk 两处 YUYV frame interval max 都改为 10fps,形成 min=max=default=10fps,但仍保持 continuous descriptor,不恢复 discrete descriptor 或严格 commit 校验。构建通过,输出 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`;用户复测确认现在可以。 |
+| SDK-clean | 用户发现 `/home/slam` 根目录有多个 pico-sdk 副本 | **已清理**:`/home/slam/pico-sdk` 和 `/home/slam/pico-sdk-2.2.0` 已删除。当前 `pico_tn160` 实际 SDK 为 `tools/pico-sdk-2.2.0`,构建缓存 `PICO_SDK_PATH=/home/slam/Sipeed/pico_tn160/tools/pico-sdk-2.2.0` 已确认。旧 `th160_release260414A1` 的历史 build cache 曾引用 `/home/slam/pico-sdk-2.2.0`;若以后要重构建旧工程,需重新设置 `PICO_SDK_PATH`。 |
 
-## 下一步计划
+## 下一步计划（3-5条actionable)
 
-1. **看实测结果** `ls -lt tools/pico_th160_thermocam_gui/dist/*.png | head -1`,Read 最新 PNG。如 scene 残漂 < 5°C/3min 视为成功
-2. **K_NTC 调整**:若漂移变本加厉 → 翻号 `+0.20f`;若仍同向漂(变小但还在) → 等比例放大到 `-0.30/-0.40`;若反向 → 减半到 `-0.10`(改 `K_NTC_COMP_STATIC` 一行)
-3. **看 println 日志**`FFC anchor+K: ... ntc=XXXX` 反推真实 dNTC 数量级,精确算 K_NTC
-4. **若 NTC 完全无相关性**:漂移可能来自 bolometer membrane settling 或 ROIC 参考漂移,这两者无法用现有传感器补偿。退路:在目标 ambient 下重做 cali_ref(用户操作),让 `flash_imgbg` 反映正确工作点
-5. **不要再加新算法层**:用户多次明确"删,不要加"。任何新机制必须有可观测的物理对应物且能通过单 `#define` 调控
-6. **成像清晰度**:`MIN_THERMAL_RANGE` 必须保持 `384`;若仍糊,调 `DISPLAY_DETAIL_MAX_ADU`;若横纹仍明显,调低 `DISPLAY_ROW_STRIPE_MAX_ADU` 或关闭 detail boost
-7. **NTC 通道**:当前硬件 NTC 必须读 `GPIO28/ADC2`;`GPIO26/ADC0` 是历史版本/已弃用。以后改硬件定义前必须先和用户确认最新版
-8. **NTC 4095 诊断**:已确认 `GPIO28≈0.9V`,`ACFG B26 N5 T4`,但 `NTC=4095,TADC=4095,NCS=2301,TCS=4703`。`NCS=2301`=AIN2/READY/ERR/EN;`TCS=4703`=AIN4/ERR/ERR_STICKY/READY/TS_EN/EN。外部 ADC2 和内部温度通道都当前转换报错,优先查 ADC_AVDD/3V3_ADC/AGND/参考/芯片 ADC 本体,而不是继续改平均/滤波算法
-9. **旧工程参考**:`docs/bin/th160/src/main.c` 旧 ADC0 是 `gpio_deinit(IO_NTC)` 后 `adc_init/adc_gpio_init/adc_select_input(0)`,再用 `adc_fifo_setup(true,true,1,false,false)` + DMA `DREQ_ADC` 采 `1280` 点并 trimmed mean。当前已迁移到 ADC2,采样点数为 `NTC_ADC_SAMPLES=256`
-10. **UVC 复测顺序**:当前 Windows 已能看到设备且已出画面,该 UVC 旧基线固定不动。之后单独排 Linux/guvcview,优先抓 `dmesg -w`、`v4l2-ctl --list-formats-ext`、`v4l2-ctl --stream-mmap --stream-count=30 --stream-to=/tmp/tn160.yuyv`,不要再尝试 BULK/5fps 这类已破坏 Windows 的改法。
+1. 保留当前 UVC 成功基线:Windows 可见,Linux 可抓 10fps,guvcview 可用。
+2. 不要再改 UVC descriptor/payload/commit 逻辑,除非出现新的明确兼容性问题。
+3. 若后续要做平台差异化,以当前 Bulk UVC 为 Linux/Windows 共同成功基线。
+4. 正式源码当前必须保持 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`;不要把 `MAIN_FUNC_MODE_UVC_MAX` 留在源码里。
 
-## 关键文件路径(相对 `/home/slam/Sipeed/pico_tn160/`)
+## 关键文件路径（相对路径，一行一个）
 
 ```
 src/main.c
@@ -67,11 +91,15 @@ src/sdk.h
 src/tusb_config.h
 src/usb_descriptors.h
 src/usb_descriptors.c
+tools/pico-sdk-2.2.0/lib/tinyusb/src/portable/raspberrypi/rp2040/rp2040_usb.c
+tools/pico-sdk-2.2.0/lib/tinyusb/src/class/video/video_device.c
+tools/frame/
 build.sh
 tools/pico_th160_thermocam_gui/dist/
 tools/pico_th160_thermocam_gui/monitor_tab.py
 tools/pico_th160_thermocam_gui/protocol.py
 docs/bin/raw16.py
+docs/logs.txt
 ```
 
 main.c 关键定位锚:
