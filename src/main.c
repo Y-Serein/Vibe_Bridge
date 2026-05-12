@@ -2709,11 +2709,15 @@ static volatile int uvc_sending = -1;
 static volatile uint8_t uvc_tx_busy = 0;
 static volatile uint32_t uvc_frame_num = 0;
 static volatile uint32_t uvc_inv_ms = 1000 / FRAME_RATE;
+static volatile uint32_t uvc_last_xfer_ms = 0;
 static enum UartOutMode uvc_ouomode_bak = UART_OUT_MODE_DEF;
 static uint8_t ram_cmaps[CMAP_NUM][CMAP_BYTES];
 static volatile uint8_t cur_cmap_idx = 0;
 static const uint8_t* volatile active_cmap = nullptr;
 static struct yuv_cmap_entry yuv_cmap[CMAP_W];
+
+static inline __attribute__((always_inline)) void fill_smpte_yuy2(
+    uint8_t* buf, const size_t len);
 
 static inline __attribute__((always_inline)) void uvc_buf_init()
 {
@@ -2724,6 +2728,7 @@ static inline __attribute__((always_inline)) void uvc_buf_init()
     uvc_newest_ready = -1;
     uvc_sending = -1;
     uvc_tx_busy = 0;
+    uvc_last_xfer_ms = 0;
 }
 
 static inline __attribute__((always_inline)) int find_free_uvc_buf()
@@ -2742,7 +2747,28 @@ static inline __attribute__((always_inline)) int find_ready_uvc_buf()
     if (b >= 0 && uvc_state[b] == UVCBUF_READY) {
         return b;
     }
+    for (int i = 0; i < UVC_BUF_CNT; ++i) {
+        if (uvc_state[i] == UVCBUF_READY) {
+            return i;
+        }
+    }
     return -1;
+}
+
+static inline __attribute__((always_inline)) int uvc_prepare_fallback_frame()
+{
+    const int b = find_free_uvc_buf();
+    if (b < 0) {
+        return -1;
+    }
+
+    uvc_state[b] = UVCBUF_FILLING;
+    __dmb();
+    fill_smpte_yuy2(uvc_buf[b], FRAME_SIZE);
+    __dmb();
+    uvc_state[b] = UVCBUF_READY;
+    uvc_newest_ready = b;
+    return b;
 }
 
 void tud_mount_cb()
@@ -2936,7 +2962,14 @@ int tud_video_commit_cb(uint_fast8_t ctl_idx,
 {
     (void)ctl_idx;
     (void)stm_idx;
-    uvc_inv_ms = parameters->dwFrameInterval / 10000;
+    uint32_t interval_ms = parameters->dwFrameInterval / 10000;
+    const uint32_t min_interval_ms = 1000 / FRAME_RATE;
+    if (interval_ms < min_interval_ms) {
+        interval_ms = min_interval_ms;
+    } else if (interval_ms > 1000) {
+        interval_ms = 1000;
+    }
+    uvc_inv_ms = interval_ms;
     return VIDEO_ERROR_NONE;
 }
 
@@ -3071,6 +3104,13 @@ static inline __attribute__((always_inline)) void uvc_prepare_next(void)
 static inline __attribute__((always_inline)) uint32_t uvc_task()
 {
     if (!tud_video_n_streaming(0, 0)) {
+        if (uvc_sending >= 0 && uvc_sending < UVC_BUF_CNT
+            && uvc_state[uvc_sending] == UVCBUF_SENDING) {
+            uvc_state[uvc_sending] = UVCBUF_FREE;
+        }
+        uvc_sending = -1;
+        uvc_tx_busy = 0;
+        __dmb();
         return UINT32_MAX;
     }
 
@@ -3078,9 +3118,17 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
         return UINT32_MAX;
     }
 
+    const uint32_t t_ms = now();
+    if (uvc_last_xfer_ms && (uint32_t)(t_ms - uvc_last_xfer_ms) < uvc_inv_ms) {
+        return UINT32_MAX;
+    }
+
     int b = find_ready_uvc_buf();
     if (b < 0) {
-        return UINT32_MAX;
+        b = uvc_prepare_fallback_frame();
+        if (b < 0) {
+            return UINT32_MAX;
+        }
     }
 
     uvc_state[b] = UVCBUF_SENDING;
@@ -3091,8 +3139,24 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
 
     __dmb();
     uvc_tx_busy = 1;
+    uvc_last_xfer_ms = t_ms;
 
-    tud_video_n_frame_xfer(0, 0, uvc_buf[b], FRAME_SIZE);
+    if (!tud_video_n_frame_xfer(0, 0, uvc_buf[b], FRAME_SIZE)) {
+        uvc_state[b] = UVCBUF_READY;
+        uvc_newest_ready = b;
+        uvc_sending = -1;
+        uvc_tx_busy = 0;
+        uvc_last_xfer_ms = 0;
+        __dmb();
+        return UINT32_MAX;
+    }
+
+    const uint32_t timeout_ms = uvc_inv_ms > 50 ? uvc_inv_ms + 100 : 150;
+    while (uvc_tx_busy && tud_video_n_streaming(0, 0)
+           && (uint32_t)(now() - t_ms) < timeout_ms) {
+        tud_task();
+        tight_loop_contents();
+    }
 
     return 0;
 }
@@ -4370,12 +4434,32 @@ int uvc_max_func()
     println("==========start==========");
     uvc_init();
 
+    uint32_t last_attempt_ms = 0;
+    uint32_t xfer_start_ms = 0;
     while (true) {
         tud_task();
-        if (tud_video_n_streaming(0, 0) && !uvc_tx_busy) {
+        const uint32_t t_ms = now();
+        if (uvc_tx_busy && (uint32_t)(t_ms - xfer_start_ms) > 1000) {
+            uvc_tx_busy = 0;
+            uvc_sending = -1;
+            uvc_state[0] = UVCBUF_FREE;
+            __dmb();
+        }
+        if (tud_video_n_streaming(0, 0)
+            && !uvc_tx_busy
+            && (uint32_t)(t_ms - last_attempt_ms) >= (1000 / FRAME_RATE)) {
+            last_attempt_ms = t_ms;
             fill_smpte_yuy2(uvc_buf[0], FRAME_SIZE);
+            uvc_state[0] = UVCBUF_SENDING;
+            uvc_sending = 0;
             uvc_tx_busy = 1;
-            tud_video_n_frame_xfer(0, 0, uvc_buf[0], FRAME_SIZE);
+            xfer_start_ms = t_ms;
+            if (!tud_video_n_frame_xfer(0, 0, uvc_buf[0], FRAME_SIZE)) {
+                uvc_tx_busy = 0;
+                uvc_sending = -1;
+                uvc_state[0] = UVCBUF_FREE;
+                __dmb();
+            }
         }
         tight_loop_contents();
     }

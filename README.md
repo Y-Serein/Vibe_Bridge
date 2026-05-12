@@ -169,11 +169,15 @@
 
 ### UVC
 
-UVC 参数当前可确认如下：
+UVC 当前成功基线如下：
 
 - 分辨率：`160x120`
-- 帧率：`22fps`
+- 帧率：`10fps`
 - 像素格式：`YUY2`
+- USB 传输：full-speed Bulk UVC
+- Bulk endpoint：`wMaxPacketSize=64`
+- UVC payload / TinyUSB epbuf：`256`
+- 已验证：Windows 可见，Linux/V4L2 可连续抓取 10fps，guvcview 可用
 
 当前流程是：
 
