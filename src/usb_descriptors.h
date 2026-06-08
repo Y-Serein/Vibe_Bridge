@@ -169,7 +169,7 @@ enum {
                                               _width * _height * 16 / 8, \
                                               (10000000 / _fps), \
                                               (10000000 / _fps), \
-                                              (10000000 / _fps), \
+                                              (10000000 / _fps) * _fps, \
                                               (10000000 / _fps)), \
         TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING( \
             VIDEO_COLOR_PRIMARIES_BT709, \
@@ -236,7 +236,7 @@ enum {
                                               _width * _height * 16 / 8, \
                                               (10000000 / _fps), \
                                               (10000000 / _fps), \
-                                              (10000000 / _fps), \
+                                              (10000000 / _fps) * _fps, \
                                               (10000000 / _fps)), \
         TUD_VIDEO_DESC_CS_VS_COLOR_MATCHING( \
             VIDEO_COLOR_PRIMARIES_BT709, \

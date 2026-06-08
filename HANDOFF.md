@@ -1,7 +1,43 @@
 # pico_tn160 温漂调试 HANDOFF
 
+最后更新：2026-06-08 14:20 CST
+当前分支：test0416
+当前任务：提交当前相对稳定 checkpoint；下一步只加诊断定位冷启动温漂和运行期 -50°C 灾难掉温。
+
+## 接手默认协议
+
+后续接手本项目时，默认按工程控制论闭环推进：目标 -> 状态 -> 误差 -> 控制动作 -> 反馈 -> 修正 -> 验证 -> 沉淀。
+
+- 动固件、USB descriptor、UVC payload、PIO、DMA、时序或文档前，先说明当前目标、当前系统状态、目标与现状误差、本轮控制变量、最小闭环验证方式。
+- 修改后必须用真实反馈验证：构建、UVC 抓帧、Windows/Linux/guvcview 兼容性、硬件实测或用户反馈。
+- 反馈与预期不一致时，先定位误差来源，再继续改。
+- 禁止一次性大范围重构；优先做最小可运行闭环。
+- 禁止破坏当前 full-speed Bulk UVC、160x120、YUY2、10fps 的 Windows/Linux 成功基线。
+- 长任务暂停或结束时，更新本文件：当前状态、已完成内容、失败尝试、关键文件、验证结果、遗留问题和下一步动作。
+- 开工前优先运行：`python3 /home/rv_nano/Sipeed/T_tools/agent_preflight.py --project pico-tn160`；相关流程见 `/home/rv_nano/Sipeed/.claude/skills/pico-tn160-uvc/SKILL.md`。
+- 接手/对齐需求/先不改代码时，先用 `/home/rv_nano/Sipeed/.claude/skills/project-intake/SKILL.md`。
+
 ## 当前在做什么
-当前主线是让 TN160 UVC 在 Windows、Linux/V4L2、guvcview 下稳定可用。当前状态:已完成。成功基线是 full-speed Bulk UVC,160x120,YUY2,10fps。
+当前主线是温漂/运行期 NUC 稳定性。UVC 当前保持成功基线:full-speed Bulk UVC,160x120,YUY2,10fps;Windows 已恢复,Linux/WSL `v4l2-ctl` 连续抓帧通过,guvcview 可用。不要回到 ISO descriptor/payload 猜测路线。
+
+当前相对稳定 checkpoint 固件只允许放在 build 目录:
+`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
+
+SHA256:
+`25ec59279ef4bfd7b1aba27ef68d9eb7f28fabfdbf014426129b842e13b61d3e`
+
+项目目录内 `.uf2` 副本已按用户要求删除。之后不要再把固件放到项目根、`docs/` 或 `D_deliverables/`;本项目固件产物只放 `/home/slam/build/pico_tn160`。
+
+用户最新反馈:
+1. 当前版本整体相对稳定,需要先提交 checkpoint 再继续尝试修改。
+2. 0-50s 冷启动温漂确定存在,约 1 分钟后渐进稳定;MaixCam2 接入会影响热状态/温漂表现。
+3. 偶尔运行 7-8 分钟后会突然掉到 -50°C 左右,且短时间内基本不会恢复。这是独立于冷启动 warmup 的灾难级异常,优先判断是否为 anchor/calib 被污染、NTC/ADC 突跳补偿、或 NUC commit guard 漏挡。
+
+本轮温漂控制动作:
+1. 保留既有 K/NTC/warmup 参数,不继续随意调历史实测常数。
+2. 明确当前 `ffc_run()` 是运行期 shutter-based offset NUC;`K_ANCHOR_COMP_STATIC == 0.0f` 时,VTEMP 不参与 anchor 补偿,也不再用 VTEMP/NTC plausibility gate 阻塞运行期 NUC。
+3. 运行期 NUC 先计算候选 shutter frame/candidate anchor,通过 dG limit 和预测画面跳变 guard 后才 commit 到 `ram_calibg`/`ram_temp_anchor`;拒绝时不污染当前基线。
+4. 帧尾复用旧 ADC debug 字段输出 NUC event:`decision/count/dg/dv/dn`;GUI 源码解析并显示 `NUC ACC#...`/`REJ_*` 状态。注意 dist 里的 exe 尚未重新打包,要看新状态需运行源码版 GUI 或后续重打包。
 
 本轮已做最小 Bulk UVC 改动:
 1. `src/tusb_config.h` 增加 `CFG_TUD_VIDEO_STREAMING_BULK=1`,TinyUSB video buffer / UVC max payload 设为 256。
@@ -55,6 +91,7 @@
 | 29 | (a) 加 `FFC_VTEMP_SETTLED_ADU=200` 闸门:`ffc_should_trigger` 在 `ffc_count >= 4`(过 warmup)时检查 `\|cur_vtemp − smooth_vtemp\|`,大于阈值直接 defer FFC,避免热瞬变期间 commit 烤垃圾 (b) `K_NTC_COMP_STATIC +7.0f → +8.0f` 微调减小 inter-FFC 残漂 | **(a) 部分有效但灾难仍发生**:trend_20260428_140252 t=270 处 FPA 飞到 130°C,scene 永久偏移 -10°C。Gate 阻止了 FFC commit 期间烤数据但**没阻止 per-frame K_V·dV 推动 anchor**——smooth 慢慢追上 raw 的过程中 dv_pre 累积变大。**(b) 反而更不稳**:K_NTC=+8 对 inter-FFC 没显著好处,撤回 |
 | 30 | (a) 撤回 K_NTC `+8.0f → +7.0f` (b) 加 `DV_CLAMP_ADU=400` 在所有 K_V·dV 计算前对 `dv` 做对称钳位:binary_calib_frame 的 comp、ffc_run 的 comp_pre 和 comp_acc 三处 | **部分根因修复**:trend_20260428_141806 t=180 仍发生灾难,scene 永久偏移 -8°C(被钳位限到 K_V·400=200 ADU);**用户关键定位**:手放镜头前 FPA 不变 → FPA 测的是 ROIC 芯片自身,t=180 是 VTEMP 寄存器 spontaneous glitch,**不是真实热事件**;模型边界外 K_V·dV 不该应用 |
 | 31 | NTC plausibility 交叉验证:`DV_DN_RATIO_MAX=10` 用 `\|dN\|·10` 钳住 `\|dV\|`,放在三处 K_V·dv 计算前(early in the chain,DV_CLAMP=400 仍兜底)。NTC 是物理传感器(EMA+R-T 公式)不会 glitch,真实热漂时 dN/dV 同向且 dV/dN ratio 有界,VTEMP glitch 时 dN≈0 → dv 被钳到 0 → K_V comp=0 完全免疫 | **定稿候选**:期望 t=180 类 VTEMP glitch 完全不影响 scene;正常缓漂(dn=20 ADU,dv 上限 200)K_V 仍正常工作 |
+| 32 | 运行期 NUC 策略版:在 `K_ANCHOR_COMP_STATIC == 0.0f` 时不再让 VTEMP/NTC plausibility gate 阻塞 shutter NUC;NUC 先算 candidate anchor,通过 dG limit 和预测画面跳变 guard 后再 commit;帧尾输出 `decision/count/dg/dv/dn`,GUI 源码显示 `NUC ACC#...`/`REJ_*` | **当前相对稳定 checkpoint**:`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`,SHA256 `25ec59279ef4bfd7b1aba27ef68d9eb7f28fabfdbf014426129b842e13b61d3e`;项目内旧 `D_deliverables/*.uf2` 副本已删除,以后固件只放 build 目录 |
 | 20 | 确认 ADC2 硬件死(永远 4095),GUI 删除 NTC/ΔNTC/SAT/ADCERR/TADC/TCS/NCS/ACFG 显示 + NTC 趋势曲线 + 保存 PNG 第三轴 | **完成**:`protocol.py` 不再 unpack 帧尾 NTC/ADC 字段,`monitor_tab.py` 删除 `tax3` 轴/`_trend_ntc`/`_hist_ntc`/`_ntc_ref`。固件帧尾仍发这些字节但 GUI 忽略,不需重烧 |
 | UVC-1 | Linux YUYV 仍报 `Dequeued v4l2 buffer contains corrupted data (38400 bytes)`;后续 UVC 试改导致 Windows Code 10/找不到设备 | **Windows 已出画面**:撤销 `567f761` 及后续 BULK/5fps 试改后,用户确认 Windows 已能看到设备且有画面。当前基线为旧固件 UVC 形态(ISO/30fps/EP1023/原 `fill_uvc_frame2`)。guvcview 仍未解决,不要再用破坏 Windows 的 descriptor/传输参数试改。当前最可疑点:160x120 YUY2 30fps 约 1.152MB/s,超过 full-speed ISO 1023KB/s 上限,Linux/v4l2 可能因此把 buffer 标记为 corrupted;但改帧率/包长会影响 Windows,必须先抓 Linux 协商和内核日志。 |
 | UVC-2 | 用户提供 `tools/frame/frame*.raw`,反馈经常卡在第一帧 | **已做最小状态机修复,待上板验证**:6 个 raw 文件均为 38400 bytes,hash 全不同,`frame.raw -> frame2.raw` 有 99.04% 字节不同,`frame2 -> frame3` 有 79.84% 字节不同;按 YUYV 解析无全 0/全 FF/短帧。已修 `uvc_task()` 忽略 `tud_video_n_frame_xfer()` false 的问题:失败时恢复 `uvc_tx_busy=0`,`uvc_state[b]=UVCBUF_READY`,`uvc_sending=-1`;not streaming 时释放发送中 buffer;`find_ready_uvc_buf()` 增加 READY 兜底扫描。该改动不碰 descriptor/帧率/端点。 |
@@ -79,10 +116,11 @@
 
 ## 下一步计划（3-5条actionable)
 
-1. 保留当前 UVC 成功基线:Windows 可见,Linux 可抓 10fps,guvcview 可用。
-2. 不要再改 UVC descriptor/payload/commit 逻辑,除非出现新的明确兼容性问题。
-3. 若后续要做平台差异化,以当前 Bulk UVC 为 Linux/Windows 共同成功基线。
-4. 正式源码当前必须保持 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`;不要把 `MAIN_FUNC_MODE_UVC_MAX` 留在源码里。
+1. 先提交当前 checkpoint:主固件仓库和 `tools/pico_th160_thermocam_gui/` GUI 仓库分别提交,作为后续诊断修改的回滚点。
+2. 做一版只加诊断、不改变控制行为的固件/GUI:暴露 `boot_ntc`、`boot_delta`、`warmup_curve_comp`、`normal_ntc_comp`、`total_comp`、`eff_anchor`、`ram_temp_anchor`、NUC `decision/count/dg/dv/dn`。
+3. 用诊断版做 3-5 次 0-90s 冷启动对照,至少覆盖一次有漂和一次不漂;判断 `boot_ntc/boot_delta/warmup_comp` 是否随机导致 0-50s 温漂差异。
+4. 长跑 10-15 分钟复现 -50°C 灾难掉温;掉温时重点看是否刚发生 `NUC ACC#...`、`ram_temp_anchor/eff_anchor` 是否突变、`NTC/ΔNTC` 是否突跳、`dg` 是否异常。
+5. 不要修改 UVC descriptor/payload/commit,不要把测试模式 `MAIN_FUNC_MODE_UVC_MAX` 留在正式源码里;下一轮只根据诊断反馈选择收紧 NUC guard、稳定 `boot_ntc`,或限制 NTC 补偿异常输入。
 
 ## 关键文件路径（相对路径，一行一个）
 
@@ -106,21 +144,30 @@ docs/logs.txt
 main.c 关键定位锚:
 - `K_ANCHOR_COMP_STATIC` / `K_NTC_COMP_STATIC` / `K_COMP_MAX_ADU` 定义
 - `binary_calib_frame()` 内 `eff_anchor =` 的 K 补偿块
-- `binary_calib_frame()` 诊断尾部:`PX_CNT+19..20 = ffc_last_ntc`,`PX_CNT+21..22 = cur_ntc`,`PX_CNT+23..26 = TCS/ACFG`,`PX_CNT+27..30 = TADC/NCS`
-- `ffc_run()` 内 `eff_anchor_old` 计算 + `comp_acc` 吸收 + `ffc_last_ntc` 更新
+- `binary_calib_frame()` 诊断尾部:`PX_CNT+19..20 = ffc_last_ntc`,`PX_CNT+21..22 = cur_ntc`,`PX_CNT+23..30 = NUC decision/count/dg/dv/dn`
+- `ffc_run()` 内 `candidate_temp_anchor`、jump guard、`ffc_record_event()`
 - `ffc_should_trigger()` 内 FFC 调度(30s + 150 ADU dV + 2s min lockout)
 - FFC sanity check(`FFC_REJECT_DG_ADU=2500` / `FFC_REJECT_DV_ADU=1000`)
 
 构建:`bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 | tail -5` → 输出 `/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
 
+## 当前验证状态
+
+- 已确认当前正式固件产物存在:`/home/slam/build/pico_tn160/pico_tn160.elf.uf2`
+- 已确认 SHA256:`25ec59279ef4bfd7b1aba27ef68d9eb7f28fabfdbf014426129b842e13b61d3e`
+- 已清理项目目录内 `.uf2` 副本;项目根、`docs/`、`D_deliverables/` 下不再保留固件副本。
+- 已确认源码模式仍是 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`;UVC 仍是 Bulk 10fps 基线。
+- 本轮尚未重新构建;当前目标是先提交现有相对稳定 checkpoint,再做诊断修改。
+- 未上板验证新诊断项;后续需要用户烧录 build 目录固件并用源码版 GUI 记录冷启动和长跑 trend。
+
 ## 还没搞清楚的问题
 
-1. ~~**NTC ADC2 仍读 4095**~~ —— **已解决**:RP2350 AVDD 引脚漏接电源,补焊即恢复正常
-2. **NTC 电压分压拓扑未知** —— 已确认当前硬件 NTC 通道是 `GPIO28/ADC2`;上拉 vs 下拉 仍决定 K_NTC 符号。**只能靠实测翻号**(现在 NTC 真实可用,可以做对照实验)
-3. **ram_mean_diff 实际值未知** —— K 系数推导依赖此值,用户 GUI 诊断标签里能看到 `mean_diff XXX.X`,可让用户告知
-4. **是否真是 shutter 漂移** —— 50s 时间常数的指数衰减可能是 (a) shutter blade、(b) lens housing、(c) bolometer membrane settling。NTC 只能补偿 (a)(b);若是 (c) 必须改硬件或重 cal
-5. **a9c7591 当初是不是真的不漂** —— 用户记忆中那版"还行",但数学分析表明它有同样的漂移源。可能是当时测试时长不够,或 ambient 条件巧合接近 cal 时
-6. **flash_imgbg 是否在合适 ambient 下采集** —— 若出厂 cal 时 ambient ≠ 当前 ambient,会有不可消除的常量偏置(~md/50.4·ΔT_amb 度)。属于标定问题不是固件问题
+1. ~~**NTC ADC2 仍读 4095**~~ —— **已解决**:RP2350 AVDD 引脚漏接电源,补焊即恢复正常。
+2. **0-50s 冷启动温漂的随机性来源** —— 真实冷启动热漂确定存在;当前优先怀疑 `boot_ntc`/早期 NTC EMA/warmup curve 起点随机,也可能是 MaixCam2 改变热路径导致 NTC 不能代表 shutter/lens。
+3. **7-8 分钟后偶发 -50°C 且短时间不恢复** —— warmup curve 已在 320s 后退出,所以这不是冷启动补偿本身;优先怀疑某次运行期 NUC commit 污染 `ram_temp_anchor`/`ram_calibg`,或 NTC/ADC 有效范围内突跳导致补偿异常。
+4. **掉温是否和 `NUC ACC#...` 同步** —— 需要诊断版记录掉温瞬间的 `decision/count/dg/dv/dn`、`ram_temp_anchor`、`eff_anchor`、`NTC/ΔNTC`。
+5. **ram_mean_diff 实际值和标定环境** —— K 系数和温度跳变量级依赖 `mean_diff`;若 flash 低温参考 ambient 与当前 ambient 不一致,会产生常量偏置,属于标定问题不是运行期算法问题。
+6. **热源/结构影响** —— MaixCam2 接入会影响温漂,需要区分供电/热源/气流/机械安装导致的真实热漂和固件补偿误差。
 
 ## 用户偏好备注
 - 中文回复(`feedback_language_chinese.md` 已记忆)
