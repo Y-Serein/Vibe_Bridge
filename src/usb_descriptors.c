@@ -55,7 +55,11 @@ uint8_t const* tud_descriptor_device_cb(void)
 // Configuration Descriptor
 //--------------------------------------------------------------------+
 
-#if defined(CFG_EXAMPLE_VIDEO_READONLY) \
+#if UVC_MJPEG640_STATIC_TEST
+#    define CONFIG_TOTAL_LEN \
+        (TUD_CONFIG_DESC_LEN \
+         + TUD_VIDEO_CAPTURE_DESC_UNCOMPR_MJPEG_BULK_LEN)
+#elif defined(CFG_EXAMPLE_VIDEO_READONLY) \
     && !defined(CFG_EXAMPLE_VIDEO_DISABLE_MJPEG)
 #    define CONFIG_TOTAL_LEN \
         (TUD_CONFIG_DESC_LEN + TUD_VIDEO_CAPTURE_DESC_MJPEG_LEN)
@@ -70,13 +74,16 @@ uint8_t const* tud_descriptor_device_cb(void)
 #if TU_CHECK_MCU(OPT_MCU_LPC175X_6X, OPT_MCU_LPC177X_8X, OPT_MCU_LPC40XX)
 // LPC 17xx and 40xx endpoint type (bulk/interrupt/iso) are fixed by its number
 // 0 control, 1 In, 2 Bulk, 3 Iso, 4 In, 5 Bulk etc ...
+#    define EPNUM_VIDEO_CONTROL 0x84
 #    define EPNUM_VIDEO_IN 0x83
 
 #elif TU_CHECK_MCU(OPT_MCU_NRF5X)
 // nRF5x ISO can only be endpoint 8
+#    define EPNUM_VIDEO_CONTROL 0x81
 #    define EPNUM_VIDEO_IN 0x88
 
 #else
+#    define EPNUM_VIDEO_CONTROL 0x82
 #    define EPNUM_VIDEO_IN 0x81
 
 #endif
@@ -87,7 +94,14 @@ uint8_t const desc_fs_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0, 500),
 
 // IAD for Video Control
-#if defined(CFG_EXAMPLE_VIDEO_READONLY) \
+#if UVC_MJPEG640_STATIC_TEST
+    TUD_VIDEO_CAPTURE_DESCRIPTOR_UNCOMPR_MJPEG_BULK(4,
+                                                    EPNUM_VIDEO_CONTROL,
+                                                    EPNUM_VIDEO_IN,
+                                                    FRAME_WIDTH,
+                                                    FRAME_HEIGHT,
+                                                    FRAME_RATE)
+#elif defined(CFG_EXAMPLE_VIDEO_READONLY) \
     && !defined(CFG_EXAMPLE_VIDEO_DISABLE_MJPEG)
     TUD_VIDEO_CAPTURE_DESCRIPTOR_MJPEG(4,
                                        EPNUM_VIDEO_IN,
@@ -97,6 +111,7 @@ uint8_t const desc_fs_configuration[] = {
                                        CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE)
 #elif CFG_TUD_VIDEO_STREAMING_BULK
     TUD_VIDEO_CAPTURE_DESCRIPTOR_UNCOMPR_BULK(4,
+                                              EPNUM_VIDEO_CONTROL,
                                               EPNUM_VIDEO_IN,
                                               FRAME_WIDTH,
                                               FRAME_HEIGHT,

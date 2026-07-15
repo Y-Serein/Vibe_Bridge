@@ -39,6 +39,10 @@
 
 #include "usb_descriptors.h"
 
+#if UVC_MJPEG640_STATIC_TEST
+#    include "uvc_mjpeg_test_frame.h"
+#endif
+
 #if MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
 #    include "device/usbd.h"
 #    include "tusb.h"
@@ -2898,6 +2902,9 @@ static volatile int uvc_newest_ready = -1;
 static volatile int uvc_sending = -1;
 static volatile uint8_t uvc_tx_busy = 0;
 static volatile uint32_t uvc_frame_num = 0;
+#if UVC_MJPEG640_STATIC_TEST
+static volatile uint8_t uvc_format_index = UVC_FORMAT_INDEX_YUY2;
+#endif
 #define UVC_FIXED_INTERVAL_MS (1000u / FRAME_RATE)
 static volatile uint32_t uvc_inv_ms = UVC_FIXED_INTERVAL_MS;
 static volatile uint32_t uvc_last_xfer_ms = 0;
@@ -2920,6 +2927,9 @@ static inline __attribute__((always_inline)) void uvc_buf_init()
     uvc_sending = -1;
     uvc_tx_busy = 0;
     uvc_last_xfer_ms = 0;
+#if UVC_MJPEG640_STATIC_TEST
+    uvc_format_index = UVC_FORMAT_INDEX_YUY2;
+#endif
 }
 
 static inline __attribute__((always_inline)) int find_free_uvc_buf()
@@ -3153,7 +3163,15 @@ int tud_video_commit_cb(uint_fast8_t ctl_idx,
 {
     (void)ctl_idx;
     (void)stm_idx;
+#if UVC_MJPEG640_STATIC_TEST
+    if (parameters
+        && (parameters->bFormatIndex == UVC_FORMAT_INDEX_YUY2
+            || parameters->bFormatIndex == UVC_FORMAT_INDEX_MJPEG_TEST)) {
+        uvc_format_index = parameters->bFormatIndex;
+    }
+#else
     (void)parameters;
+#endif
     uvc_inv_ms = UVC_FIXED_INTERVAL_MS;
     return VIDEO_ERROR_NONE;
 }
@@ -3244,6 +3262,12 @@ static inline __attribute__((always_inline)) void uvc_fill(uint8_t* buf,
 
 static inline __attribute__((always_inline)) void uvc_prepare_next(void)
 {
+#if UVC_MJPEG640_STATIC_TEST
+    if (uvc_format_index == UVC_FORMAT_INDEX_MJPEG_TEST) {
+        return;
+    }
+#endif
+
     int src = newest_ready;
     if (src < 0) {
         return;
@@ -3307,6 +3331,31 @@ static inline __attribute__((always_inline)) uint32_t uvc_task()
     if (uvc_last_xfer_ms && (uint32_t)(t_ms - uvc_last_xfer_ms) < uvc_inv_ms) {
         return UINT32_MAX;
     }
+
+#if UVC_MJPEG640_STATIC_TEST
+    if (uvc_format_index == UVC_FORMAT_INDEX_MJPEG_TEST) {
+        uvc_sending = -1;
+        uvc_tx_busy = 1;
+        uvc_last_xfer_ms = t_ms;
+        if (!tud_video_n_frame_xfer(0,
+                                    0,
+                                    (void*)(uintptr_t)uvc_mjpeg_test_frame,
+                                    UVC_MJPEG_TEST_FRAME_SIZE)) {
+            uvc_tx_busy = 0;
+            uvc_last_xfer_ms = 0;
+            __dmb();
+            return UINT32_MAX;
+        }
+
+        const uint32_t timeout_ms = uvc_inv_ms + 100;
+        while (uvc_tx_busy && tud_video_n_streaming(0, 0)
+               && (uint32_t)(now() - t_ms) < timeout_ms) {
+            tud_task();
+            tight_loop_contents();
+        }
+        return 0;
+    }
+#endif
 
     int b = find_ready_uvc_buf();
     if (b < 0) {

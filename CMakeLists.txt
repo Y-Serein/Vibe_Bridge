@@ -9,6 +9,12 @@ project(
     LANGUAGES C ASM CXX
 )
 
+option(
+    UVC_MJPEG640_STATIC_TEST
+    "Expose a static 640x480 MJPEG compatibility profile for host testing"
+    OFF
+)
+
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -72,6 +78,7 @@ target_compile_definitions(
     PICO_FLASH_SIZE_BYTES=4194304
     PICO_STACK_SIZE=2048
     PICO_STACK_SIZE_CORE1=4096
+    UVC_MJPEG640_STATIC_TEST=$<BOOL:${UVC_MJPEG640_STATIC_TEST}>
 )
 
 target_link_libraries(
