@@ -37,6 +37,8 @@
 #include <sys/types.h>
 #include <utils.h>
 
+#include "thermal_ncm.h"
+#include "thermal_ota.h"
 #include "usb_descriptors.h"
 
 #if UVC_MJPEG640_STATIC_TEST
@@ -155,7 +157,8 @@ enum rawbuf_state {
  *                      T_FPA = 25 + (vtemp - 8192) / 70  [°C, factory cal].
  *                      FFC drift detection uses this field. */
 #define RAWBUF_OFS_VTEMP (RAWBUFSIZE + RAWBUFSIZEOFS)
-static uint8_t rawbuf[RAWBUFCNT][RAWBUFSIZETOTAL];
+static uint8_t rawbuf[RAWBUFCNT][RAWBUFSIZETOTAL]
+    __attribute__((aligned(__alignof__(uint16_t))));
 static volatile uint8_t rawbuf_state[RAWBUFCNT];
 static volatile int rawbuf_last_ready;
 /* Core1 advances the capture epoch only after a shutter movement has fully
@@ -174,15 +177,79 @@ static enum UartOutMode ouomode = UART_OUT_MODE_DEF;
  * VTEMP swings are too small to reliably track sensor self-heating. */
 static uint32_t rawbuf_vtemp_sum[RAWBUFCNT];
 static uint16_t rawbuf_vtemp_cnt[RAWBUFCNT];
-static uint32_t rawbuf_vtemp_top_sum[RAWBUFCNT];
-static uint32_t rawbuf_vtemp_bottom_sum[RAWBUFCNT];
-static uint16_t rawbuf_vtemp_top_cnt[RAWBUFCNT];
-static uint16_t rawbuf_vtemp_bottom_cnt[RAWBUFCNT];
-static uint16_t rawbuf_vtemp_min[RAWBUFCNT];
-static uint16_t rawbuf_vtemp_max[RAWBUFCNT];
-static volatile uint16_t g_boot_vtemp_mean = 0;
-static volatile uint16_t g_boot_vtemp_span = 0;
-static volatile int16_t g_boot_vtemp_tb = 0;
+static uint16_t rawbuf_uniform_rows[RAWBUFCNT];
+static uint16_t rawbuf_uniform_max_run[RAWBUFCNT];
+volatile uint16_t g_capture_last_frame_uniform_rows = 0;
+volatile uint16_t g_capture_last_frame_uniform_max_run = 0;
+uint8_t g_capture_raw_diag[RAWBUFSIZE] __attribute__((aligned(4)));
+volatile bool g_capture_raw_diag_frozen = false;
+int8_t g_capture_row_phase[SENSOR_H];
+static uint16_t rawbuf_row_ref[RAWBUFCNT][SENSOR_H];
+uint16_t g_capture_row_ref_diag[SENSOR_H];
+
+enum adc16_snapshot_state {
+    ADC16_SNAPSHOT_IDLE = 0,
+    ADC16_SNAPSHOT_REQUESTED,
+    ADC16_SNAPSHOT_READY,
+    ADC16_SNAPSHOT_SENDING,
+};
+static uint8_t adc16_snapshot_state;
+
+
+
+
+/* Core0 capture diagnostics are copied into the NCM metadata row by Core1.
+ * They are monotonic, so a bad image can be correlated with an exact receive
+ * overflow or frame-boundary resync without a serial console. */
+volatile uint32_t g_capture_incomplete_frames = 0;
+volatile uint32_t g_capture_unexpected_heads = 0;
+
+/* Statistics for the most recent averaged shutter background candidate. */
+volatile uint16_t g_ffc_bg_max_row_jump_adu = 0;
+volatile uint8_t g_ffc_bg_max_row_jump_line = 0;
+volatile uint16_t g_ffc_bg_min_row_mean = 0;
+volatile uint16_t g_ffc_bg_max_row_mean = 0;
+
+/* H1617 packet-sequence diagnostics. A complete image is one EC/DA head,
+ * 119 C7/DA middle rows and one C7/F1 tail. These counters are observational:
+ * they do not change the existing capture/resync decisions. */
+volatile uint32_t g_capture_packet_heads = 0;
+volatile uint32_t g_capture_packet_mids = 0;
+volatile uint32_t g_capture_packet_tails = 0;
+volatile uint32_t g_capture_packet_invalid = 0;
+volatile uint16_t g_capture_runtime_resyncs = 0;
+volatile uint16_t g_capture_last_resync_invalid_run = 0;
+volatile uint16_t g_capture_max_invalid_run = 0;
+volatile uint32_t g_capture_complete_sequences = 0;
+volatile uint32_t g_capture_bad_tail_sequences = 0;
+volatile uint32_t g_capture_head_after_head = 0;
+volatile uint32_t g_capture_tail_without_head = 0;
+volatile uint16_t g_capture_active_mid_count = 0;
+volatile uint16_t g_capture_last_interrupted_mid_count = 0;
+volatile uint16_t g_capture_last_tail_mid_count = 0;
+volatile uint16_t g_capture_max_interrupted_mid_count = 0;
+volatile uint32_t g_capture_interrupt_mid_0_31 = 0;
+volatile uint32_t g_capture_interrupt_mid_32_63 = 0;
+volatile uint32_t g_capture_interrupt_mid_64_95 = 0;
+volatile uint32_t g_capture_interrupt_mid_96_plus = 0;
+
+static inline __attribute__((always_inline)) void
+capture_note_interrupted_sequence(uint16_t mid_count)
+{
+    g_capture_last_interrupted_mid_count = mid_count;
+    if (mid_count > g_capture_max_interrupted_mid_count) {
+        g_capture_max_interrupted_mid_count = mid_count;
+    }
+    if (mid_count <= 31) {
+        g_capture_interrupt_mid_0_31++;
+    } else if (mid_count <= 63) {
+        g_capture_interrupt_mid_32_63++;
+    } else if (mid_count <= 95) {
+        g_capture_interrupt_mid_64_95++;
+    } else {
+        g_capture_interrupt_mid_96_plus++;
+    }
+}
 
 static inline __attribute__((always_inline)) void rawbuf_init(void)
 {
@@ -218,6 +285,8 @@ static inline __attribute__((always_inline)) int rawbuf_find_free(void)
 static inline __attribute__((always_inline)) void rawbuf_copy_line(
     int buf_idx, int line, const uint8_t* src, size_t len)
 {
+    static uint16_t uniform_run[RAWBUFCNT];
+
     if (line >= SENSOR_H) {
         return;
     }
@@ -229,31 +298,59 @@ static inline __attribute__((always_inline)) void rawbuf_copy_line(
     if (line == 0) {
         rawbuf_vtemp_sum[buf_idx] = 0;
         rawbuf_vtemp_cnt[buf_idx] = 0;
-        rawbuf_vtemp_top_sum[buf_idx] = 0;
-        rawbuf_vtemp_bottom_sum[buf_idx] = 0;
-        rawbuf_vtemp_top_cnt[buf_idx] = 0;
-        rawbuf_vtemp_bottom_cnt[buf_idx] = 0;
-        rawbuf_vtemp_min[buf_idx] = 0x3FFFu;
-        rawbuf_vtemp_max[buf_idx] = 0;
+        rawbuf_uniform_rows[buf_idx] = 0;
+        rawbuf_uniform_max_run[buf_idx] = 0;
+        uniform_run[buf_idx] = 0;
     }
+    uint16_t refs[6];
+    for (int k = 0; k < 6; ++k) {
+        const uint8_t* p = k < 4
+                               ? src - 8 + k * 2
+                               : src + SENSOR_W * 2 + (k - 4) * 2;
+        uint16_t value =
+            ((((uint16_t)p[0]) << 8) | (uint16_t)p[1]) & 0x3FFFu;
+        value ^= value >> 1;
+        value ^= value >> 2;
+        value ^= value >> 4;
+        value ^= value >> 8;
+        refs[k] = value & 0x3FFFu;
+    }
+    for (int i = 1; i < 6; ++i) {
+        const uint16_t value = refs[i];
+        int j = i;
+        while (j > 0 && refs[j - 1] > value) {
+            refs[j] = refs[j - 1];
+            --j;
+        }
+        refs[j] = value;
+    }
+    rawbuf_row_ref[buf_idx][line] =
+        (uint16_t)((refs[1] + refs[2] + refs[3] + refs[4] + 2u) / 4u);
+    /* Equality is endian-independent. A real thermal row always has spatial
+     * variation; failure packets repeat one code across all active columns. */
+    const uint16_t* row16 = (const uint16_t*)src;
+    bool uniform = true;
+    for (size_t x = 1; x < SENSOR_W; ++x) {
+        if (row16[x] != row16[0]) {
+            uniform = false;
+            break;
+        }
+    }
+    if (uniform) {
+        rawbuf_uniform_rows[buf_idx]++;
+        uniform_run[buf_idx]++;
+        if (uniform_run[buf_idx] > rawbuf_uniform_max_run[buf_idx]) {
+            rawbuf_uniform_max_run[buf_idx] = uniform_run[buf_idx];
+        }
+    } else {
+        uniform_run[buf_idx] = 0;
+    }
+
     const uint16_t line_vtemp =
         ((((uint16_t)src[SENSOR_W * 2 + 4]) << 8) | src[SENSOR_W * 2 + 5])
         & 0x3FFF;
     rawbuf_vtemp_sum[buf_idx] += line_vtemp;
     rawbuf_vtemp_cnt[buf_idx]++;
-    if (line < SENSOR_H / 2) {
-        rawbuf_vtemp_top_sum[buf_idx] += line_vtemp;
-        rawbuf_vtemp_top_cnt[buf_idx]++;
-    } else {
-        rawbuf_vtemp_bottom_sum[buf_idx] += line_vtemp;
-        rawbuf_vtemp_bottom_cnt[buf_idx]++;
-    }
-    if (line_vtemp < rawbuf_vtemp_min[buf_idx]) {
-        rawbuf_vtemp_min[buf_idx] = line_vtemp;
-    }
-    if (line_vtemp > rawbuf_vtemp_max[buf_idx]) {
-        rawbuf_vtemp_max[buf_idx] = line_vtemp;
-    }
 
     if (ouomode == UOM_RAW_U16) {
         const size_t line_stride = SENSOR_W * 2 + 4;
@@ -378,10 +475,21 @@ enum tx_buf_state {
 };
 
 #define PX_CNT     (SENSOR_W * SENSOR_H)
+#if THERMAL_NCM_MODE
+/* NCM v1 transmits temp8 directly. Keep only the normalized pixels and the
+ * 70-byte internal per-frame diagnostics consumed while constructing Meta. */
+#define TX_PAYLOAD (PX_CNT + 72)
+#else
 #define TX_PAYLOAD (RAWBUFSIZETOTAL + 2)
-#define TXBUF_CNT  3
+#endif
+/* Core1 fills processed frames.  UART can hold one buffer in DMA while
+ * Core1 prepares the next; UVC copies a READY buffer synchronously before
+ * releasing it.  A third processed-frame buffer has no distinct owner. */
+#define TXBUF_CNT  2
 static int uart_tx_dma_chan = -1;
-static uint8_t norm_buf[TXBUF_CNT][TX_PAYLOAD];
+static uint8_t norm_buf[TXBUF_CNT][TX_PAYLOAD] __attribute__((aligned(4)));
+static_assert(TX_PAYLOAD > PX_CNT + 70,
+              "processed frame buffer must include internal diagnostics");
 [[maybe_unused]] static int tx_buf_idx;
 static volatile int dma_busy;
 static int buf_idx;
@@ -414,145 +522,6 @@ static float ram_mean_diff = 0.0f;
 static float ram_t_ref_low = 0.0f;
 static int32_t ram_l_ref_mean = 0;   /* mean of low-ref frame; fixed at boot, never changes */
 static int32_t ram_temp_anchor = 0;  /* temperature zero-point in corrected ADU; updated each FFC */
-#define STATIC_CAL_V1_WRITE_COMMAND 0xECu
-#define STATIC_CAL_DUMP_COMMAND 0xEDu
-#define FFC_MAP_DUMP_COMMAND 0xEEu
-#define UART_EXIT_TO_UVC_COMMAND 0x99u
-#define THERMAL_V2_WRITE_COMMAND 0xEFu
-#define THERMAL_V2_FLASH_HEADER_DIAG_COMMAND 0xF0u
-#define THERMAL_V2_HEADER_TRANSACTION_DIAG_COMMAND 0xF1u
-#define THERMAL_V2_MAP0_TRANSACTION_DIAG_COMMAND 0xF2u
-#define THERMAL_V2_FULL_ERASE_COMMAND 0xF3u
-#define THERMAL_V2_STATUS_COMMAND 0xF4u
-#define FFC_MAP_DUMP_VERSION 1u
-struct __attribute__((packed)) FfcMapDumpHeader {
-    uint8_t magic[4];
-    uint16_t version;
-    uint16_t header_size;
-    uint16_t width;
-    uint16_t height;
-    uint32_t payload_size;
-    uint32_t payload_crc32;
-    int32_t temp_anchor;
-    uint16_t ntc;
-    uint16_t vtemp;
-    uint16_t ffc_count;
-    uint8_t last_decision;
-    uint8_t flags; /* bit0: accepted FFC; bit1: ram map active; bits4..7: model */
-    uint32_t uptime_ms;
-};
-static_assert(sizeof(struct FfcMapDumpHeader) == 36,
-              "FFC map dump header must remain protocol-stable");
-struct __attribute__((packed)) StaticCalDumpHeader {
-    uint8_t magic[4];
-    uint16_t version;
-    uint16_t header_size;
-    uint16_t width;
-    uint16_t height;
-    uint32_t gain_size;
-    uint32_t gain_crc32;
-    float mean_diff;
-    float t_ref_low;
-    uint32_t header_crc32;
-};
-static_assert(sizeof(struct StaticCalDumpHeader) == 32,
-              "Static calibration dump header must remain protocol-stable");
-struct __attribute__((packed)) StaticCalV1WriteHeader {
-    uint8_t magic[4];
-    uint16_t version;
-    uint16_t header_size;
-    uint16_t width;
-    uint16_t height;
-    uint16_t badpts_num;
-    uint16_t flags;
-    uint32_t imgbg_size;
-    uint32_t gain_size;
-    uint32_t badpts_size;
-    float mean_diff;
-    float t_ref_low;
-    uint32_t imgbg_crc32;
-    uint32_t gain_crc32;
-    uint32_t badpts_crc32;
-    uint32_t payload_crc32;
-    uint8_t reserved[8];
-    uint32_t header_crc32;
-};
-static_assert(sizeof(struct StaticCalV1WriteHeader) == 64,
-              "Static V1 write header must remain protocol-stable");
-struct __attribute__((packed)) StaticCalV1WriteReply {
-    uint8_t magic[4];
-    uint16_t version;
-    uint8_t status;
-    uint8_t detail;
-    uint32_t payload_crc32;
-    uint32_t header_crc32;
-    uint32_t flash_header_crc32;
-};
-static_assert(sizeof(struct StaticCalV1WriteReply) == 20,
-              "Static V1 write reply must remain protocol-stable");
-enum StaticCalV1WriteStatus {
-    STATIC_CAL_V1_WRITE_OK = 0x00,
-    STATIC_CAL_V1_WRITE_READY_IMGBG = 0x10,
-    STATIC_CAL_V1_WRITE_READY_GAIN = 0x11,
-    STATIC_CAL_V1_WRITE_READY_BADPTS = 0x12,
-    STATIC_CAL_V1_WRITE_READY_HEADER = 0x7f,
-    STATIC_CAL_V1_WRITE_ERR_RX = 0x80,
-    STATIC_CAL_V1_WRITE_ERR_HEADER = 0x81,
-    STATIC_CAL_V1_WRITE_ERR_PAYLOAD_CRC = 0x82,
-    STATIC_CAL_V1_WRITE_ERR_SEMANTIC = 0x83,
-    STATIC_CAL_V1_WRITE_ERR_FLASH = 0x84,
-    STATIC_CAL_V1_WRITE_ERR_VERIFY = 0x85,
-};
-struct __attribute__((packed)) ThermalV2WriteReply {
-    uint8_t magic[4];
-    uint16_t version;
-    uint8_t status;
-    uint8_t detail;
-    uint32_t payload_crc32;
-    uint32_t header_crc32;
-};
-static_assert(sizeof(struct ThermalV2WriteReply) == 16,
-              "Thermal V2 write reply must remain protocol-stable");
-enum ThermalV2WriteStatus {
-    THERMAL_V2_WRITE_READY_HEADER = 0x7f,
-    THERMAL_V2_WRITE_READY_MAP0 = 0x10,
-    THERMAL_V2_WRITE_READY_MAP1 = 0x11,
-    THERMAL_V2_WRITE_READY_MAP2 = 0x12,
-    THERMAL_V2_WRITE_READY_MAP3 = 0x13,
-    /* 0xF0: one 4 KiB V2-header erase/program diagnostic.  V1 and all V2
-     * map sectors stay untouched; the V2 header remains invalid afterwards. */
-    THERMAL_V2_WRITE_DIAG_FLASH_BEGIN = 0x70,
-    THERMAL_V2_WRITE_DIAG_FLASH_RETURNED = 0x71,
-    THERMAL_V2_WRITE_DIAG_FLASH_VERIFIED = 0x72,
-    THERMAL_V2_WRITE_DIAG_HEADER_READY = 0x73,
-    THERMAL_V2_WRITE_DIAG_WRAPPER_BEGIN = 0x74,
-    THERMAL_V2_WRITE_DIAG_WRAPPER_VERIFIED = 0x75,
-    THERMAL_V2_WRITE_DIAG_MAP0_HEADER_READY = 0x76,
-    THERMAL_V2_WRITE_DIAG_MAP0_READY = 0x77,
-    THERMAL_V2_WRITE_DIAG_MAP0_VERIFIED = 0x78,
-    THERMAL_V2_WRITE_ERASE_BEGIN = 0x79,
-    THERMAL_V2_WRITE_ERASE_MAP_VERIFIED = 0x7a,
-    THERMAL_V2_WRITE_ERASE_VERIFIED = 0x7b,
-    THERMAL_V2_WRITE_STATUS = 0x7c,
-    THERMAL_V2_WRITE_CANDIDATE = 0x01,
-    THERMAL_V2_WRITE_OK = 0x00,
-    THERMAL_V2_WRITE_ERR_RX = 0x80,
-    THERMAL_V2_WRITE_ERR_HEADER = 0x81,
-    THERMAL_V2_WRITE_ERR_MAP_CRC = 0x82,
-    THERMAL_V2_WRITE_ERR_FLASH = 0x83,
-    THERMAL_V2_WRITE_ERR_VERIFY = 0x84,
-};
-static bool ffc_map_dump_requested = false;
-static bool static_cal_dump_requested = false;
-static bool static_cal_v1_write_requested = false;
-static bool thermal_v2_write_requested = false;
-static bool thermal_v2_flash_header_diag_requested = false;
-static bool thermal_v2_header_transaction_diag_requested = false;
-static bool thermal_v2_map0_transaction_diag_requested = false;
-static bool thermal_v2_full_erase_requested = false;
-static bool thermal_v2_status_requested = false;
-static bool g_thermal_v2_valid = false;
-
 #define T_REF_HIGH 50.0f
 #define BODY_ONLY_RESYNC_THRES    8u
 #define STARTUP_HEAD_SYNC_TIMEOUT 24u
@@ -623,55 +592,14 @@ static const uint16_t* g_last_calib = nullptr;
  * up (~6 s @ τ=3 s) before allowing FFC. 100 ADU ≈ 1.4 °C-equivalent. */
 #define FFC_VTEMP_SETTLED_ADU   100
 /* Thermal compensation model selector.  TABLE is the bounded cold-start
- * correction identified from trend_20260730_092834.csv.  STATE_LINEAR is the
- * first absolute board-NTC fit. STATE_PWL50_TEST extends only its low-NTC range
- * using the 2026-07-30 50 °C hot-RST data. RELATIVE_NTC references each core's
- * first accepted FFC so cold-start compensation does not replay on a hot RST.
- * V1_ONLY is the production-safe baseline: it keeps V1 gain/offset and FFC,
- * but applies no unqualified global thermal compensation or persisted V2 map.
- * Keep every older mode for source-level diagnosis and rollback. */
-#define THERMAL_COMP_MODEL_OFF              0
-#define THERMAL_COMP_MODEL_LEGACY           1
-#define THERMAL_COMP_MODEL_TABLE            2
-#define THERMAL_COMP_MODEL_STATE_LINEAR     3
-#define THERMAL_COMP_MODEL_STATE_PWL50_TEST 4
-#define THERMAL_COMP_MODEL_RELATIVE_NTC     5
-#define THERMAL_COMP_MODEL_PIXEL_NUC_V2     6
-#define THERMAL_COMP_MODEL_V1_ONLY          7
+ * correction identified from trend_20260730_092834.csv.  Keep OFF and LEGACY
+ * available for a one-line rollback during A/B validation. */
+#define THERMAL_COMP_MODEL_OFF     0
+#define THERMAL_COMP_MODEL_LEGACY  1
+#define THERMAL_COMP_MODEL_TABLE   2
 
-#define THERMAL_COMP_MODEL THERMAL_COMP_MODEL_V1_ONLY
+#define THERMAL_COMP_MODEL THERMAL_COMP_MODEL_TABLE
 #define THERMAL_COMP_TABLE_LIMIT_ADU 600
-/* STATE50_TEST fit, using the board NTC ADC code directly:
- *   anchor_comp = 1.76439 * ntc_adu - 3430.884
- * Represent the slope as Q8 (452/256 = 1.765625) around NTC=1700 to avoid a
- * per-frame float operation. The observed fit range was NTC 1657..1720 ADU;
- * bounded extrapolation to 1600..1800 supports the next hot-RST test without
- * allowing a bad ADC sample to shift the anchor by more than 600 ADU. */
-#define THERMAL_COMP_STATE_NTC_REF_ADU     1700
-#define THERMAL_COMP_STATE_AT_REF_ADU      (-431)
-#define THERMAL_COMP_STATE_SLOPE_Q8        452
-#define THERMAL_COMP_STATE_NTC_MIN_ADU     1600
-#define THERMAL_COMP_STATE_NTC_MAX_ADU     1800
-#define THERMAL_COMP_STATE_LIMIT_ADU       600
-/* Low-NTC extension measured from trend_startup_20260730_190352.csv. The
- * 1657 ADU join exactly matches STATE_LINEAR; below 1550 ADU the correction
- * remains bounded at -600 ADU instead of extrapolating without evidence. */
-#define THERMAL_COMP_PWL_NTC_LOW_ADU       1550
-#define THERMAL_COMP_PWL_AT_LOW_ADU        (-600)
-#define THERMAL_COMP_PWL_NTC_MID_ADU       1590
-#define THERMAL_COMP_PWL_AT_MID_ADU        (-521)
-#define THERMAL_COMP_PWL_NTC_JOIN_ADU      1657
-#define THERMAL_COMP_PWL_AT_JOIN_ADU       (-507)
-/* Cold-start V1-only compensation fitted to the latest fixed high-emissivity
- * trace, trend_startup_20260806_181135.csv.  Excluding its one post-FFC
- * transient frame, center RAW regressed at +1.100364 ADU/code against the
- * falling board NTC; 282/256 = 1.1015625 is the nearest fixed-point slope.
- * Reference the first accepted FFC, never boot time, so the curve cannot
- * replay on a hot RST.  The observed first-FFC-to-end correction is about
- * -200 ADU, bounded below by -220 ADU. */
-#define THERMAL_COMP_REL_NTC_DEADBAND_ADU  15
-#define THERMAL_COMP_REL_NTC_SLOPE_Q8      282
-#define THERMAL_COMP_REL_NTC_LIMIT_ADU     220
 
 struct ThermalCompTablePoint {
     uint32_t elapsed_ms;
@@ -690,7 +618,7 @@ static const struct ThermalCompTablePoint thermal_comp_table[] = {
 };
 
 #if THERMAL_COMP_MODEL < THERMAL_COMP_MODEL_OFF \
-    || THERMAL_COMP_MODEL > THERMAL_COMP_MODEL_V1_ONLY
+    || THERMAL_COMP_MODEL > THERMAL_COMP_MODEL_TABLE
 #error "Invalid THERMAL_COMP_MODEL"
 #endif
 
@@ -702,22 +630,6 @@ static inline bool thermal_comp_legacy_enabled(void)
 static inline bool thermal_comp_table_enabled(void)
 {
     return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_TABLE;
-}
-
-static inline bool thermal_comp_state_enabled(void)
-{
-    return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_STATE_LINEAR
-           || THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_STATE_PWL50_TEST;
-}
-
-static inline bool thermal_comp_relative_ntc_enabled(void)
-{
-    return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_RELATIVE_NTC;
-}
-
-static inline bool thermal_comp_pixel_nuc_v2_enabled(void)
-{
-    return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_PIXEL_NUC_V2;
 }
 
 /* Between-FFC drift compensation: STATIC (compile-time) coefficients
@@ -804,7 +716,6 @@ static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
 static uint16_t boot_ntc = 0;                /* valid NTC ADC captured at power-on */
 static uint32_t boot_ntc_ms = 0;             /* timestamp of the first valid NTC */
-static uint16_t thermal_comp_ntc_ref = 0;    /* immutable first accepted-FFC NTC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
 static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
 static uint8_t  ffc_consec_reject = 0;        /* consecutive sanity-rejects */
@@ -866,13 +777,11 @@ enum FfcEventDecision : uint8_t {
  *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
  *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
  *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
- *    [PX_CNT+19 .. +20] model NTC reference u16   BE (0 before first FFC)
+ *    [PX_CNT+19 .. +20] ffc_last_ntc        u16   BE (0 before first FFC)
  *    [PX_CNT+21 .. +22] cur_ntc             u16   BE
  *    [PX_CNT+23]         last FFC/NUC event decision
  *    [PX_CNT+24]         ffc_count after the last accepted NUC
  *    [PX_CNT+25 .. +26] last NUC dg         i16   BE
- *      count=1: first shutter mean - factory low-reference mean
- *      count>1: current shutter mean - previous accepted shutter mean
  *    [PX_CNT+27 .. +28] last NUC dv         i16   BE
  *    [PX_CNT+29 .. +30] last NUC dn         i16   BE
  *    [PX_CNT+31 .. +32] boot_ntc            u16   BE
@@ -886,8 +795,16 @@ enum FfcEventDecision : uint8_t {
  *    [PX_CNT+49 .. +50] center 5x5 temp     i16   BE (x0.1°C, raw corrected ADU)
  *    [PX_CNT+51 .. +52] center raw ADU      u16   BE
  *    [PX_CNT+53 .. +54] center 5x5 ADU      u16   BE
+ *    [PX_CNT+55 .. +58] temperature low     f32   BE (degrees Celsius)
+ *    [PX_CNT+59 .. +62] temperature high    f32   BE (degrees Celsius)
+ *    [PX_CNT+63 .. +64] scene minimum        i16   BE (x0.1°C)
+ *    [PX_CNT+65 .. +66] scene maximum        i16   BE (x0.1°C)
+ *    [PX_CNT+67]         scene minimum X
+ *    [PX_CNT+68]         scene minimum Y
+ *    [PX_CNT+69]         scene maximum X
+ *    [PX_CNT+70]         scene maximum Y
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
-#define FRAME_DIAG_TAIL     48
+#define FRAME_DIAG_TAIL     64
 
 /* VTEMP EMA smoother (x256 fixed-point). The raw VTEMP register has
  * frame-to-frame ADC jitter of ~50–100 ADU (~0.7–1.4 °C-equivalent),
@@ -901,9 +818,7 @@ static volatile uint32_t g_vtemp_smooth_x256 = 0;
  * only when it is not rail-saturated. */
 static volatile uint16_t g_cur_ntc_adc = 0;
 static volatile uint32_t g_ntc_smooth_x256 = 0;
-static volatile uint16_t g_ntc_raw_adc = 0;
 static volatile uint16_t g_adc_temp_adc = 0;
-static volatile uint16_t g_boot_adc_temp_adc = 0;
 static volatile uint16_t g_adc_temp_cs_low16 = 0;
 static volatile uint16_t g_ntc_adc_cs_low16 = 0;
 #define ADC_DIAG_CFG_WORD \
@@ -912,6 +827,7 @@ static volatile uint16_t g_ntc_adc_cs_low16 = 0;
      | ((uint16_t)ADC_TEMPERATURE_CHANNEL_NUM))
 static volatile uint16_t g_adc_cfg_word = ADC_DIAG_CFG_WORD;
 #define NTC_ADC_SAMPLES 256
+#define NTC_ADC_DMA_TIMEOUT_MS 5
 #define NTC_FAST_TRACK_MS 60000u
 #define NTC_EMA_FAST_SHIFT 3
 #define NTC_EMA_SLOW_SHIFT 5
@@ -924,259 +840,9 @@ static volatile int16_t g_ffc_last_dg = 0;
 static volatile int16_t g_ffc_last_dv = 0;
 static volatile int16_t g_ffc_last_dn = 0;
 
-/* One-shot diagnostic firmware keeps the existing 19255-byte UART frame.
- * In THERMAL_COMP_MODEL_OFF, warmup_comp/normal_comp do not drive the image,
- * so those two i16 fields carry a tagged slot/value pair instead.  Twenty-five
- * slots complete every 2.5 s at 10 fps and let the unchanged GUI record slow
- * thermal state plus shutter spatial state without knowing the serial adapter. */
-#define THERMAL_DIAG_MUX_TAG     (-32000)
-#define THERMAL_DIAG_VERSION     0x1601
-#define THERMAL_DIAG_ZONE_COUNT  9u
-enum ThermalDiagSlot : uint8_t {
-    THERMAL_DIAG_VERSION_SLOT = 0,
-    THERMAL_DIAG_UPTIME_DS,
-    THERMAL_DIAG_NTC_RAW,
-    THERMAL_DIAG_MCU_TEMP_ADC,
-    THERMAL_DIAG_VTEMP_ROW_SPAN,
-    THERMAL_DIAG_VTEMP_ROW_TB,
-    THERMAL_DIAG_BOOT_VTEMP,
-    THERMAL_DIAG_BOOT_VTEMP_ROW_SPAN,
-    THERMAL_DIAG_BOOT_VTEMP_ROW_TB,
-    THERMAL_DIAG_BOOT_MCU_TEMP_ADC,
-    THERMAL_DIAG_FFC_GLOBAL_ABS,
-    THERMAL_DIAG_FFC_ZONE_00,
-    THERMAL_DIAG_FFC_ZONE_01,
-    THERMAL_DIAG_FFC_ZONE_02,
-    THERMAL_DIAG_FFC_ZONE_10,
-    THERMAL_DIAG_FFC_ZONE_11,
-    THERMAL_DIAG_FFC_ZONE_12,
-    THERMAL_DIAG_FFC_ZONE_20,
-    THERMAL_DIAG_FFC_ZONE_21,
-    THERMAL_DIAG_FFC_ZONE_22,
-    THERMAL_DIAG_FFC_VTEMP_ROW_SPAN,
-    THERMAL_DIAG_FFC_VTEMP_ROW_TB,
-    THERMAL_DIAG_FFC_FRAME_MEAN_SPAN,
-    THERMAL_DIAG_FFC_VTEMP_FRAME_SPAN,
-    THERMAL_DIAG_FFC_DURATION_MS,
-    THERMAL_DIAG_SLOT_COUNT,
-};
-static uint8_t g_thermal_diag_mux_slot = 0;
-static volatile int16_t g_ffc_diag_global_abs = 0;
-static volatile int16_t g_ffc_diag_zone_abs[THERMAL_DIAG_ZONE_COUNT] = {0};
-static volatile uint16_t g_ffc_diag_vtemp_row_span = 0;
-static volatile int16_t g_ffc_diag_vtemp_row_tb = 0;
-static volatile uint16_t g_ffc_diag_frame_mean_span = 0;
-static volatile uint16_t g_ffc_diag_vtemp_frame_span = 0;
-static volatile uint16_t g_ffc_diag_duration_ms = 0;
-
 static inline bool ntc_adc_valid(uint16_t v)
 {
     return v > 8 && v < 4088;
-}
-
-struct ThermalV2Selection {
-    uint8_t lo;
-    uint8_t hi;
-    uint16_t weight_q15;
-};
-
-static struct ThermalV2Selection thermal_v2_select(uint16_t ntc)
-{
-    struct ThermalV2Selection sel = {0, 0, 0};
-    if (!g_thermal_v2_valid || !ntc_adc_valid(ntc)) {
-        return sel;
-    }
-
-    if (ntc >= flash_thermal_v2_header->ntc_adu[0]) {
-        return sel;
-    }
-    if (ntc
-        <= flash_thermal_v2_header->ntc_adu[THERMAL_V2_MAP_COUNT - 1]) {
-        sel.lo = THERMAL_V2_MAP_COUNT - 1;
-        sel.hi = sel.lo;
-        return sel;
-    }
-
-    for (uint8_t i = 0; i < THERMAL_V2_MAP_COUNT - 1u; ++i) {
-        const uint16_t knot_lo = flash_thermal_v2_header->ntc_adu[i];
-        const uint16_t knot_hi = flash_thermal_v2_header->ntc_adu[i + 1];
-        if (ntc <= knot_lo && ntc >= knot_hi) {
-            const uint32_t span = (uint32_t)knot_lo - knot_hi;
-            const uint32_t offset = (uint32_t)knot_lo - ntc;
-            sel.lo = i;
-            sel.hi = i + 1;
-            sel.weight_q15 = (uint16_t)(
-                (offset * 32768u + span / 2u) / span);
-            return sel;
-        }
-    }
-    return sel;
-}
-
-static inline int32_t thermal_v2_interp_i16(
-    int16_t lo, int16_t hi, uint16_t weight_q15)
-{
-    const int32_t delta = (int32_t)hi - (int32_t)lo;
-    int32_t scaled = delta * (int32_t)weight_q15;
-    if (scaled >= 0) {
-        scaled = (scaled + 16384) >> 15;
-    } else {
-        scaled = -((-scaled + 16384) >> 15);
-    }
-    return (int32_t)lo + scaled;
-}
-
-static inline int32_t thermal_v2_residual_for_pixel(
-    const struct ThermalV2Selection* sel, size_t pixel)
-{
-    const int16_t lo = flash_thermal_v2_maps[sel->lo][pixel];
-    if (sel->lo == sel->hi) {
-        return lo;
-    }
-    return thermal_v2_interp_i16(
-        lo, flash_thermal_v2_maps[sel->hi][pixel], sel->weight_q15);
-}
-
-static int32_t thermal_v2_anchor_for_ntc(uint16_t ntc)
-{
-    if (!g_thermal_v2_valid || !ffc_done_first || !ntc_adc_valid(ntc)) {
-        return 0;
-    }
-    const struct ThermalV2Selection sel = thermal_v2_select(ntc);
-    const int16_t lo = flash_thermal_v2_header->global_anchor_adu[sel.lo];
-    if (sel.lo == sel.hi) {
-        return lo;
-    }
-    return thermal_v2_interp_i16(
-        lo,
-        flash_thermal_v2_header->global_anchor_adu[sel.hi],
-        sel.weight_q15);
-}
-
-static int32_t thermal_comp_state_linear_value_for_ntc(uint16_t cur_ntc)
-{
-    int32_t bounded_ntc = cur_ntc;
-    if (bounded_ntc < THERMAL_COMP_STATE_NTC_MIN_ADU) {
-        bounded_ntc = THERMAL_COMP_STATE_NTC_MIN_ADU;
-    } else if (bounded_ntc > THERMAL_COMP_STATE_NTC_MAX_ADU) {
-        bounded_ntc = THERMAL_COMP_STATE_NTC_MAX_ADU;
-    }
-
-    int32_t scaled =
-        (bounded_ntc - THERMAL_COMP_STATE_NTC_REF_ADU)
-        * THERMAL_COMP_STATE_SLOPE_Q8;
-    if (scaled >= 0) {
-        scaled = (scaled + 128) / 256;
-    } else {
-        scaled = -((-scaled + 128) / 256);
-    }
-
-    int32_t comp = THERMAL_COMP_STATE_AT_REF_ADU + scaled;
-    if (comp > THERMAL_COMP_STATE_LIMIT_ADU) {
-        comp = THERMAL_COMP_STATE_LIMIT_ADU;
-    } else if (comp < -THERMAL_COMP_STATE_LIMIT_ADU) {
-        comp = -THERMAL_COMP_STATE_LIMIT_ADU;
-    }
-    return comp;
-}
-
-static int32_t thermal_comp_interp_rounded(
-    int32_t x,
-    int32_t x0,
-    int32_t y0,
-    int32_t x1,
-    int32_t y1)
-{
-    const int32_t span = x1 - x0;
-    const int32_t offset = x - x0;
-    const int32_t delta = y1 - y0;
-    return y0 + (offset * delta + span / 2) / span;
-}
-
-static int32_t thermal_comp_state_pwl50_value_for_ntc(uint16_t cur_ntc)
-{
-    const int32_t ntc = cur_ntc;
-    if (ntc >= THERMAL_COMP_PWL_NTC_JOIN_ADU) {
-        return thermal_comp_state_linear_value_for_ntc(cur_ntc);
-    }
-    if (ntc <= THERMAL_COMP_PWL_NTC_LOW_ADU) {
-        return THERMAL_COMP_PWL_AT_LOW_ADU;
-    }
-    if (ntc <= THERMAL_COMP_PWL_NTC_MID_ADU) {
-        return thermal_comp_interp_rounded(
-            ntc,
-            THERMAL_COMP_PWL_NTC_LOW_ADU,
-            THERMAL_COMP_PWL_AT_LOW_ADU,
-            THERMAL_COMP_PWL_NTC_MID_ADU,
-            THERMAL_COMP_PWL_AT_MID_ADU);
-    }
-    return thermal_comp_interp_rounded(
-        ntc,
-        THERMAL_COMP_PWL_NTC_MID_ADU,
-        THERMAL_COMP_PWL_AT_MID_ADU,
-        THERMAL_COMP_PWL_NTC_JOIN_ADU,
-        THERMAL_COMP_PWL_AT_JOIN_ADU);
-}
-
-/* Absolute thermal-state anchor correction. Unlike TABLE this is independent
- * of boot time, so a cold start and a hot RST at the same board temperature
- * receive the same correction. The fit is valid only after the first accepted
- * shutter FFC; before that the loaded factory background may not represent the
- * current shutter state and the temperature remains in its calibration phase. */
-static int32_t thermal_comp_state_for_ntc(uint16_t cur_ntc)
-{
-    if (!thermal_comp_state_enabled()
-        || !ffc_done_first
-        || !ntc_adc_valid(cur_ntc)) {
-        return 0;
-    }
-
-    if (THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_STATE_PWL50_TEST) {
-        return thermal_comp_state_pwl50_value_for_ntc(cur_ntc);
-    }
-    return thermal_comp_state_linear_value_for_ntc(cur_ntc);
-}
-
-/* Per-core cold-warmup correction referenced to the first accepted FFC.
- * Only a falling NTC ADC code is compensated: hot-RST noise and cooling stay
- * inside the deadband or on the inactive side. */
-static int32_t thermal_comp_relative_ntc_for(uint16_t cur_ntc)
-{
-    if (!thermal_comp_relative_ntc_enabled()
-        || !ntc_adc_valid(thermal_comp_ntc_ref)
-        || !ntc_adc_valid(cur_ntc)) {
-        return 0;
-    }
-
-    int32_t delta = (int32_t)thermal_comp_ntc_ref - (int32_t)cur_ntc;
-    if (delta <= THERMAL_COMP_REL_NTC_DEADBAND_ADU) {
-        return 0;
-    }
-    delta -= THERMAL_COMP_REL_NTC_DEADBAND_ADU;
-
-    int32_t comp =
-        (delta * THERMAL_COMP_REL_NTC_SLOPE_Q8 + 128) / 256;
-    if (comp > THERMAL_COMP_REL_NTC_LIMIT_ADU) {
-        comp = THERMAL_COMP_REL_NTC_LIMIT_ADU;
-    }
-    return -comp;
-}
-
-static int32_t thermal_global_comp_for(uint16_t cur_ntc)
-{
-    if (thermal_comp_pixel_nuc_v2_enabled()) {
-        return thermal_v2_anchor_for_ntc(cur_ntc);
-    }
-    if (thermal_comp_table_enabled()) {
-        return thermal_comp_table_for_now();
-    }
-    if (thermal_comp_state_enabled()) {
-        return thermal_comp_state_for_ntc(cur_ntc);
-    }
-    if (thermal_comp_relative_ntc_enabled()) {
-        return thermal_comp_relative_ntc_for(cur_ntc);
-    }
-    return 0;
 }
 
 static bool ffc_vtemp_ntc_plausible(
@@ -1369,90 +1035,6 @@ static uint16_t center_roi_mean_u14(const uint16_t* img, int radius)
     return count != 0 ? (uint16_t)(sum / count) : img[(uint32_t)cy * SENSOR_W + (uint32_t)cx];
 }
 
-static int32_t thermal_diag_roi_mean_u32(
-    const uint32_t* img, int cx, int cy, int radius)
-{
-    uint32_t sum = 0;
-    uint32_t count = 0;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        const int y = cy + dy;
-        for (int dx = -radius; dx <= radius; ++dx) {
-            const int x = cx + dx;
-            sum += img[(uint32_t)y * SENSOR_W + (uint32_t)x];
-            count++;
-        }
-    }
-    return count != 0 ? (int32_t)(sum / count) : 0;
-}
-
-static int32_t thermal_diag_roi_mean_u16(
-    const uint16_t* img, int cx, int cy, int radius)
-{
-    uint32_t sum = 0;
-    uint32_t count = 0;
-    for (int dy = -radius; dy <= radius; ++dy) {
-        const int y = cy + dy;
-        for (int dx = -radius; dx <= radius; ++dx) {
-            const int x = cx + dx;
-            sum += img[(uint32_t)y * SENSOR_W + (uint32_t)x];
-            count++;
-        }
-    }
-    return count != 0 ? (int32_t)(sum / count) : 0;
-}
-
-static int16_t thermal_diag_mux_value(
-    uint8_t slot, uint16_t frame_vtemp_span, int16_t frame_vtemp_tb)
-{
-    if (slot >= THERMAL_DIAG_FFC_ZONE_00
-        && slot <= THERMAL_DIAG_FFC_ZONE_22) {
-        return g_ffc_diag_zone_abs[slot - THERMAL_DIAG_FFC_ZONE_00];
-    }
-
-    switch (slot) {
-        case THERMAL_DIAG_VERSION_SLOT:
-            return THERMAL_DIAG_VERSION;
-        case THERMAL_DIAG_UPTIME_DS: {
-            uint32_t uptime_ds =
-                to_ms_since_boot(get_absolute_time()) / 100u;
-            if (uptime_ds > INT16_MAX) {
-                uptime_ds = INT16_MAX;
-            }
-            return (int16_t)uptime_ds;
-        }
-        case THERMAL_DIAG_NTC_RAW:
-            return (int16_t)g_ntc_raw_adc;
-        case THERMAL_DIAG_MCU_TEMP_ADC:
-            return (int16_t)g_adc_temp_adc;
-        case THERMAL_DIAG_VTEMP_ROW_SPAN:
-            return (int16_t)frame_vtemp_span;
-        case THERMAL_DIAG_VTEMP_ROW_TB:
-            return frame_vtemp_tb;
-        case THERMAL_DIAG_BOOT_VTEMP:
-            return (int16_t)g_boot_vtemp_mean;
-        case THERMAL_DIAG_BOOT_VTEMP_ROW_SPAN:
-            return (int16_t)g_boot_vtemp_span;
-        case THERMAL_DIAG_BOOT_VTEMP_ROW_TB:
-            return g_boot_vtemp_tb;
-        case THERMAL_DIAG_BOOT_MCU_TEMP_ADC:
-            return (int16_t)g_boot_adc_temp_adc;
-        case THERMAL_DIAG_FFC_GLOBAL_ABS:
-            return g_ffc_diag_global_abs;
-        case THERMAL_DIAG_FFC_VTEMP_ROW_SPAN:
-            return (int16_t)g_ffc_diag_vtemp_row_span;
-        case THERMAL_DIAG_FFC_VTEMP_ROW_TB:
-            return g_ffc_diag_vtemp_row_tb;
-        case THERMAL_DIAG_FFC_FRAME_MEAN_SPAN:
-            return (int16_t)g_ffc_diag_frame_mean_span;
-        case THERMAL_DIAG_FFC_VTEMP_FRAME_SPAN:
-            return (int16_t)g_ffc_diag_vtemp_frame_span;
-        case THERMAL_DIAG_FFC_DURATION_MS:
-            return (int16_t)g_ffc_diag_duration_ms;
-        default:
-            return 0;
-    }
-}
-
 static void ffc_record_event(uint8_t decision,
                              int32_t dg,
                              int32_t dv,
@@ -1542,7 +1124,21 @@ static uint16_t adc_read_dma_trimmed_input(uint input)
                           false);
     adc_run(true);
     dma_channel_start(ntc_adc_dma_chan);
-    dma_channel_wait_for_finish_blocking(ntc_adc_dma_chan);
+
+    /* Never let an ADC/DREQ fault starve TinyUSB and the lwIP timers. The
+     * nominal 256-sample conversion takes well below 1 ms; 5 ms leaves ample
+     * margin while keeping the NCM data plane alive during the wait. */
+    const absolute_time_t deadline =
+        make_timeout_time_ms(NTC_ADC_DMA_TIMEOUT_MS);
+    while (dma_channel_is_busy(ntc_adc_dma_chan)) {
+        thermal_ncm_task();
+        if (time_reached(deadline)) {
+            adc_run(false);
+            dma_channel_abort(ntc_adc_dma_chan);
+            adc_fifo_drain();
+            return 0;
+        }
+    }
     adc_run(false);
     adc_fifo_drain();
 
@@ -1582,7 +1178,6 @@ static inline void ntc_tick(void)
 
     const uint16_t v = ntc_read_avg(4);
     if (!ntc_adc_valid(v)) return;
-    g_ntc_raw_adc = v;
 
     if (!ntc_adc_valid(boot_ntc)) {
         boot_ntc = v;
@@ -1615,17 +1210,6 @@ static void adc_probe_core(void)
     g_adc_cfg_word = ADC_DIAG_CFG_WORD;
 
     adc_select_input(ADC_CH_NTC);
-}
-
-static inline void adc_temp_tick(void)
-{
-    static uint32_t last_ms = 0;
-    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    if ((uint32_t)(now_ms - last_ms) < 1000u) {
-        return;
-    }
-    last_ms = now_ms;
-    adc_probe_core();
 }
 
 static inline __attribute__((always_inline)) void normalize_frame_be(
@@ -1873,6 +1457,7 @@ static inline uint16_t display_detail_boost_u14(
     return clip_u16((int32_t)img[idx] + (detail >> 1));
 }
 
+#if !THERMAL_NCM_MODE
 static inline __attribute__((always_inline)) void raw16_decode_to_normbuf(
     const uint8_t* raw, uint8_t* out, [[maybe_unused]] size_t size)
 {
@@ -1898,6 +1483,7 @@ static inline __attribute__((always_inline)) void raw16_decode_to_normbuf(
     const uint8_t* adc = raw + SENSOR_H * line_stride;
     memcpy(&dst[SENSOR_H * px_per_line * 2], adc, 2);
 }
+#endif
 
 static inline __attribute__((always_inline)) int cali_ref_stream(
     const uint8_t* raw_h,
@@ -2604,24 +2190,12 @@ void __not_in_flash_func(__flash_erase_cali__)(void* param)
     flash_range_erase(FLASH_TARGET_OFFSET, FLASH_SECTOR_SIZE);
 }
 
-struct FlashEraseSectorInfo {
-    uint32_t ofs;
-};
-
-void __not_in_flash_func(__flash_erase_sector__)(void* param)
-{
-    const struct FlashEraseSectorInfo* info =
-        (const struct FlashEraseSectorInfo*)param;
-    if (info == nullptr) {
-        return;
-    }
-    flash_range_erase(FLASH_TARGET_OFFSET + info->ofs, FLASH_SECTOR_SIZE);
-}
-
 void __not_in_flash_func(__flash_write2__)(void* param)
 {
     const struct FlashOpInfo* opinfo = (const struct FlashOpInfo*)param;
-    if (opinfo == nullptr) {
+    if (opinfo == nullptr
+        || opinfo->ofs > FLASH_CALIBRATION_DATA_SIZE
+        || opinfo->size > FLASH_CALIBRATION_DATA_SIZE - opinfo->ofs) {
         return;
     }
     const uint32_t ofs = FLASH_TARGET_OFFSET + opinfo->ofs;
@@ -2638,6 +2212,18 @@ static inline __attribute__((always_inline)) void* hidep(void* ptr)
 static inline __attribute__((always_inline)) bool flash_write2(
     const struct FlashOpInfo* flashop)
 {
+    if (flashop == nullptr || flashop->data == nullptr || flashop->size == 0
+        || flashop->ofs % FLASH_SECTOR_SIZE != 0
+        || flashop->ofs > FLASH_CALIBRATION_DATA_SIZE
+        || flashop->size > FLASH_CALIBRATION_DATA_SIZE - flashop->ofs) {
+        return false;
+    }
+    const uint32_t erase_size =
+        (flashop->size + FLASH_SECTOR_SIZE - 1u)
+        & ~(FLASH_SECTOR_SIZE - 1u);
+    if (erase_size > FLASH_CALIBRATION_DATA_SIZE - flashop->ofs) {
+        return false;
+    }
     static uint8_t buffer[FLASH_SECTOR_SIZE];
     int rc = -1;
     const uint32_t fsector = flashop->size / FLASH_SECTOR_SIZE;
@@ -2979,967 +2565,6 @@ static inline __attribute__((always_inline)) bool dump_cli()
     return true;
 }
 
-static uint32_t crc32_ieee_accumulate(
-    uint32_t crc, const uint8_t* data, size_t size)
-{
-    for (size_t i = 0; i < size; ++i) {
-        crc ^= data[i];
-        for (uint8_t bit = 0; bit < 8; ++bit) {
-            const uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
-        }
-    }
-    return crc;
-}
-
-static uint32_t crc32_ieee(const uint8_t* data, size_t size)
-{
-    return crc32_ieee_accumulate(0xFFFFFFFFu, data, size) ^ 0xFFFFFFFFu;
-}
-
-static void uart_write_service_usb(const uint8_t* data, size_t size)
-{
-    while (size != 0) {
-        const size_t chunk = size > 512u ? 512u : size;
-        uart_write_blocking(OUART, data, chunk);
-        data += chunk;
-        size -= chunk;
-        if (dataomode == DOM_UVC) {
-            tud_task();
-        }
-    }
-}
-
-static bool thermal_v2_info_semantically_valid(
-    const struct ThermalV2Info* info)
-{
-    static const uint32_t expected_ofs[THERMAL_V2_MAP_COUNT] = {
-        FLASH_OFS_THERMAL_V2_MAP0,
-        FLASH_OFS_THERMAL_V2_MAP1,
-        FLASH_OFS_THERMAL_V2_MAP2,
-        FLASH_OFS_THERMAL_V2_MAP3,
-    };
-    if (info == nullptr
-        || info->magic != THERMAL_V2_MAGIC
-        || info->version != THERMAL_V2_VERSION
-        || info->header_size != sizeof(struct ThermalV2Info)
-        || (info->flags & THERMAL_V2_FLAG_VALID) == 0
-        || info->payload_size
-               != THERMAL_V2_MAP_COUNT * THERMAL_V2_MAP_SIZE
-        || info->width != SENSOR_W
-        || info->height != SENSOR_H
-        || info->map_count != THERMAL_V2_MAP_COUNT
-        || info->state_axis != THERMAL_V2_STATE_AXIS_NTC
-        || info->map_size != THERMAL_V2_MAP_SIZE) {
-        return false;
-    }
-    for (uint8_t i = 0; i < THERMAL_V2_MAP_COUNT; ++i) {
-        if (info->map_ofs[i] != expected_ofs[i]
-            || !ntc_adc_valid(info->ntc_adu[i])
-            || i32_abs(info->global_anchor_adu[i]) > 600) {
-            return false;
-        }
-        if (i != 0 && info->ntc_adu[i - 1] <= info->ntc_adu[i]) {
-            return false;
-        }
-    }
-    return info->header_crc32
-           == crc32_ieee((const uint8_t*)info,
-                         offsetof(struct ThermalV2Info, header_crc32));
-}
-
-static bool thermal_v2_map_values_valid(const int16_t* map, uint8_t index)
-{
-    if (map == nullptr) {
-        return false;
-    }
-    for (size_t i = 0; i < PX_CNT; ++i) {
-        const int32_t value = map[i];
-        if (i32_abs(value) > 2048 || (index == 0 && value != 0)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool thermal_v2_validate_flash(void)
-{
-    const struct ThermalV2Info* info = flash_thermal_v2_header;
-    if (!thermal_v2_info_semantically_valid(info)) {
-        return false;
-    }
-    uint32_t payload_crc = 0xFFFFFFFFu;
-    for (uint8_t i = 0; i < THERMAL_V2_MAP_COUNT; ++i) {
-        const uint8_t* map = (const uint8_t*)flash_thermal_v2_maps[i];
-        if (!thermal_v2_map_values_valid(flash_thermal_v2_maps[i], i)
-            || crc32_ieee(map, THERMAL_V2_MAP_SIZE)
-                   != info->map_crc32[i]) {
-            return false;
-        }
-        payload_crc = crc32_ieee_accumulate(
-            payload_crc, map, THERMAL_V2_MAP_SIZE);
-    }
-    return (payload_crc ^ 0xFFFFFFFFu) == info->payload_crc32;
-}
-
-static bool uart_read_exact_service_usb(
-    uint8_t* data, size_t size, uint32_t timeout_ms)
-{
-    const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
-    while (size != 0) {
-        if (uart_is_readable(OUART)) {
-            *data++ = uart_getc(OUART);
-            size--;
-            continue;
-        }
-        if (time_reached(deadline)) {
-            return false;
-        }
-        if (dataomode == DOM_UVC) {
-            tud_task();
-        }
-        tight_loop_contents();
-    }
-    return true;
-}
-
-static void thermal_v2_write_reply(
-    uint8_t status, uint8_t detail, uint32_t payload_crc, uint32_t header_crc)
-{
-    const struct ThermalV2WriteReply reply = {
-        .magic = {'T', 'N', 'V', 'W'},
-        .version = THERMAL_V2_VERSION,
-        .status = status,
-        .detail = detail,
-        .payload_crc32 = payload_crc,
-        .header_crc32 = header_crc,
-    };
-    uart_write_blocking(OUART, (const uint8_t*)&reply, sizeof(reply));
-    uart_tx_wait_blocking(OUART);
-}
-
-static void dump_static_calibration(void)
-{
-    while (dma_busy) {
-        if (dataomode == DOM_UVC) {
-            tud_task();
-        }
-        tight_loop_contents();
-    }
-    uart_tx_wait_blocking(OUART);
-    if (flash_header->has_data != FLASH_HAS_DATA_F
-        || flash_header->gain_size != PX_CNT * sizeof(float)) {
-        send_cali_error_with_str(ERR_FLASH_EMPTY);
-        return;
-    }
-
-    struct StaticCalDumpHeader header = {
-        .magic = {'T', 'N', 'C', 'S'},
-        .version = 1,
-        .header_size = sizeof(struct StaticCalDumpHeader),
-        .width = SENSOR_W,
-        .height = SENSOR_H,
-        .gain_size = flash_header->gain_size,
-        .gain_crc32 = crc32_ieee(
-            (const uint8_t*)flash_gain, flash_header->gain_size),
-        .mean_diff = flash_header->mean_diff,
-        .t_ref_low = flash_header->t_ref_low,
-        .header_crc32 = 0,
-    };
-    header.header_crc32 = crc32_ieee(
-        (const uint8_t*)&header,
-        offsetof(struct StaticCalDumpHeader, header_crc32));
-    uart_write_service_usb((const uint8_t*)&header, sizeof(header));
-    uart_write_service_usb(
-        (const uint8_t*)flash_gain, flash_header->gain_size);
-    uart_tx_wait_blocking(OUART);
-}
-
-static void stop_uart_tx_dma_for_flash(void)
-{
-    const absolute_time_t dma_deadline =
-        make_timeout_time_ms(1000u);
-
-    while (dma_busy && !time_reached(dma_deadline)) {
-        if (dataomode == DOM_UVC) {
-            tud_task();
-        }
-        tight_loop_contents();
-    }
-
-    if (dma_busy) {
-        dma_channel_abort(uart_tx_dma_chan);
-
-        while (dma_channel_is_busy(uart_tx_dma_chan)) {
-            tight_loop_contents();
-        }
-
-        dma_hw->ints1 = 1u << uart_tx_dma_chan;
-
-        if (sending >= 0 && sending < TXBUF_CNT) {
-            tx_state[sending] = TXBUF_FREE;
-        }
-
-        sending = -1;
-        newest_ready = -1;
-        dma_busy = 0;
-        __dmb();
-    }
-    uart_tx_wait_blocking(OUART);
-}
-
-static void static_cal_v1_write_reply(
-    uint8_t status,
-    uint8_t detail,
-    uint32_t payload_crc,
-    uint32_t header_crc,
-    uint32_t flash_header_crc)
-{
-    const struct StaticCalV1WriteReply reply = {
-        .magic = {'T', 'N', 'C', 'W'},
-        .version = 1,
-        .status = status,
-        .detail = detail,
-        .payload_crc32 = payload_crc,
-        .header_crc32 = header_crc,
-        .flash_header_crc32 = flash_header_crc,
-    };
-    uart_write_blocking(OUART, (const uint8_t*)&reply, sizeof(reply));
-    uart_tx_wait_blocking(OUART);
-}
-
-static bool static_cal_v1_header_valid(
-    const struct StaticCalV1WriteHeader* header)
-{
-    if (header == nullptr
-        || memcmp(header->magic, "TNC1", 4) != 0
-        || header->version != 1
-        || header->header_size != sizeof(struct StaticCalV1WriteHeader)
-        || header->width != SENSOR_W
-        || header->height != SENSOR_H
-        || header->badpts_num != MAX_BADPT
-        || header->flags != 0
-        || header->imgbg_size != PX_CNT * sizeof(uint16_t)
-        || header->gain_size != PX_CNT * sizeof(float)
-        || header->badpts_size != MAX_BADPT * sizeof(struct BadPt)
-        || !isfinite(header->mean_diff)
-        || header->mean_diff <= 0.0f
-        || header->mean_diff > 16383.0f
-        || !isfinite(header->t_ref_low)
-        || header->t_ref_low <= -273.15f
-        || header->t_ref_low >= T_REF_HIGH
-        || header->header_crc32
-               != crc32_ieee(
-                   (const uint8_t*)header,
-                   offsetof(struct StaticCalV1WriteHeader, header_crc32))) {
-        return false;
-    }
-    for (size_t i = 0; i < sizeof(header->reserved); ++i) {
-        if (header->reserved[i] != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool static_cal_v1_background_valid(const uint8_t* data, size_t size)
-{
-    if (data == nullptr || size != PX_CNT * sizeof(uint16_t)) {
-        return false;
-    }
-    const uint16_t* pixels = (const uint16_t*)data;
-    for (size_t i = 0; i < PX_CNT; ++i) {
-        if (pixels[i] > 0x3fffu) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool static_cal_v1_gain_valid(const uint8_t* data, size_t size)
-{
-    if (data == nullptr || size != PX_CNT * sizeof(float)) {
-        return false;
-    }
-    const float* gain = (const float*)data;
-    for (size_t i = 0; i < PX_CNT; ++i) {
-        if (!isfinite(gain[i]) || gain[i] < 0.2f || gain[i] > 4.0f) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool static_cal_v1_badpts_valid(const struct BadPt* badpts)
-{
-    if (badpts == nullptr) {
-        return false;
-    }
-    bool saw_empty = false;
-    for (size_t i = 0; i < MAX_BADPT; ++i) {
-        const bool empty = badpts[i].x == UINT8_MAX
-                           && badpts[i].y == UINT8_MAX;
-        if (empty) {
-            saw_empty = true;
-            continue;
-        }
-        if (saw_empty
-            || badpts[i].x >= SENSOR_W
-            || badpts[i].y >= SENSOR_H) {
-            return false;
-        }
-        for (size_t j = 0; j < i; ++j) {
-            if (badpts[j].x == badpts[i].x
-                && badpts[j].y == badpts[i].y) {
-                return false;
-            }
-            const int dx = (int)badpts[j].x - (int)badpts[i].x;
-            const int dy = (int)badpts[j].y - (int)badpts[i].y;
-            if (abs(dx) <= 1 && abs(dy) <= 1) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-static bool static_cal_v1_program_and_verify(
-    uint32_t ofs,
-    uint8_t* data,
-    uint32_t size,
-    uint32_t expected_crc)
-{
-    struct FlashOpInfo op = {
-        .ofs = ofs,
-        .size = size,
-        .data = data,
-    };
-    for (uint8_t attempt = 0; attempt < FLASH_RETRY_MAX; ++attempt) {
-        if (flash_write2(&op)
-            && crc32_ieee(flash_target_contents + ofs, size) == expected_crc) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool write_static_cal_v1_from_uart(void)
-{
-    stop_uart_tx_dma_for_flash();
-
-    static_cal_v1_write_reply(
-        STATIC_CAL_V1_WRITE_READY_HEADER, 0, 0, 0, 0);
-    static struct StaticCalV1WriteHeader incoming;
-    if (!uart_read_exact_service_usb(
-            (uint8_t*)&incoming, sizeof(incoming), 3000u)) {
-        static_cal_v1_write_reply(STATIC_CAL_V1_WRITE_ERR_RX, 0, 0, 0, 0);
-        return false;
-    }
-    if (!static_cal_v1_header_valid(&incoming)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_HEADER,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    /* V1 has one fixed slot.  Invalidate its header before the first payload
-     * sector is changed and commit a valid header only after every section
-     * passes CRC and readback.  A power loss therefore leaves an explicitly
-     * invalid calibration instead of silently accepting a mixed payload. */
-    static struct FlashDataInfo invalid_header;
-    memset(&invalid_header, 0xFF, sizeof(invalid_header));
-    if (!static_cal_v1_program_and_verify(
-            FLASH_OFS_INFO,
-            (uint8_t*)&invalid_header,
-            sizeof(invalid_header),
-            crc32_ieee((const uint8_t*)&invalid_header,
-                       sizeof(invalid_header)))) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_FLASH,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    uint8_t* payload_buffer = (uint8_t*)&calib_workspace;
-    uint32_t payload_crc = 0xFFFFFFFFu;
-
-    static_cal_v1_write_reply(
-        STATIC_CAL_V1_WRITE_READY_IMGBG,
-        0,
-        incoming.payload_crc32,
-        incoming.header_crc32,
-        0);
-    if (!uart_read_exact_service_usb(
-            payload_buffer, incoming.imgbg_size, 5000u)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_RX,
-            1,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    if (crc32_ieee(payload_buffer, incoming.imgbg_size)
-            != incoming.imgbg_crc32
-        || !static_cal_v1_background_valid(
-            payload_buffer, incoming.imgbg_size)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_PAYLOAD_CRC,
-            1,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    payload_crc = crc32_ieee_accumulate(
-        payload_crc, payload_buffer, incoming.imgbg_size);
-    if (!static_cal_v1_program_and_verify(
-            FLASH_OFS_IMGBG,
-            payload_buffer,
-            incoming.imgbg_size,
-            incoming.imgbg_crc32)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_VERIFY,
-            1,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    static_cal_v1_write_reply(
-        STATIC_CAL_V1_WRITE_READY_GAIN,
-        0,
-        incoming.payload_crc32,
-        incoming.header_crc32,
-        0);
-    if (!uart_read_exact_service_usb(
-            payload_buffer, incoming.gain_size, 5000u)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_RX,
-            2,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    if (crc32_ieee(payload_buffer, incoming.gain_size)
-            != incoming.gain_crc32
-        || !static_cal_v1_gain_valid(payload_buffer, incoming.gain_size)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_SEMANTIC,
-            2,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    payload_crc = crc32_ieee_accumulate(
-        payload_crc, payload_buffer, incoming.gain_size);
-    if (!static_cal_v1_program_and_verify(
-            FLASH_OFS_GAIN,
-            payload_buffer,
-            incoming.gain_size,
-            incoming.gain_crc32)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_VERIFY,
-            2,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    static struct BadPt incoming_badpts[MAX_BADPT];
-    static_cal_v1_write_reply(
-        STATIC_CAL_V1_WRITE_READY_BADPTS,
-        0,
-        incoming.payload_crc32,
-        incoming.header_crc32,
-        0);
-    if (!uart_read_exact_service_usb(
-            (uint8_t*)incoming_badpts, incoming.badpts_size, 3000u)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_RX,
-            3,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    if (crc32_ieee((const uint8_t*)incoming_badpts, incoming.badpts_size)
-            != incoming.badpts_crc32
-        || !static_cal_v1_badpts_valid(incoming_badpts)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_SEMANTIC,
-            3,
-            incoming.payload_crc32,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    payload_crc = crc32_ieee_accumulate(
-        payload_crc, (const uint8_t*)incoming_badpts, incoming.badpts_size);
-    payload_crc ^= 0xFFFFFFFFu;
-    if (payload_crc != incoming.payload_crc32) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_PAYLOAD_CRC,
-            4,
-            payload_crc,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-    if (!static_cal_v1_program_and_verify(
-            FLASH_OFS_BADPTS,
-            (uint8_t*)incoming_badpts,
-            incoming.badpts_size,
-            incoming.badpts_crc32)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_VERIFY,
-            3,
-            payload_crc,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    static struct FlashDataInfo flash_info;
-    memset(&flash_info, 0, sizeof(flash_info));
-    flash_info.has_data = FLASH_HAS_DATA_F;
-    flash_info.imgbg_ofs = FLASH_OFS_IMGBG;
-    flash_info.imgbg_size = incoming.imgbg_size;
-    flash_info.badpts_ofs = FLASH_OFS_BADPTS;
-    flash_info.badpts_size = incoming.badpts_size;
-    flash_info.badpts_num = incoming.badpts_num;
-    flash_info.gain_ofs = FLASH_OFS_GAIN;
-    flash_info.gain_size = incoming.gain_size;
-    flash_info.mean_diff = incoming.mean_diff;
-    flash_info.t_ref_low = incoming.t_ref_low;
-    const uint32_t flash_header_crc = crc32_ieee(
-        (const uint8_t*)&flash_info, sizeof(flash_info));
-    if (!static_cal_v1_program_and_verify(
-            FLASH_OFS_INFO,
-            (uint8_t*)&flash_info,
-            sizeof(flash_info),
-            flash_header_crc)) {
-        static_cal_v1_write_reply(
-            STATIC_CAL_V1_WRITE_ERR_VERIFY,
-            4,
-            payload_crc,
-            incoming.header_crc32,
-            0);
-        return false;
-    }
-
-    static_cal_v1_write_reply(
-        STATIC_CAL_V1_WRITE_OK,
-        0,
-        payload_crc,
-        incoming.header_crc32,
-        flash_header_crc);
-    return true;
-}
-
-static bool diagnose_thermal_v2_header_flash(void)
-{
-    /* This is deliberately the same first Flash operation used by the V2
-     * writer: erase the V2 header sector and program it with 0xff.  It keeps
-     * V1 and every map sector untouched, and leaves V2 invalid by design. */
-    static uint8_t invalid[FLASH_SECTOR_SIZE];
-    memset(invalid, 0xFF, sizeof(invalid));
-    g_thermal_v2_valid = false;
-
-    struct FlashOpInfo op = {
-        .ofs = FLASH_OFS_THERMAL_V2_INFO,
-        .size = sizeof(invalid),
-        .data = invalid,
-    };
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_DIAG_FLASH_BEGIN, 0, 0, 0);
-    const int rc = flash_safe_execute(__flash_write2__, (void*)&op, 500u);
-    if (rc != PICO_OK) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_FLASH, 1, (uint32_t)rc, 0);
-        return false;
-    }
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_DIAG_FLASH_RETURNED, 0, 0, 0);
-    if (memcmp(flash_target_contents + FLASH_OFS_THERMAL_V2_INFO,
-               invalid,
-               sizeof(invalid)) != 0) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_VERIFY, 2, 0, 0);
-        return false;
-    }
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_DIAG_FLASH_VERIFIED, 0, 0, 0);
-    return true;
-}
-
-static bool thermal_v2_flash_region_is_erased(uint32_t ofs, uint32_t size)
-{
-    const uint8_t* data = flash_target_contents + ofs;
-    for (uint32_t i = 0; i < size; ++i) {
-        if (data[i] != 0xffu) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool thermal_v2_erase_region(uint32_t ofs, uint32_t size)
-{
-    const uint32_t sectors =
-        (size + FLASH_SECTOR_SIZE - 1u) / FLASH_SECTOR_SIZE;
-    for (uint32_t sector = 0; sector < sectors; ++sector) {
-        const struct FlashEraseSectorInfo op = {
-            .ofs = ofs + sector * FLASH_SECTOR_SIZE,
-        };
-        if (flash_safe_execute(__flash_erase_sector__, (void*)&op, 500u)
-            != PICO_OK) {
-            return false;
-        }
-    }
-    return thermal_v2_flash_region_is_erased(
-        ofs, sectors * FLASH_SECTOR_SIZE);
-}
-
-/* F3 is the recovery boundary between V2 experiments and any V1 operation.
- * Invalidate V2 first, then erase all V2-only sectors; V1 addresses remain
- * untouched.  The caller reboots after the final reply so RAM is reloaded
- * from V1 instead of continuing with a V2-era runtime state. */
-static bool erase_thermal_v2_all(void)
-{
-    static const uint32_t map_ofs[THERMAL_V2_MAP_COUNT] = {
-        FLASH_OFS_THERMAL_V2_MAP0,
-        FLASH_OFS_THERMAL_V2_MAP1,
-        FLASH_OFS_THERMAL_V2_MAP2,
-        FLASH_OFS_THERMAL_V2_MAP3,
-    };
-
-    g_thermal_v2_valid = false;
-    g_last_calib = nullptr;
-    thermal_v2_write_reply(THERMAL_V2_WRITE_ERASE_BEGIN, 0, 0, 0);
-
-    if (!thermal_v2_erase_region(
-            FLASH_OFS_THERMAL_V2_INFO, FLASH_SECTOR_SIZE)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_FLASH, 0, 0, 0);
-        return false;
-    }
-
-    for (uint8_t i = 0; i < THERMAL_V2_MAP_COUNT; ++i) {
-        if (!thermal_v2_erase_region(
-                map_ofs[i], THERMAL_V2_MAP_SIZE)) {
-            thermal_v2_write_reply(
-                THERMAL_V2_WRITE_ERR_FLASH, (uint8_t)(i + 1u), 0, 0);
-            return false;
-        }
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERASE_MAP_VERIFIED, i, 0, 0);
-    }
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_ERASE_VERIFIED, 0, 0, 0);
-    return true;
-}
-
-static void report_thermal_v2_status(void)
-{
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_STATUS, g_thermal_v2_valid ? 1u : 0u, 0, 0);
-}
-
-static bool diagnose_thermal_v2_header_transaction_from_uart(void)
-{
-    /* Reproduce the original V2 transaction up to, but not including, map0:
-     * receive the real 96-byte header, then use the same flash_write2()
-     * wrapper that invalidates the V2 header.  V1 and all map sectors remain
-     * untouched; the diagnostic deliberately leaves V2 invalid. */
-    thermal_v2_write_reply(THERMAL_V2_WRITE_DIAG_HEADER_READY, 0, 0, 0);
-
-    static struct ThermalV2Info incoming;
-    if (!uart_read_exact_service_usb(
-            (uint8_t*)&incoming, sizeof(incoming), 3000u)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_RX, 0, 0, 0);
-        return false;
-    }
-    if (flash_header->has_data != FLASH_HAS_DATA_F
-        || !thermal_v2_info_semantically_valid(&incoming)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_HEADER,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        return false;
-    }
-
-    static struct ThermalV2Info invalid;
-    memset(&invalid, 0xFF, sizeof(invalid));
-    g_thermal_v2_valid = false;
-    struct FlashOpInfo op = {
-        .ofs = FLASH_OFS_THERMAL_V2_INFO,
-        .size = sizeof(invalid),
-        .data = (uint8_t*)&invalid,
-    };
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_DIAG_WRAPPER_BEGIN, 0, 0, 0);
-    if (!flash_write2(&op)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_FLASH, 1, 0, 0);
-        return false;
-    }
-
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_DIAG_WRAPPER_VERIFIED, 0, 0, 0);
-    return true;
-}
-
-static bool diagnose_thermal_v2_map0_transaction_from_uart(void)
-{
-    /* Reproduce the V2 transaction through map0 receive/CRC, but deliberately
-     * stop before flash_range_program(map0).  This is the last host-to-device
-     * exchange absent from F1; V1 and every V2 map sector stay untouched. */
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_DIAG_MAP0_HEADER_READY, 0, 0, 0);
-
-    static struct ThermalV2Info incoming;
-    if (!uart_read_exact_service_usb(
-            (uint8_t*)&incoming, sizeof(incoming), 3000u)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_RX, 0, 0, 0);
-        return false;
-    }
-    if (flash_header->has_data != FLASH_HAS_DATA_F
-        || !thermal_v2_info_semantically_valid(&incoming)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_HEADER,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        return false;
-    }
-
-    static struct ThermalV2Info invalid;
-    memset(&invalid, 0xFF, sizeof(invalid));
-    g_thermal_v2_valid = false;
-    struct FlashOpInfo op = {
-        .ofs = FLASH_OFS_THERMAL_V2_INFO,
-        .size = sizeof(invalid),
-        .data = (uint8_t*)&invalid,
-    };
-    if (!flash_write2(&op)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_FLASH, 0, 0, 0);
-        return false;
-    }
-
-    uint8_t* map_buffer = calib_workspace.frames[0];
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_DIAG_MAP0_READY,
-        0,
-        incoming.payload_crc32,
-        incoming.header_crc32);
-    if (!uart_read_exact_service_usb(
-            map_buffer, THERMAL_V2_MAP_SIZE, 5000u)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_RX,
-            1,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        return false;
-    }
-    if (crc32_ieee(map_buffer, THERMAL_V2_MAP_SIZE)
-            != incoming.map_crc32[0]
-        || !thermal_v2_map_values_valid((const int16_t*)map_buffer, 0)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_MAP_CRC,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        return false;
-    }
-
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_DIAG_MAP0_VERIFIED,
-        0,
-        incoming.payload_crc32,
-        incoming.header_crc32);
-    return true;
-}
-
-static bool write_thermal_v2_from_uart(void)
-{
-    stop_uart_tx_dma_for_flash();
-
-    thermal_v2_write_reply(THERMAL_V2_WRITE_READY_HEADER, 0, 0, 0);
-    static struct ThermalV2Info incoming;
-    if (!uart_read_exact_service_usb(
-            (uint8_t*)&incoming, sizeof(incoming), 3000u)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_RX, 0, 0, 0);
-        return false;
-    }
-    if (flash_header->has_data != FLASH_HAS_DATA_F
-        || !thermal_v2_info_semantically_valid(&incoming)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_HEADER,
-            0,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        return false;
-    }
-
-    /* Invalidate V2 before touching any map.  A power loss from here until
-     * the final header commit falls back to the untouched V1 calibration. */
-    static struct ThermalV2Info invalid;
-    memset(&invalid, 0xFF, sizeof(invalid));
-    struct FlashOpInfo op = {
-        .ofs = FLASH_OFS_THERMAL_V2_INFO,
-        .size = sizeof(invalid),
-        .data = (uint8_t*)&invalid,
-    };
-    if (!flash_write2(&op)) {
-        thermal_v2_write_reply(THERMAL_V2_WRITE_ERR_FLASH, 0, 0, 0);
-        return false;
-    }
-
-    uint8_t* map_buffer = calib_workspace.frames[0];
-    uint32_t payload_crc = 0xFFFFFFFFu;
-    for (uint8_t i = 0; i < THERMAL_V2_MAP_COUNT; ++i) {
-        thermal_v2_write_reply(
-            (uint8_t)(THERMAL_V2_WRITE_READY_MAP0 + i),
-            i,
-            incoming.payload_crc32,
-            incoming.header_crc32);
-        if (!uart_read_exact_service_usb(
-                map_buffer, THERMAL_V2_MAP_SIZE, 5000u)) {
-            thermal_v2_write_reply(
-                THERMAL_V2_WRITE_ERR_RX,
-                i,
-                incoming.payload_crc32,
-                incoming.header_crc32);
-            return false;
-        }
-        if (crc32_ieee(map_buffer, THERMAL_V2_MAP_SIZE)
-                != incoming.map_crc32[i]
-            || !thermal_v2_map_values_valid((const int16_t*)map_buffer, i)) {
-            thermal_v2_write_reply(
-                THERMAL_V2_WRITE_ERR_MAP_CRC,
-                i,
-                incoming.payload_crc32,
-                incoming.header_crc32);
-            return false;
-        }
-        payload_crc = crc32_ieee_accumulate(
-            payload_crc, map_buffer, THERMAL_V2_MAP_SIZE);
-        op.ofs = incoming.map_ofs[i];
-        op.size = THERMAL_V2_MAP_SIZE;
-        op.data = map_buffer;
-        if (!flash_write2(&op)) {
-            thermal_v2_write_reply(
-                THERMAL_V2_WRITE_ERR_FLASH,
-                i,
-                incoming.payload_crc32,
-                incoming.header_crc32);
-            return false;
-        }
-        if (crc32_ieee(
-                (const uint8_t*)flash_thermal_v2_maps[i],
-                THERMAL_V2_MAP_SIZE)
-            != incoming.map_crc32[i]) {
-            thermal_v2_write_reply(
-                THERMAL_V2_WRITE_ERR_VERIFY,
-                i,
-                incoming.payload_crc32,
-                incoming.header_crc32);
-            return false;
-        }
-    }
-    payload_crc ^= 0xFFFFFFFFu;
-    if (payload_crc != incoming.payload_crc32) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_MAP_CRC,
-            THERMAL_V2_MAP_COUNT,
-            payload_crc,
-            incoming.header_crc32);
-        return false;
-    }
-
-    /* A byte-perfect payload is only a candidate.  Do not let CRC success
-     * immediately alter the live image or contaminate a later V1 operation.
-     * Persist the maps with an invalid header; a future, separately validated
-     * activation path must explicitly commit THERMAL_V2_FLAG_VALID. */
-    struct ThermalV2Info candidate = incoming;
-    candidate.flags &= ~THERMAL_V2_FLAG_VALID;
-    candidate.header_crc32 = crc32_ieee(
-        (const uint8_t*)&candidate,
-        offsetof(struct ThermalV2Info, header_crc32));
-    op.ofs = FLASH_OFS_THERMAL_V2_INFO;
-    op.size = sizeof(candidate);
-    op.data = (uint8_t*)&candidate;
-    if (!flash_write2(&op)) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_FLASH,
-            THERMAL_V2_MAP_COUNT,
-            payload_crc,
-            incoming.header_crc32);
-        return false;
-    }
-    g_thermal_v2_valid = false;
-    if (memcmp(flash_thermal_v2_header, &candidate, sizeof(candidate)) != 0
-        || thermal_v2_validate_flash()) {
-        thermal_v2_write_reply(
-            THERMAL_V2_WRITE_ERR_VERIFY,
-            THERMAL_V2_MAP_COUNT,
-            payload_crc,
-            incoming.header_crc32);
-        return false;
-    }
-    thermal_v2_write_reply(
-        THERMAL_V2_WRITE_CANDIDATE,
-        THERMAL_V2_MAP_COUNT,
-        payload_crc,
-        incoming.header_crc32);
-    return true;
-}
-
-static void dump_runtime_ffc_map(void)
-{
-    while (dma_busy) {
-        if (dataomode == DOM_UVC) {
-            tud_task();
-        }
-        tight_loop_contents();
-    }
-    uart_tx_wait_blocking(OUART);
-
-    const uint8_t* payload = (const uint8_t*)ram_calibg;
-    const uint32_t payload_size = (uint32_t)sizeof(ram_calibg);
-    const struct FfcMapDumpHeader header = {
-        .magic = {'T', 'N', 'F', 'M'},
-        .version = FFC_MAP_DUMP_VERSION,
-        .header_size = sizeof(struct FfcMapDumpHeader),
-        .width = SENSOR_W,
-        .height = SENSOR_H,
-        .payload_size = payload_size,
-        .payload_crc32 = crc32_ieee(payload, payload_size),
-        .temp_anchor = ram_temp_anchor,
-        .ntc = g_cur_ntc_adc,
-        .vtemp = (uint16_t)(g_vtemp_smooth_x256 >> 8),
-        .ffc_count = ffc_count,
-        .last_decision = g_ffc_last_decision,
-        .flags = (uint8_t)((ffc_done_first ? 0x01u : 0u)
-                           | (calibg == ram_calibg ? 0x02u : 0u)
-                           | ((THERMAL_COMP_MODEL & 0x0Fu) << 4)),
-        .uptime_ms = to_ms_since_boot(get_absolute_time()),
-    };
-
-    uart_write_service_usb((const uint8_t*)&header, sizeof(header));
-    uart_write_service_usb(payload, payload_size);
-    uart_tx_wait_blocking(OUART);
-}
-
 static inline __attribute__((always_inline)) void repair_bad_pixels(
     uint16_t* raw, const struct BadPt* pts, const int count)
 {
@@ -3990,27 +2615,26 @@ static inline __attribute__((always_inline)) void repair_bad_pixels(
 }
 
 static inline __attribute__((always_inline)) void binary_calib_frame(
-    const uint8_t* raw,
+    uint8_t* raw,
     const uint16_t* calib,
     const float* calig,
     const struct BadPt* calip,
     uint8_t* out,
-    const size_t px_cnt,
-    uint16_t frame_vtemp_span,
-    int16_t frame_vtemp_tb)
+    const size_t px_cnt)
 {
+    typedef uint16_t raw14_alias_t __attribute__((may_alias));
     static uint8_t gamma_lut[256];
-    static uint16_t raw14[PX_CNT];
+    /* Core1 owns this frame as RAWBUF_READING for the whole conversion.
+     * Reuse its pixel area as corrected-u14 scratch; trailing VTEMP remains
+     * outside RAWBUFSIZE and is read after conversion. */
+    static_assert(RAWBUFSIZE == PX_CNT * sizeof(uint16_t),
+                  "raw pixel area must fit the in-place u14 scratch");
+    static_assert(RAWBUFSIZETOTAL % __alignof__(uint16_t) == 0,
+                  "every raw frame must preserve u14 alignment");
+    raw14_alias_t* const raw14 = (raw14_alias_t*)raw;
 
     uint16_t low = 0, high = 0;
     bool debad = false;
-    const bool apply_thermal_v2_spatial =
-        thermal_comp_pixel_nuc_v2_enabled()
-        && g_thermal_v2_valid
-        && ffc_done_first
-        && ntc_adc_valid(g_cur_ntc_adc);
-    const struct ThermalV2Selection thermal_v2_sel =
-        thermal_v2_select(g_cur_ntc_adc);
 
     if (unlikely(calib != nullptr && calib != g_last_calib)) {
         uint64_t sum = 0;
@@ -4025,11 +2649,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         for (size_t i = 0; i < px_cnt; i++) {
             uint16_t r = be16_to_u14(&raw[i * 2]);
             r = gray14_to_bin(r);
-            const int32_t residual = apply_thermal_v2_spatial
-                ? thermal_v2_residual_for_pixel(&thermal_v2_sel, i)
-                : 0;
-            const int32_t diff = (int32_t)r - (int32_t)calib[i]
-                                 - residual + g_calib_mean;
+            const int32_t diff = (int32_t)r - (int32_t)calib[i] + g_calib_mean;
             raw14[i] = clip_u16(diff);
             if (dataomode == DOM_UVC && (i & 0x3FF) == 0) {
                 tud_task();
@@ -4040,11 +2660,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         for (size_t i = 0; i < px_cnt; i++) {
             uint16_t r = be16_to_u14(&raw[i * 2]);
             r = gray14_to_bin(r);
-            const int32_t residual = apply_thermal_v2_spatial
-                ? thermal_v2_residual_for_pixel(&thermal_v2_sel, i)
-                : 0;
-            const int32_t diff =
-                (int32_t)r - (int32_t)calib[i] - residual;
+            const int32_t diff = (int32_t)r - (int32_t)calib[i];
             const int32_t val =
                 (int32_t)(calig[i] * (float)diff) + g_calib_mean;
             raw14[i] = clip_u16(val);
@@ -4066,6 +2682,20 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         repair_bad_pixels(raw14, calip, MAX_BADPT);
         if (dataomode == DOM_UVC) {
             tud_task();
+        }
+    }
+    uint16_t scene_min_adu = UINT16_MAX;
+    uint16_t scene_max_adu = 0;
+    uint32_t scene_min_idx = 0;
+    uint32_t scene_max_idx = 0;
+    for (uint32_t i = 0; i < PX_CNT; ++i) {
+        if (raw14[i] < scene_min_adu) {
+            scene_min_adu = raw14[i];
+            scene_min_idx = i;
+        }
+        if (raw14[i] > scene_max_adu) {
+            scene_max_adu = raw14[i];
+            scene_max_idx = i;
         }
     }
     calc_percentile_u14(raw14, PX_CNT, &low, &high);
@@ -4154,8 +2784,8 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             if (comp >  K_COMP_MAX_ADU) comp =  K_COMP_MAX_ADU;
             if (comp < -K_COMP_MAX_ADU) comp = -K_COMP_MAX_ADU;
             eff_anchor += comp;
-        } else {
-            eff_anchor += thermal_global_comp_for(cur_ntc);
+        } else if (thermal_comp_table_enabled()) {
+            eff_anchor += thermal_comp_table_for_now();
         }
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
@@ -4187,6 +2817,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
                     : INT16_MAX;
     const int16_t center_roi_x10 =
         temp_map_ok ? temp_x10_from_corrected_adu(center_roi_adu, eff_anchor)
+                    : INT16_MAX;
+    const int16_t scene_min_x10 =
+        temp_map_ok ? temp_x10_from_corrected_adu(scene_min_adu, eff_anchor)
+                    : INT16_MAX;
+    const int16_t scene_max_x10 =
+        temp_map_ok ? temp_x10_from_corrected_adu(scene_max_adu, eff_anchor)
                     : INT16_MAX;
 
     /* Per-frame temperature-linear LUT: map the ADU-linear intensity 0..254
@@ -4278,9 +2914,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[PX_CNT + 16] = (uint8_t)(md_u >> 16);
     out[PX_CNT + 17] = (uint8_t)(md_u >>  8);
     out[PX_CNT + 18] = (uint8_t)(md_u      );
-    const uint16_t ntc_ref = thermal_comp_relative_ntc_enabled()
-                                 ? thermal_comp_ntc_ref
-                                 : ffc_last_ntc;
+    const uint16_t ntc_ref = ffc_last_ntc;
     out[PX_CNT + 19] = (uint8_t)(ntc_ref >> 8);
     out[PX_CNT + 20] = (uint8_t)(ntc_ref     );
     const uint16_t ntc_snap = g_cur_ntc_adc;
@@ -4302,25 +2936,10 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     if (ntc_adc_valid(boot_ntc_snap) && ntc_adc_valid(ntc_snap)) {
         boot_delta = u16_absdiff(ntc_snap, boot_ntc_snap);
     }
-    uint16_t warmup_comp;
-    uint16_t normal_comp;
-    if (THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_OFF) {
-        const uint8_t diag_slot = g_thermal_diag_mux_slot;
-        g_thermal_diag_mux_slot =
-            (uint8_t)((diag_slot + 1u) % THERMAL_DIAG_SLOT_COUNT);
-        warmup_comp = (uint16_t)(int16_t)(THERMAL_DIAG_MUX_TAG + diag_slot);
-        normal_comp = (uint16_t)thermal_diag_mux_value(
-            diag_slot, frame_vtemp_span, frame_vtemp_tb);
-    } else if (thermal_comp_relative_ntc_enabled()) {
-        warmup_comp = 0;
-        normal_comp =
-            (uint16_t)clip_i16_i32(thermal_comp_relative_ntc_for(ntc_snap));
-    } else {
-        warmup_comp =
-            (uint16_t)clip_i16_i32(ntc_warmup_curve_comp_for(ntc_snap));
-        normal_comp =
-            (uint16_t)clip_i16_i32(ntc_normal_comp_for(ntc_snap));
-    }
+    const uint16_t warmup_comp =
+        (uint16_t)clip_i16_i32(ntc_warmup_curve_comp_for(ntc_snap));
+    const uint16_t normal_comp =
+        (uint16_t)clip_i16_i32(ntc_normal_comp_for(ntc_snap));
     const uint16_t total_comp =
         (uint16_t)clip_i16_i32(eff_anchor - ram_temp_anchor);
     const uint32_t eff_anchor_u = (uint32_t)eff_anchor;
@@ -4350,6 +2969,28 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     out[PX_CNT + 52] = (uint8_t)(center_raw_adu     );
     out[PX_CNT + 53] = (uint8_t)(center_roi_adu >> 8);
     out[PX_CNT + 54] = (uint8_t)(center_roi_adu     );
+    uint32_t t_lo_bits;
+    uint32_t t_hi_bits;
+    memcpy(&t_lo_bits, &t_lo_c_f, sizeof(t_lo_bits));
+    memcpy(&t_hi_bits, &t_hi_c_f, sizeof(t_hi_bits));
+    out[PX_CNT + 55] = (uint8_t)(t_lo_bits >> 24);
+    out[PX_CNT + 56] = (uint8_t)(t_lo_bits >> 16);
+    out[PX_CNT + 57] = (uint8_t)(t_lo_bits >>  8);
+    out[PX_CNT + 58] = (uint8_t)(t_lo_bits      );
+    out[PX_CNT + 59] = (uint8_t)(t_hi_bits >> 24);
+    out[PX_CNT + 60] = (uint8_t)(t_hi_bits >> 16);
+    out[PX_CNT + 61] = (uint8_t)(t_hi_bits >>  8);
+    out[PX_CNT + 62] = (uint8_t)(t_hi_bits      );
+    const uint16_t scene_min_u = (uint16_t)scene_min_x10;
+    const uint16_t scene_max_u = (uint16_t)scene_max_x10;
+    out[PX_CNT + 63] = (uint8_t)(scene_min_u >> 8);
+    out[PX_CNT + 64] = (uint8_t)(scene_min_u);
+    out[PX_CNT + 65] = (uint8_t)(scene_max_u >> 8);
+    out[PX_CNT + 66] = (uint8_t)(scene_max_u);
+    out[PX_CNT + 67] = (uint8_t)(scene_min_idx % SENSOR_W);
+    out[PX_CNT + 68] = (uint8_t)(scene_min_idx / SENSOR_W);
+    out[PX_CNT + 69] = (uint8_t)(scene_max_idx % SENSOR_W);
+    out[PX_CNT + 70] = (uint8_t)(scene_max_idx / SENSOR_W);
 }
 
 static inline __attribute__((always_inline)) void binary_frame(
@@ -4452,9 +3093,12 @@ static inline __attribute__((always_inline)) void try_start_dma()
     __dmb();
     dma_busy = 1;
 
+#if !THERMAL_NCM_MODE
     if (ouomode == UOM_RAW_U16) {
         uart_tx_dma_start(norm_buf[b], TX_PAYLOAD);
-    } else if (ouomode == UOM_CALI_U8) {
+    } else
+#endif
+    if (ouomode == UOM_CALI_U8) {
         uart_tx_dma_start(norm_buf[b], PX_CNT + 7 + FRAME_DIAG_TAIL);
     }
 }
@@ -4464,9 +3108,7 @@ void __isr dma_irq1_handler()
     dma_hw->ints1 = 1u << uart_tx_dma_chan;
 
     const int b = sending;
-    if (b >= 0 && b < TXBUF_CNT) {
-        tx_state[b] = TXBUF_FREE;
-    }
+    tx_state[b] = TXBUF_FREE;
     __dmb();
     sending = -1;
     dma_busy = 0;
@@ -4476,36 +3118,21 @@ void __isr dma_irq1_handler()
 static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
                                                              const int raw_idx)
 {
+#if !THERMAL_NCM_MODE
     if (ouomode == UOM_RAW_U16) {
         norm_buf[tx_idx][0] = 0xFF;
         norm_buf[tx_idx][1] = 0xFF;
         raw16_decode_to_normbuf(rawbuf[raw_idx], norm_buf[tx_idx], PX_CNT);
-    } else if (ouomode == UOM_CALI_U8) {
+    } else
+#endif
+    if (ouomode == UOM_CALI_U8) {
         if (cmode == CM_OFF) {
-            const uint16_t frame_vtemp_span =
-                rawbuf_vtemp_max[raw_idx] >= rawbuf_vtemp_min[raw_idx]
-                    ? (uint16_t)(rawbuf_vtemp_max[raw_idx]
-                                 - rawbuf_vtemp_min[raw_idx])
-                    : 0;
-            int16_t frame_vtemp_tb = 0;
-            if (rawbuf_vtemp_top_cnt[raw_idx] != 0
-                && rawbuf_vtemp_bottom_cnt[raw_idx] != 0) {
-                const int32_t top =
-                    (int32_t)(rawbuf_vtemp_top_sum[raw_idx]
-                              / rawbuf_vtemp_top_cnt[raw_idx]);
-                const int32_t bottom =
-                    (int32_t)(rawbuf_vtemp_bottom_sum[raw_idx]
-                              / rawbuf_vtemp_bottom_cnt[raw_idx]);
-                frame_vtemp_tb = clip_i16_i32(bottom - top);
-            }
             binary_calib_frame(rawbuf[raw_idx],
                                calibg,
                                caligain,
                                calibadpt,
                                norm_buf[tx_idx],
-                               PX_CNT,
-                               frame_vtemp_span,
-                               frame_vtemp_tb);
+                               PX_CNT);
             norm_buf[tx_idx][PX_CNT + 1] = rawbuf[raw_idx][RAWBUF_OFS_VTEMP];
             norm_buf[tx_idx][PX_CNT + 2] = rawbuf[raw_idx][RAWBUF_OFS_VTEMP + 1];
         } else if (cmode == CM_ON) {
@@ -4515,6 +3142,57 @@ static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
         }
     }
 }
+
+static void capture_diag_compute_row_phase(void)
+{
+    if (!calibg) {
+        memset(g_capture_row_phase, 0x7f, sizeof(g_capture_row_phase));
+        return;
+    }
+    for (int y = 0; y < SENSOR_H; ++y) {
+        enum { PHASE_SAMPLES = SENSOR_W / 4 };
+        uint16_t raw_samples[PHASE_SAMPLES];
+        uint32_t raw_sum = 0;
+        for (int k = 0; k < PHASE_SAMPLES; ++k) {
+            const int x = k * 4;
+            const size_t i = (size_t)y * SENSOR_W + (size_t)x;
+            raw_samples[k] =
+                gray14_to_bin(be16_to_u14(&g_capture_raw_diag[i * 2]));
+            raw_sum += raw_samples[k];
+        }
+
+        uint64_t best_cost = UINT64_MAX;
+        int best_dy = 0;
+        for (int cy = 0; cy < SENSOR_H; ++cy) {
+            const int dy = cy - y;
+            uint32_t calib_sum = 0;
+            for (int k = 0; k < PHASE_SAMPLES; ++k) {
+                const int x = k * 4;
+                calib_sum += calibg[(size_t)cy * SENSOR_W + (size_t)x];
+            }
+
+            uint64_t cost = 0;
+            for (int k = 0; k < PHASE_SAMPLES; ++k) {
+                const int x = k * 4;
+                const int32_t raw_centered =
+                    (int32_t)raw_samples[k] * PHASE_SAMPLES
+                    - (int32_t)raw_sum;
+                const int32_t calib_centered =
+                    (int32_t)calibg[(size_t)cy * SENSOR_W + (size_t)x]
+                        * PHASE_SAMPLES
+                    - (int32_t)calib_sum;
+                const int32_t delta = raw_centered - calib_centered;
+                cost += (uint32_t)(delta < 0 ? -delta : delta);
+            }
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_dy = dy;
+            }
+        }
+        g_capture_row_phase[y] = (int8_t)best_dy;
+    }
+}
+
 
 static uint32_t curr_uartb;
 static bool flash_dm = false;
@@ -4527,7 +3205,6 @@ baud_get2(const uint8_t cmd)
         baud = UBM11;
         ouomode = UOM_CALI_U8;
         cmode = CM_OFF;
-        dataomode = DOM_UART;
         flash_dm = false;
         break;
     case 0x22:
@@ -4572,18 +3249,10 @@ baud_get2(const uint8_t cmd)
     //     cmode = CM_OFF;
     //     flash_dm = false;
     //     break;
-    case UART_EXIT_TO_UVC_COMMAND:
-        baud = curr_uartb;
-        ouomode = UOM_CALI_U8;
-        cmode = CM_OFF;
-        dataomode = tud_mounted() ? DOM_UVC : DOM_UART;
-        flash_dm = false;
-        break;
     case 0xAA:
         baud = UBMAA;
         ouomode = UOM_RAW_U16;
         cmode = CM_OFF;
-        dataomode = DOM_UART;
         flash_dm = false;
         break;
     case 0xBB:
@@ -4608,42 +3277,6 @@ baud_get2(const uint8_t cmd)
         dataomode = DOM_UART; /* override UVC mode so dump path runs */
         flash_dm = true;
         break;
-    case STATIC_CAL_V1_WRITE_COMMAND:
-        baud = curr_uartb;
-        static_cal_v1_write_requested = true;
-        break;
-    case STATIC_CAL_DUMP_COMMAND:
-        baud = curr_uartb;
-        static_cal_dump_requested = true;
-        break;
-    case FFC_MAP_DUMP_COMMAND:
-        baud = curr_uartb;
-        ffc_map_dump_requested = true;
-        break;
-    case THERMAL_V2_WRITE_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_write_requested = true;
-        break;
-    case THERMAL_V2_FLASH_HEADER_DIAG_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_flash_header_diag_requested = true;
-        break;
-    case THERMAL_V2_HEADER_TRANSACTION_DIAG_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_header_transaction_diag_requested = true;
-        break;
-    case THERMAL_V2_MAP0_TRANSACTION_DIAG_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_map0_transaction_diag_requested = true;
-        break;
-    case THERMAL_V2_FULL_ERASE_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_full_erase_requested = true;
-        break;
-    case THERMAL_V2_STATUS_COMMAND:
-        baud = curr_uartb;
-        thermal_v2_status_requested = true;
-        break;
     default:
         break;
     };
@@ -4655,7 +3288,7 @@ static inline __attribute__((always_inline)) void ouart_init(const uint8_t cmd)
     static bool setup = OUART_SETUP_DEF;
 
     if (unlikely(!setup)) {
-        const char* OUART_TEST_STRING = "sipeed PMOD_Thermal160\n";
+        const char* OUART_TEST_STRING = "Sipeed T160 Thermal\n";
         setup = true;
         uart_deinit(OUART);
         gpio_set_function(IO_OTX, GPIO_FUNC_UART);
@@ -4698,29 +3331,16 @@ static inline __attribute__((always_inline)) void uart_poll2(
 {
     if (dataomode == DOM_UVC) {
         tud_task();
-        /* In UVC mode only accept explicit override/diagnostic commands.
+        /* In UVC mode only accept explicit override commands (0xCC/0xDD).
          * All other bytes are silently discarded to avoid corrupting UVC. */
         if (!uart_is_readable(OUART)) {
             return;
         }
         const uint8_t cmd = uart_getc(OUART);
-        if (cmd != 0x11
-            && cmd != UART_EXIT_TO_UVC_COMMAND
-            && cmd != 0xAA
-            && cmd != 0xCC
-            && cmd != 0xDD
-            && cmd != STATIC_CAL_V1_WRITE_COMMAND
-            && cmd != STATIC_CAL_DUMP_COMMAND
-            && cmd != FFC_MAP_DUMP_COMMAND
-            && cmd != THERMAL_V2_WRITE_COMMAND
-            && cmd != THERMAL_V2_FLASH_HEADER_DIAG_COMMAND
-            && cmd != THERMAL_V2_HEADER_TRANSACTION_DIAG_COMMAND
-            && cmd != THERMAL_V2_MAP0_TRANSACTION_DIAG_COMMAND
-            && cmd != THERMAL_V2_FULL_ERASE_COMMAND
-            && cmd != THERMAL_V2_STATUS_COMMAND) {
+        if (cmd != 0xCC && cmd != 0xDD) {
             return;
         }
-        /* sel() applies the requested UART/UVC mode before any baud change. */
+        /* sel() sets dataomode = DOM_UART, cmode, caliidx, etc. */
         const uint32_t baud = sel(cmd);
         if (baud == 0 || baud == curr_uartb) {
             return;
@@ -4779,6 +3399,7 @@ static inline __attribute__((always_inline)) uint32_t now()
     return to_ms_since_boot(get_absolute_time());
 }
 
+#if !THERMAL_NCM_MODE
 enum {
     UVCBUF_FREE = 0,
     UVCBUF_FILLING,
@@ -5367,6 +3988,90 @@ static void uvc_ffc_hold_end(void)
     __dmb();
     uvc_ffc_hold_buf = -1;
 }
+#else
+static inline void uvc_ffc_hold_begin(void) {}
+static inline void uvc_ffc_hold_end(void) {}
+#endif
+
+static bool ncm_frame_acquire(struct thermal_frame_view* view)
+{
+    const int b = newest_ready;
+    if (!view || b < 0 || b >= TXBUF_CNT || tx_state[b] != TXBUF_READY) {
+        return false;
+    }
+
+    tx_state[b] = TXBUF_SENDING;
+    newest_ready = -1;
+    __dmb();
+    view->pixels = &norm_buf[b][1];
+    view->meta = thermal_ncm_meta((uint8_t)b);
+    view->token = (uint8_t)b;
+    return view->meta != nullptr;
+}
+
+static void ncm_frame_release(uint8_t token)
+{
+    if (token >= TXBUF_CNT || tx_state[token] != TXBUF_SENDING) return;
+    __dmb();
+    tx_state[token] = TXBUF_FREE;
+    __dmb();
+    __sev();
+}
+
+/* Factory adc16 uses the exact active-pixel decode from the legacy raw UART
+ * path: sensor BE Gray code -> right-aligned 14-bit binary.  The unified
+ * protocol changes the wire order to little endian and excludes the legacy
+ * UART frame marker, two per-row reference words and trailing auxiliary word.
+ * g_capture_raw_diag is reused as the one-shot snapshot so no additional
+ * 38.4 KiB frame buffer is added to BSS. */
+static void ncm_capture_adc16(const uint8_t* raw)
+{
+    for (size_t i = 0; i < PX_CNT; ++i) {
+        uint16_t value = be16_to_u14(&raw[i * 2u]);
+        value = gray14_to_bin(value);
+        g_capture_raw_diag[i * 2u] = (uint8_t)value;
+        g_capture_raw_diag[i * 2u + 1u] = (uint8_t)(value >> 8);
+    }
+}
+
+static bool ncm_adc16_frame_acquire(struct thermal_frame_view* view)
+{
+    if (!view) return false;
+    if (adc16_snapshot_state == ADC16_SNAPSHOT_IDLE) {
+        adc16_snapshot_state = ADC16_SNAPSHOT_REQUESTED;
+        __dmb();
+        __sev();
+        return false;
+    }
+    if (adc16_snapshot_state != ADC16_SNAPSHOT_READY) return false;
+
+    const struct sipeed_thermal_meta_v1* meta =
+        thermal_ncm_adc16_meta();
+    if (!meta) return false;
+    adc16_snapshot_state = ADC16_SNAPSHOT_SENDING;
+    __dmb();
+    view->pixels = g_capture_raw_diag;
+    view->meta = meta;
+    view->token = 0;
+    return true;
+}
+
+static void ncm_adc16_frame_release(uint8_t token)
+{
+    (void)token;
+    if (adc16_snapshot_state != ADC16_SNAPSHOT_SENDING) return;
+    __dmb();
+    adc16_snapshot_state = ADC16_SNAPSHOT_IDLE;
+    __dmb();
+    __sev();
+}
+
+static void ncm_adc16_frame_cancel(void)
+{
+    if (adc16_snapshot_state == ADC16_SNAPSHOT_SENDING) return;
+    adc16_snapshot_state = ADC16_SNAPSHOT_IDLE;
+    __dmb();
+}
 
 static void ffc_run(uint16_t cur_fpa_vtemp);
 static bool ffc_should_trigger(uint16_t cur_fpa_vtemp);
@@ -5382,43 +4087,24 @@ void __time_critical_func(core1_rawbuf_consumer)()
     newest_ready = -1;
     sending = -1;
     dma_busy = 0;
-    struct GpioBtn boot;
-    boot.gpio = IO_BTN;
-    boot.event = 0;
-    boot.last_change_ms = 0;
-    boot.last_level = 1;
-    boot.stable_level = 1;
-    boot.press_ms = 0;
-    gpio_init(boot.gpio);
-    gpio_set_dir(boot.gpio, GPIO_IN);
-    gpio_set_pulls(boot.gpio, true, false);
-
     println("Core1 consumer start");
-    uvc_init();
+    dataomode = DOM_NCM;
+    ouomode = UOM_CALI_U8;
+    cmode = CM_OFF;
+    adc16_snapshot_state = ADC16_SNAPSHOT_IDLE;
+    thermal_ncm_init(ncm_frame_acquire, ncm_frame_release,
+                     ncm_adc16_frame_acquire, ncm_adc16_frame_release,
+                     ncm_adc16_frame_cancel);
     flash_safe_execute_core_init();
-
-    ouart_init(UART_BAUD_MODE_DEF);
     dma_busy = 0;
     buf_idx = 0;
-
-    memcpy(ram_cmaps[0], colormap_magma, CMAP_BYTES);
-    memcpy(ram_cmaps[1], colormap_hot, CMAP_BYTES);
-    memcpy(ram_cmaps[2], colormap_turbo, CMAP_BYTES);
-    memcpy(ram_cmaps[3], colormap_cool, CMAP_BYTES);
-    memcpy(ram_cmaps[4], colormap_deepgreen, CMAP_BYTES);
-    memcpy(ram_cmaps[5], colormap_gray, CMAP_BYTES);
-    active_cmap = ram_cmaps[0];
-    cur_cmap_idx = 0;
-    init_yuv_cmap(active_cmap);
 
     /* Seed ADC diagnostics before the first frame. */
     g_adc_cfg_word = ADC_DIAG_CFG_WORD;
     adc_probe_core();
-    g_boot_adc_temp_adc = g_adc_temp_adc;
     for (int i = 0; i < 32; i++) {
         const uint16_t v = ntc_read_avg(8);
         if (ntc_adc_valid(v)) {
-            g_ntc_raw_adc = v;
             g_cur_ntc_adc = v;
             g_ntc_smooth_x256 = ((uint32_t)v) << 8;
             boot_ntc = v;
@@ -5430,7 +4116,6 @@ void __time_critical_func(core1_rawbuf_consumer)()
     if (!ntc_adc_valid(g_cur_ntc_adc)) {
         g_cur_ntc_adc = ntc_read_avg(8);
         if (ntc_adc_valid(g_cur_ntc_adc)) {
-            g_ntc_raw_adc = g_cur_ntc_adc;
             g_ntc_smooth_x256 = ((uint32_t)g_cur_ntc_adc) << 8;
             boot_ntc = g_cur_ntc_adc;
             boot_ntc_ms = to_ms_since_boot(get_absolute_time());
@@ -5438,67 +4123,6 @@ void __time_critical_func(core1_rawbuf_consumer)()
     }
 
     while (true) {
-        uart_poll2(baud_get2);
-        if (static_cal_v1_write_requested) {
-            static_cal_v1_write_requested = false;
-            (void)write_static_cal_v1_from_uart();
-            sleep_ms(100);
-            goto core1_restart;
-        }
-        if (static_cal_dump_requested) {
-            static_cal_dump_requested = false;
-            dump_static_calibration();
-            continue;
-        }
-        if (ffc_map_dump_requested) {
-            ffc_map_dump_requested = false;
-            dump_runtime_ffc_map();
-            continue;
-        }
-        if (thermal_v2_write_requested) {
-            thermal_v2_write_requested = false;
-            (void)write_thermal_v2_from_uart();
-            sleep_ms(100);
-            goto core1_restart;
-        }
-        if (thermal_v2_full_erase_requested) {
-            thermal_v2_full_erase_requested = false;
-            stop_uart_tx_dma_for_flash();
-            if (erase_thermal_v2_all()) {
-                sleep_ms(100);
-                goto core1_restart;
-            }
-            continue;
-        }
-        if (thermal_v2_status_requested) {
-            thermal_v2_status_requested = false;
-            report_thermal_v2_status();
-            continue;
-        }
-        if (thermal_v2_flash_header_diag_requested) {
-            thermal_v2_flash_header_diag_requested = false;
-            stop_uart_tx_dma_for_flash();
-            (void)diagnose_thermal_v2_header_flash();
-            continue;
-        }
-        if (thermal_v2_header_transaction_diag_requested) {
-            thermal_v2_header_transaction_diag_requested = false;
-            stop_uart_tx_dma_for_flash();
-            (void)diagnose_thermal_v2_header_transaction_from_uart();
-            continue;
-        }
-        if (thermal_v2_map0_transaction_diag_requested) {
-            thermal_v2_map0_transaction_diag_requested = false;
-            stop_uart_tx_dma_for_flash();
-            (void)diagnose_thermal_v2_map0_transaction_from_uart();
-            continue;
-        }
-        if (flash_dm) {
-            goto dump_start;
-        }
-        if (dataomode == DOM_UART) {
-            adc_temp_tick();
-        }
         ntc_tick();
         bool did_work = false;
 
@@ -5513,8 +4137,59 @@ void __time_critical_func(core1_rawbuf_consumer)()
                 int b = txbuf_pick_free();
                 if (b >= 0) {
                     tx_state[b] = TXBUF_FILLING;
-
+                    g_capture_last_frame_uniform_rows =
+                        rawbuf_uniform_rows[idx];
+                    g_capture_last_frame_uniform_max_run =
+                        rawbuf_uniform_max_run[idx];
+                    const bool adc16_captured =
+                        adc16_snapshot_state == ADC16_SNAPSHOT_REQUESTED;
+                    bool diag_raw_captured = false;
+                    if (adc16_captured) {
+                        ncm_capture_adc16(rawbuf[idx]);
+                    } else if (adc16_snapshot_state == ADC16_SNAPSHOT_IDLE
+                               && !g_capture_raw_diag_frozen) {
+                        memcpy(g_capture_raw_diag, rawbuf[idx], RAWBUFSIZE);
+                        memcpy(g_capture_row_ref_diag, rawbuf_row_ref[idx],
+                               sizeof(g_capture_row_ref_diag));
+                        diag_raw_captured = true;
+                    }
                     fill_txbuf(b, idx);
+                    if (diag_raw_captured && !g_capture_raw_diag_frozen) {
+                        const uint8_t* pixels = &norm_buf[b][1];
+                        uint32_t previous_sum = 0;
+                        for (uint32_t x = 0; x < SENSOR_W; ++x) {
+                            previous_sum += pixels[x];
+                        }
+                        for (uint32_t y = 1; y < SENSOR_H; ++y) {
+                            uint32_t sum = 0;
+                            const uint8_t* row = pixels + y * SENSOR_W;
+                            for (uint32_t x = 0; x < SENSOR_W; ++x) {
+                                sum += row[x];
+                            }
+                            const uint32_t jump = sum > previous_sum
+                                                      ? sum - previous_sum
+                                                      : previous_sum - sum;
+                            if (jump >= SENSOR_W * 80u) {
+                                capture_diag_compute_row_phase();
+                                __dmb();
+                                g_capture_raw_diag_frozen = true;
+                                break;
+                            }
+                            previous_sum = sum;
+                        }
+                    }
+                    thermal_ncm_note_frame(
+                        (uint8_t)b,
+                        norm_buf[b],
+                        calibg != nullptr && caligain != nullptr
+                            && ram_mean_diff > 0.0f);
+                    if (adc16_captured) {
+                        thermal_ncm_note_adc16(
+                            g_capture_raw_diag,
+                            thermal_ncm_meta((uint8_t)b));
+                        __dmb();
+                        adc16_snapshot_state = ADC16_SNAPSHOT_READY;
+                    }
                     __dmb();
 
                     int old_tx_ready = newest_ready;
@@ -5534,55 +4209,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
             did_work = true;
         }
 
-        if (dataomode == DOM_UVC) {
-            tud_task();
-            if (uvc_ffc_hold_active) {
-                uvc_ffc_hold_service();
-            } else {
-                uvc_prepare_next();
-            }
-        }
-        tud_task();
-
-        if (dataomode == DOM_UART) {
-            if (cmode == CM_OFF) {
-                try_start_dma();
-            } else if (cmode == CM_ON) {
-                if (caliidx < CALIBUF_CNT) {
-                    button_scan(&boot);
-                    uint8_t boot_ev = boot.event;
-                    if (boot_ev) {
-                        boot.event = 0;
-                        if (boot_ev & GB_EV_RELEASE) {
-                            caliidx++;
-                            led_toggle();
-                            if (caliidx >= CALIBUF_CNT) {
-                                goto cali_start;
-                            }
-                        }
-                    }
-                } else {
-                    goto cali_start;
-                }
-            }
-        } else if (dataomode == DOM_UVC) {
-            if (uvc_ffc_hold_active) {
-                uvc_ffc_hold_service();
-            } else {
-                uvc_task();
-            }
-
-            button_scan(&boot);
-            uint8_t boot_ev = boot.event;
-            if (boot_ev) {
-                boot.event = 0;
-                if (boot_ev & GB_EV_RELEASE) {
-                    cur_cmap_idx = (cur_cmap_idx + 1) % CMAP_NUM;
-                    active_cmap = ram_cmaps[cur_cmap_idx];
-                    init_yuv_cmap(active_cmap);
-                }
-            }
-        }
+        thermal_ncm_task();
 
         /* FFC: check trigger once per loop iteration when in normal output.
          * Allow first FFC even without full calibration (calibg == nullptr);
@@ -5603,32 +4230,10 @@ void __time_critical_func(core1_rawbuf_consumer)()
         }
 
         if (!did_work) {
-            __wfe();
+            tight_loop_contents();
         }
     }
 
-cali_start:
-    if (start_cali()) {
-        led_on_succ(CALI_LED_T_NUM);
-    } else {
-        led_on_failed(CALI_LED_T_NUM);
-    }
-    goto core1_restart;
-
-dump_start:
-    if (dump_cli()) {
-        led_on_succ(CALI_LED_T_NUM);
-    } else {
-        led_on_failed(CALI_LED_T_NUM);
-    }
-
-    goto core1_restart;
-
-core1_restart:
-    watchdog_reboot(0, 0, 0);
-    while (true) {
-        tight_loop_contents();
-    }
 }
 
 static inline __attribute__((always_inline)) void uart_tx_dma_wait_done()
@@ -5639,11 +4244,11 @@ static inline __attribute__((always_inline)) void uart_tx_dma_wait_done()
 
 static inline void ffc_service_usb(void)
 {
-    if (dataomode == DOM_UVC) {
-        tud_task();
-        if (uvc_ffc_hold_active) {
-            uvc_ffc_hold_service();
-        }
+    /* Core0 also calls shutter_on() once during sensor startup. TinyUSB and
+     * lwIP are owned by Core1 and are not safe to enter concurrently from
+     * both cores; runtime FFC itself always runs on Core1. */
+    if (get_core_num() == 1) {
+        thermal_ncm_task();
     }
 }
 
@@ -5987,8 +4592,6 @@ static void ffc_open_and_resync_scene(void)
  */
 static void ffc_run(uint16_t cur_fpa_vtemp)
 {
-    const uint32_t ffc_started_ms =
-        to_ms_since_boot(get_absolute_time());
     println("FFC start");
     led_on();
 
@@ -6007,12 +4610,6 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     uint32_t* const ffc_sum = calib_workspace.ffc_sum;
     memset(ffc_sum, 0, sizeof(calib_workspace.ffc_sum));
     uint32_t ffc_vtemp_sum = 0;
-    uint32_t ffc_frame_mean_min = UINT32_MAX;
-    uint32_t ffc_frame_mean_max = 0;
-    uint16_t ffc_vtemp_frame_min = UINT16_MAX;
-    uint16_t ffc_vtemp_frame_max = 0;
-    uint32_t ffc_vtemp_row_span_sum = 0;
-    int32_t ffc_vtemp_row_tb_sum = 0;
 
     /* Drop two fully fresh frames after the shutter-close pulse, then sum
      * eight complete shutter frames.  14-bit ADU * 8 fits in 17 bits, so the
@@ -6041,46 +4638,13 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
 
         if (pass >= FFC_CLOSED_DISCARD_FRAMES) {
             const uint8_t* const src = rawbuf[idx];
-            uint64_t frame_sum = 0;
             for (size_t i = 0; i < PX_CNT; i++) {
-                const uint16_t value =
-                    gray14_to_bin(be16_to_u14(&src[i * 2]));
-                ffc_sum[i] += value;
-                frame_sum += value;
+                ffc_sum[i] += gray14_to_bin(be16_to_u14(&src[i * 2]));
                 if ((i & 0x3FFu) == 0) {
                     ffc_service_usb();
                 }
             }
-            const uint32_t frame_mean = (uint32_t)(frame_sum / PX_CNT);
-            if (frame_mean < ffc_frame_mean_min) {
-                ffc_frame_mean_min = frame_mean;
-            }
-            if (frame_mean > ffc_frame_mean_max) {
-                ffc_frame_mean_max = frame_mean;
-            }
-            const uint16_t frame_vtemp =
-                be16_to_u14(&src[RAWBUF_OFS_VTEMP]);
-            ffc_vtemp_sum += frame_vtemp;
-            if (frame_vtemp < ffc_vtemp_frame_min) {
-                ffc_vtemp_frame_min = frame_vtemp;
-            }
-            if (frame_vtemp > ffc_vtemp_frame_max) {
-                ffc_vtemp_frame_max = frame_vtemp;
-            }
-            if (rawbuf_vtemp_max[idx] >= rawbuf_vtemp_min[idx]) {
-                ffc_vtemp_row_span_sum +=
-                    rawbuf_vtemp_max[idx] - rawbuf_vtemp_min[idx];
-            }
-            if (rawbuf_vtemp_top_cnt[idx] != 0
-                && rawbuf_vtemp_bottom_cnt[idx] != 0) {
-                const int32_t top =
-                    (int32_t)(rawbuf_vtemp_top_sum[idx]
-                              / rawbuf_vtemp_top_cnt[idx]);
-                const int32_t bottom =
-                    (int32_t)(rawbuf_vtemp_bottom_sum[idx]
-                              / rawbuf_vtemp_bottom_cnt[idx]);
-                ffc_vtemp_row_tb_sum += bottom - top;
-            }
+            ffc_vtemp_sum += be16_to_u14(&src[RAWBUF_OFS_VTEMP]);
         }
         ffc_release_frame(idx);
     }
@@ -6095,37 +4659,39 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         ffc_sum[i] = avg;
         pixel_sum += avg;
     }
-    const int32_t new_calib_mean = (int32_t)(pixel_sum / PX_CNT);
-    int16_t ffc_zone_abs[THERMAL_DIAG_ZONE_COUNT] = {0};
-    if (ram_l_ref_mean > 0) {
-        static const uint8_t zone_x[THERMAL_DIAG_ZONE_COUNT] = {
-            40, 80, 120, 40, 80, 120, 40, 80, 120,
-        };
-        static const uint8_t zone_y[THERMAL_DIAG_ZONE_COUNT] = {
-            30, 30, 30, 60, 60, 60, 90, 90, 90,
-        };
-        for (uint32_t zone = 0; zone < THERMAL_DIAG_ZONE_COUNT; ++zone) {
-            const int32_t current = thermal_diag_roi_mean_u32(
-                ffc_sum, zone_x[zone], zone_y[zone], 4);
-            const int32_t factory = thermal_diag_roi_mean_u16(
-                flash_imgbg, zone_x[zone], zone_y[zone], 4);
-            ffc_zone_abs[zone] = clip_i16_i32(current - factory);
+
+    /* Summarize shutter-background row structure. A partial/shifted frame
+     * produces a large adjacent-row discontinuity here; normal scene texture
+     * cannot influence this metric because the shutter is closed. */
+    uint16_t bg_min_row_mean = UINT16_MAX;
+    uint16_t bg_max_row_mean = 0;
+    uint16_t bg_max_row_jump = 0;
+    uint8_t bg_max_row_jump_line = 0;
+    uint16_t previous_row_mean = 0;
+    for (uint32_t y = 0; y < SENSOR_H; y++) {
+        uint32_t row_sum = 0;
+        for (uint32_t x = 0; x < SENSOR_W; x++) {
+            row_sum += ffc_sum[y * SENSOR_W + x];
         }
+        const uint16_t row_mean = (uint16_t)(row_sum / SENSOR_W);
+        if (row_mean < bg_min_row_mean) bg_min_row_mean = row_mean;
+        if (row_mean > bg_max_row_mean) bg_max_row_mean = row_mean;
+        if (y != 0) {
+            const uint16_t jump = row_mean > previous_row_mean
+                ? row_mean - previous_row_mean
+                : previous_row_mean - row_mean;
+            if (jump > bg_max_row_jump) {
+                bg_max_row_jump = jump;
+                bg_max_row_jump_line = (uint8_t)y;
+            }
+        }
+        previous_row_mean = row_mean;
     }
-    const uint16_t ffc_frame_mean_span =
-        ffc_frame_mean_max >= ffc_frame_mean_min
-            ? (uint16_t)(ffc_frame_mean_max - ffc_frame_mean_min)
-            : 0;
-    const uint16_t ffc_vtemp_frame_span =
-        ffc_vtemp_frame_max >= ffc_vtemp_frame_min
-            ? (uint16_t)(ffc_vtemp_frame_max - ffc_vtemp_frame_min)
-            : 0;
-    const uint16_t ffc_vtemp_row_span =
-        (uint16_t)((ffc_vtemp_row_span_sum
-                    + FFC_AVERAGE_FRAMES / 2u)
-                   / FFC_AVERAGE_FRAMES);
-    const int16_t ffc_vtemp_row_tb = clip_i16_i32(
-        ffc_vtemp_row_tb_sum / (int32_t)FFC_AVERAGE_FRAMES);
+    g_ffc_bg_max_row_jump_adu = bg_max_row_jump;
+    g_ffc_bg_max_row_jump_line = bg_max_row_jump_line;
+    g_ffc_bg_min_row_mean = bg_min_row_mean;
+    g_ffc_bg_max_row_mean = bg_max_row_mean;
+    const int32_t new_calib_mean = (int32_t)(pixel_sum / PX_CNT);
     cur_fpa_vtemp = (uint16_t)(
         (ffc_vtemp_sum + FFC_AVERAGE_FRAMES / 2u) / FFC_AVERAGE_FRAMES);
     const uint16_t cur_ntc_at_ffc = g_cur_ntc_adc;
@@ -6222,11 +4788,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      * uses eff_anchor_old (not bare anchor_old) to keep displayed
      * scene continuous. */
     const int32_t smooth_vtemp_at_ffc = (int32_t)(g_vtemp_smooth_x256 >> 8);
-    /* Freeze one global-state snapshot for both sides of this FFC. Updating
-     * the NTC-derived correction between old/new anchors would manufacture a
-     * temperature jump even when the shutter candidate itself is healthy. */
-    const int32_t global_comp_at_ffc =
-        thermal_global_comp_for(cur_ntc_at_ffc);
+    const int32_t table_comp_at_ffc = thermal_comp_table_for_now();
     int32_t eff_anchor_old = anchor_old;
     if (thermal_comp_legacy_enabled()) {
         int32_t comp_pre = 0;
@@ -6255,8 +4817,8 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         if (comp_pre >  K_COMP_MAX_ADU) comp_pre =  K_COMP_MAX_ADU;
         if (comp_pre < -K_COMP_MAX_ADU) comp_pre = -K_COMP_MAX_ADU;
         eff_anchor_old += comp_pre;
-    } else {
-        eff_anchor_old += global_comp_at_ffc;
+    } else if (thermal_comp_table_enabled()) {
+        eff_anchor_old += table_comp_at_ffc;
     }
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
@@ -6318,8 +4880,8 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         int32_t eff_anchor_new = candidate_temp_anchor;
         if (thermal_comp_legacy_enabled()) {
             eff_anchor_new += ntc_warmup_curve_comp_for(cur_ntc_at_ffc);
-        } else {
-            eff_anchor_new += global_comp_at_ffc;
+        } else if (thermal_comp_table_enabled()) {
+            eff_anchor_new += table_comp_at_ffc;
         }
         const int32_t scene_mid_adu =
             ((int32_t)g_smooth_low + (int32_t)g_smooth_high) >> 1;
@@ -6396,27 +4958,9 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     g_calib_mean = new_calib_mean;
     g_last_calib = nullptr; /* triggers recompute on next frame */
     ram_temp_anchor = candidate_temp_anchor;
-    g_ffc_diag_global_abs = clip_i16_i32(
-        new_calib_mean - ram_l_ref_mean);
-    for (uint32_t zone = 0; zone < THERMAL_DIAG_ZONE_COUNT; ++zone) {
-        g_ffc_diag_zone_abs[zone] = ffc_zone_abs[zone];
-    }
-    g_ffc_diag_vtemp_row_span = ffc_vtemp_row_span;
-    g_ffc_diag_vtemp_row_tb = ffc_vtemp_row_tb;
-    g_ffc_diag_frame_mean_span = ffc_frame_mean_span;
-    g_ffc_diag_vtemp_frame_span = ffc_vtemp_frame_span;
     ffc_restore_gain_cache(restore_gain_cache);
-    /* The first accepted FFC has no previous shutter mean, so reporting
-     * dg_check=0 loses the absolute startup shutter state.  Reference that
-     * first diagnostic sample to the per-board factory low frame instead;
-     * later samples remain ordinary accepted-FFC deltas.  This changes only
-     * telemetry: all FFC guards above continue to use dg_check. */
-    const int32_t reported_dg =
-        (!ffc_done_first && ram_l_ref_mean > 0)
-            ? new_calib_mean - ram_l_ref_mean
-            : dg_check;
     ffc_record_event(FFC_EVT_ACCEPT,
-                     reported_dg,
+                     dg_check,
                      dv_check,
                      dn_check,
                      eff_anchor_old,
@@ -6425,14 +4969,6 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
                      new_calib_mean,
                      cur_fpa_vtemp,
                      cur_ntc_at_ffc);
-
-    /* Freeze exactly once: if the first accepted FFC has no valid NTC, keep
-     * this model disabled until reset instead of learning from a later state. */
-    if (!ffc_done_first
-        && thermal_comp_relative_ntc_enabled()
-        && ntc_adc_valid(cur_ntc_at_ffc)) {
-        thermal_comp_ntc_ref = cur_ntc_at_ffc;
-    }
 
     /* update FFC bookkeeping. ffc_last_fpa_vtemp stores the SMOOTHED VTEMP
      * so that K_V·ΔV in subsequent frames is consistent (smooth − smooth).
@@ -6447,14 +4983,6 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     ffc_done_first = true;
 
     ffc_open_and_resync_scene();
-    {
-        uint32_t duration_ms =
-            to_ms_since_boot(get_absolute_time()) - ffc_started_ms;
-        if (duration_ms > UINT16_MAX) {
-            duration_ms = UINT16_MAX;
-        }
-        g_ffc_diag_duration_ms = (uint16_t)duration_ms;
-    }
     led_off();
     println("FFC done, calib_mean=%ld", (long)g_calib_mean);
 }
@@ -6581,6 +5109,19 @@ int __time_critical_func(spi_init_40MHz4)()
     extern void dutx_init();
     dutx_init();
     pico_get_unique_board_id_string(uid, UID_LEN);
+    thermal_ota_init();
+#if THERMAL_OTA_BOOT_PROBE
+    /* One-shot isolation: prove a staging-sector erase before Core1, TinyUSB,
+     * sensor DMA, or the application FIFO protocol has started. */
+    watchdog_enable(8000u, true);
+    watchdog_hw->scratch[0] = 0x544f5441u;
+    watchdog_hw->scratch[1] = 0xb001u;
+    watchdog_hw->scratch[2] = FLASH_OTA_HEADER_OFFSET;
+    const int ota_probe_rc = thermal_ota_boot_probe();
+    watchdog_hw->scratch[3] = (uint32_t)ota_probe_rc;
+    watchdog_hw->scratch[1] = ota_probe_rc == 0 ? 0xb002u : 0xb0eeu;
+    watchdog_disable();
+#endif
     flash_safe_execute_core_init();
 
     println("MODE: %s", __PRETTY_FUNCTION__);
@@ -6615,15 +5156,6 @@ int __time_critical_func(spi_init_40MHz4)()
             ram_mean_diff = flash_header->mean_diff;
             ram_t_ref_low = flash_header->t_ref_low;
         }
-        /* Recovery-safe policy: never activate a persisted V2 header at
-         * boot.  Earlier V2 builds committed the header immediately, so a
-         * legacy valid record can exist before this firmware is installed.
-         * Ignoring it here makes a firmware update itself return the image
-         * path to V1; 0xF3 remains available to erase the legacy record.
-         * Re-enable only after a separately qualified drift model and an
-         * explicit activation transaction exist. */
-        g_thermal_v2_valid = false;
-        println("Thermal V2: disabled; V1 fallback");
     }
 
     gpio_init(IO_SVMS);
@@ -6653,6 +5185,9 @@ int __time_critical_func(spi_init_40MHz4)()
     uint8_t startup_sync_retry = 0;
     bool sync_locked = false;
     bool startup_synced = false;
+    bool capture_sequence_active = false;
+    uint16_t capture_sequence_mid_count = 0;
+    uint16_t capture_invalid_run = 0;
 
     rawbuf_init();
 
@@ -6668,11 +5203,20 @@ int __time_critical_func(spi_init_40MHz4)()
     // Serein_Y
     shutter_on();
 
-    while (true) {
-    rx_poll();
+    /* The startup shutter delay intentionally leaves the first completed DMA
+     * packet waiting before Core0 enters the receive loop. Do not let that
+     * one-time delay saturate the runtime rearm diagnostic. */
+    rx_rearm_max_us = 0;
+    rx_pio_stall_count = 0;
 
-    if (rxring.ridx != rxring.widx) {
-        /* 后面原代码保持不变 */
+    while (true) {
+        if (__builtin_expect(g_thermal_ota_core0_flash_state
+                                 == THERMAL_OTA_CORE0_FLASH_REQUEST,
+                             false)) {
+            thermal_ota_core0_flash_service();
+        }
+        rx_poll();
+        if (rxring.ridx != rxring.widx) {
             struct RxBuf* b = &rxring.buf[rxring.ridx];
 
             if (b->data[2] == 0xff && b->data[3] == 0x00
@@ -6690,6 +5234,9 @@ int __time_critical_func(spi_init_40MHz4)()
                             lidx = -1;
                             cur_buf = -1;
                             rawbuf_init();
+                            capture_sequence_active = false;
+                            capture_sequence_mid_count = 0;
+                            g_capture_active_mid_count = 0;
                             rxring.ridx = rxring.widx;
                             wspi_stop1();
                             sleep_ms(5);
@@ -6701,6 +5248,19 @@ int __time_critical_func(spi_init_40MHz4)()
                 }
 
                 if (b->data[5] == 0xec && b->data[BUFSIZE - 3] == 0xda) {
+                    capture_invalid_run = 0;
+                    g_capture_packet_heads++;
+                    const bool interrupted_sequence = capture_sequence_active;
+                    if (interrupted_sequence) {
+                        g_capture_unexpected_heads++;
+                        g_capture_incomplete_frames++;
+                        g_capture_head_after_head++;
+                        capture_note_interrupted_sequence(
+                            capture_sequence_mid_count);
+                    }
+                    capture_sequence_active = true;
+                    capture_sequence_mid_count = 0;
+                    g_capture_active_mid_count = 0;
                     if (!startup_synced) {
                         body_only_sync_cnt = 0;
                     }
@@ -6734,12 +5294,23 @@ int __time_critical_func(spi_init_40MHz4)()
                     }
 
                 } else if (b->data[5] == 0xc7 && b->data[BUFSIZE - 3] == 0xda) {
+                    capture_invalid_run = 0;
+                    g_capture_packet_mids++;
+                    if (capture_sequence_active
+                        && capture_sequence_mid_count != UINT16_MAX) {
+                        capture_sequence_mid_count++;
+                        g_capture_active_mid_count =
+                            capture_sequence_mid_count;
+                    }
                     if (!startup_synced && (lidx < 0 || cur_buf < 0)) {
                         if (++body_only_sync_cnt >= BODY_ONLY_RESYNC_THRES) {
                             body_only_sync_cnt = 0;
                             lidx = -1;
                             cur_buf = -1;
                             rawbuf_init();
+                            capture_sequence_active = false;
+                            capture_sequence_mid_count = 0;
+                            g_capture_active_mid_count = 0;
                             rxring.ridx = rxring.widx;
                             wspi_stop1();
                             sleep_ms(2);
@@ -6758,10 +5329,34 @@ int __time_critical_func(spi_init_40MHz4)()
                         lidx++;
                     }
                 } else if (b->data[5] == 0xc7 && b->data[BUFSIZE - 3] == 0xf1) {
+                    capture_invalid_run = 0;
+                    g_capture_packet_tails++;
+                    if (capture_sequence_active) {
+                        g_capture_last_tail_mid_count =
+                            capture_sequence_mid_count;
+                        if (capture_sequence_mid_count == SENSOR_H - 1) {
+                            g_capture_complete_sequences++;
+                        } else {
+                            g_capture_bad_tail_sequences++;
+                        }
+                    } else {
+                        g_capture_tail_without_head++;
+                    }
+                    capture_sequence_active = false;
+                    capture_sequence_mid_count = 0;
+                    g_capture_active_mid_count = 0;
                     wspi_stop1();
 #if RAW_OUT_MODE == 1
                     dump_buf_8bytes(rawbuf[cur_buf], RAWBUFSIZE);
 #endif
+
+                    while (multicore_fifo_rvalid()) {
+                        uint32_t cmd = multicore_fifo_pop_blocking();
+                        if (cmd == CORE0_EV0) {
+                            multicore_fifo_push_blocking(CORE1_EV0);
+                            goto core0_stop;
+                        }
+                    }
 
                     if (lidx == SENSOR_H && cur_buf >= 0) {
                         /* VTEMP = mean of per-row D166 samples accumulated
@@ -6773,26 +5368,6 @@ int __time_critical_func(spi_init_40MHz4)()
                                 ? (uint16_t)(rawbuf_vtemp_sum[cur_buf]
                                              / rawbuf_vtemp_cnt[cur_buf])
                                 : 0;
-                        if (g_boot_vtemp_mean == 0 && vtemp != 0) {
-                            g_boot_vtemp_mean = vtemp;
-                            if (rawbuf_vtemp_max[cur_buf]
-                                >= rawbuf_vtemp_min[cur_buf]) {
-                                g_boot_vtemp_span =
-                                    (uint16_t)(rawbuf_vtemp_max[cur_buf]
-                                               - rawbuf_vtemp_min[cur_buf]);
-                            }
-                            if (rawbuf_vtemp_top_cnt[cur_buf] != 0
-                                && rawbuf_vtemp_bottom_cnt[cur_buf] != 0) {
-                                const int32_t top =
-                                    (int32_t)(rawbuf_vtemp_top_sum[cur_buf]
-                                              / rawbuf_vtemp_top_cnt[cur_buf]);
-                                const int32_t bottom =
-                                    (int32_t)(rawbuf_vtemp_bottom_sum[cur_buf]
-                                              / rawbuf_vtemp_bottom_cnt[cur_buf]);
-                                g_boot_vtemp_tb =
-                                    clip_i16_i32(bottom - top);
-                            }
-                        }
                         rawbuf[cur_buf][RAWBUF_OFS_VTEMP] =
                             (uint8_t)(vtemp >> 8);
                         rawbuf[cur_buf][RAWBUF_OFS_VTEMP + 1] =
@@ -6810,13 +5385,49 @@ int __time_critical_func(spi_init_40MHz4)()
                     }
 
                     wspi_reinit1();
+                } else {
+                    g_capture_packet_invalid++;
+                    capture_invalid_run++;
                 }
+            } else {
+                g_capture_packet_invalid++;
+                capture_invalid_run++;
+            }
+
+            if (capture_invalid_run > g_capture_max_invalid_run) {
+                g_capture_max_invalid_run = capture_invalid_run;
+            }
+            if (startup_synced
+                && capture_invalid_run >= BODY_ONLY_RESYNC_THRES) {
+                g_capture_runtime_resyncs++;
+                g_capture_last_resync_invalid_run = capture_invalid_run;
+                capture_invalid_run = 0;
+                lidx = -1;
+                if (cur_buf >= 0) {
+                    g_capture_incomplete_frames++;
+                    rawbuf_state[cur_buf] = RAWBUF_FREE;
+                    cur_buf = -1;
+                    __dmb();
+                }
+                capture_sequence_active = false;
+                capture_sequence_mid_count = 0;
+                g_capture_active_mid_count = 0;
+                rxring.ridx = rxring.widx;
+                wspi_stop1();
+                sleep_ms(2);
+                wspi_reinit1();
+                rxring.ridx = rxring.widx;
+                continue;
             }
             rxring.ridx = (rxring.ridx + 1) % BUFCOUNT;
         }
     }
 
     errh(nullptr);
+core0_stop:
+    while (true) {
+        tight_loop_contents();
+    }
     return 0;
 }
 

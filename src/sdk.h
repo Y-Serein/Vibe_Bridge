@@ -52,9 +52,10 @@ enum UartOutMode : uint32_t {
 
 enum DataOutMode : uint8_t {
     DOM_UART = 0,
-    DOM_UVC,
+    DOM_NCM,
+    DOM_UVC = DOM_NCM,
 };
-#define DATA_OUT_MODE_DEF DOM_UART
+#define DATA_OUT_MODE_DEF DOM_NCM
 
 enum CaliMode : uint8_t {
     CM_OFF = 0,
@@ -221,29 +222,23 @@ struct yuv_cmap_simd {
 /* Keep this at 384: lower values make row fixed-pattern stripes visible. */
 #define MIN_THERMAL_RANGE 384
 
-#define FLASH_SIZE          (4 * 1024 * 1024)
-#define FLASH_TARGET_SIZE   (512 * 1024)
-#define FLASH_TARGET_OFFSET (FLASH_SIZE - FLASH_TARGET_SIZE)
+#define FLASH_SIZE                    (2 * 1024 * 1024)
+#define FLASH_TARGET_SIZE             (512 * 1024)
+#define FLASH_TARGET_OFFSET           (FLASH_SIZE - FLASH_TARGET_SIZE)
+/* The final two 4 KiB sectors are deliberately outside calibration data.
+ * OTA state and product settings live there so the first 1.5 MiB can be
+ * divided into two equal 768 KiB application/image slots. */
+#define FLASH_CALIBRATION_DATA_SIZE   (FLASH_TARGET_SIZE - 2 * 4096)
+#define FLASH_OTA_HEADER_OFFSET       (FLASH_TARGET_OFFSET \
+                                       + FLASH_CALIBRATION_DATA_SIZE)
+#define FLASH_PRODUCT_SETTINGS_OFFSET (FLASH_SIZE - 4096)
 #define FLASH_OFS_INFO      0x000000
 #define FLASH_OFS_IMGBG     0x002000
 #define FLASH_OFS_BADPTS    0x00e000
 #define FLASH_OFS_GAIN      0x01a000
-#define FLASH_OFS_THERMAL_V2_INFO 0x02d000
-#define FLASH_OFS_THERMAL_V2_MAP0 0x02e000
-#define FLASH_OFS_THERMAL_V2_MAP1 0x038000
-#define FLASH_OFS_THERMAL_V2_MAP2 0x042000
-#define FLASH_OFS_THERMAL_V2_MAP3 0x04c000
 #define FLASH_RETRY_MAX     3
 #define FLASH_HAS_DATA_F    0x78
 #define CLEAR_CALI_ON_BOOT  0
-
-#define THERMAL_V2_MAGIC          0x32564e54u /* "TNV2" little-endian */
-#define THERMAL_V2_VERSION        2u
-#define THERMAL_V2_MAP_COUNT      4u
-#define THERMAL_V2_STATE_AXIS_NTC 1u
-#define THERMAL_V2_FLAG_VALID     0x00000001u
-#define THERMAL_V2_MAP_SIZE \
-    (SENSOR_W * SENSOR_H * sizeof(int16_t))
 
 struct __attribute__((packed)) FlashDataInfo {
     uint8_t has_data;
@@ -260,32 +255,6 @@ struct __attribute__((packed)) FlashDataInfo {
     uint8_t _pad1[24];
 };
 
-/* Optional V2 extension.  V1 remains at its original offsets and is always
- * the safe fallback.  The four signed maps are zero-mean open-path residuals
- * in raw-offset ADU, ordered from cold/high-NTC to hot/low-NTC.  The header is
- * committed last, so a power loss during map programming leaves V2 invalid
- * without damaging the existing V1 calibration. */
-struct __attribute__((packed)) ThermalV2Info {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t header_size;
-    uint32_t flags;
-    uint32_t payload_size;
-    uint16_t width;
-    uint16_t height;
-    uint8_t map_count;
-    uint8_t state_axis;
-    uint16_t reserved0;
-    uint32_t map_size;
-    uint16_t ntc_adu[THERMAL_V2_MAP_COUNT];
-    int16_t global_anchor_adu[THERMAL_V2_MAP_COUNT];
-    uint32_t map_ofs[THERMAL_V2_MAP_COUNT];
-    uint32_t map_crc32[THERMAL_V2_MAP_COUNT];
-    uint32_t payload_crc32;
-    uint8_t reserved1[12];
-    uint32_t header_crc32;
-};
-
 struct FlashOpInfo {
     uint32_t ofs;
     uint32_t size;
@@ -297,8 +266,6 @@ extern const struct FlashDataInfo* flash_header;
 extern const uint16_t* flash_imgbg;
 extern const float* flash_gain;
 extern const struct BadPt* flash_badpt;
-extern const struct ThermalV2Info* flash_thermal_v2_header;
-extern const int16_t* flash_thermal_v2_maps[THERMAL_V2_MAP_COUNT];
 extern enum DataOutMode dataomode;
 extern struct Button buttons[BUTTON_NUM_MAX];
 #if MAIN_FUNC_MODE == MAIN_FUNC_MODE_BOARD_ID
@@ -319,18 +286,6 @@ void flash_read_unique_id();
 static_assert(sizeof(struct BadPt) == 2, "BadPt size must be 2 bytes!");
 static_assert(sizeof(struct FlashDataInfo) == 64,
               "FlashDataInfo size must be 64 bytes!");
-static_assert(sizeof(struct ThermalV2Info) == 96,
-              "ThermalV2Info size must be 96 bytes!");
-static_assert((FLASH_OFS_THERMAL_V2_INFO % 4096u) == 0,
-              "Thermal V2 header must be sector aligned");
-static_assert((FLASH_OFS_THERMAL_V2_MAP0 % 4096u) == 0
-                  && (FLASH_OFS_THERMAL_V2_MAP1 % 4096u) == 0
-                  && (FLASH_OFS_THERMAL_V2_MAP2 % 4096u) == 0
-                  && (FLASH_OFS_THERMAL_V2_MAP3 % 4096u) == 0,
-              "Thermal V2 maps must be sector aligned");
-static_assert(FLASH_OFS_THERMAL_V2_MAP3 + THERMAL_V2_MAP_SIZE
-                  <= FLASH_TARGET_SIZE,
-              "Thermal V2 maps exceed calibration partition");
 #define FLOAT_ABS_EPS 1e-7f
 #define FLOAT_REL_EPS 1e-6f
 

@@ -8,6 +8,7 @@
 #include <hardware/structs/clocks.h>
 #include <hardware/structs/dma.h>
 #include <hardware/structs/io_bank0.h>
+#include <hardware/timer.h>
 #include <hardware/uart.h>
 #include <init.h>
 #include <pico/assert.h>
@@ -632,7 +633,10 @@ void th160_init()
 }
 
 uint spi1clk;
-struct RxRing rxring;
+struct RxRing rxring __attribute__((section(".scratch_y")));
+volatile uint32_t rxring_overflow_count = 0;
+volatile uint32_t rx_pio_stall_count = 0;
+volatile uint32_t rx_rearm_max_us = 0;
 PIO rxpio = pio1;
 uint rxsm;
 uint rxofs;
@@ -642,7 +646,10 @@ uint32_t pirqc = 0;
 struct RxDma rxchan;
 int sdch;
 dma_channel_config clkdcfg;
-const uint8_t Z = 0x00;
+/* Keep this byte in SRAM.  The sensor-clock DMA reads it continuously; making
+ * it const moves it into XIP flash, where Core1 JPEG/NCM traffic can delay the
+ * reads and corrupt the sensor clock. */
+uint8_t Z = 0x00;
 static volatile bool dma_done = false;
 
 static void __isr dma_irq0_handler(void)
@@ -657,25 +664,38 @@ static void __isr dma_irq0_handler(void)
 
 void rx_poll(void)
 {
-    if (!dma_done)
+    if (!dma_done) {
         return;
+    }
 
     dma_done = false;
+    const uint32_t rearm_start_us = time_us_32();
 
 #if RXPKTDBG == 1
     dma_channel_abort(sdch);
 #endif
 
     rxring.buf[rxring.widx].len = BUFSIZE;
-    uint32_t next = (rxring.widx + 1) % BUFCOUNT;
+    const uint32_t next = (rxring.widx + 1u) % BUFCOUNT;
     if (next == rxring.ridx) {
-        rxring.ridx = (rxring.ridx + 1) % BUFCOUNT;
+        rxring_overflow_count++;
+        rxring.ridx = (rxring.ridx + 1u) % BUFCOUNT;
     }
     rxring.widx = next;
-    rxchan.buf_idx = rxring.widx;
+    rxchan.buf_idx = next;
     dma_channel_set_write_addr(
         rxchan.chan, rxring.buf[rxchan.buf_idx].data, false);
     dma_channel_set_trans_count(rxchan.chan, BUFSIZE, true);
+
+    const uint32_t rearm_us = time_us_32() - rearm_start_us;
+    if (rearm_us > rx_rearm_max_us) {
+        rx_rearm_max_us = rearm_us;
+    }
+    const uint32_t stall_mask = 1u << (PIO_FDEBUG_RXSTALL_LSB + rxsm);
+    if (rxpio->fdebug & stall_mask) {
+        rx_pio_stall_count++;
+        rxpio->fdebug = stall_mask;
+    }
 }
 
 void wspi_init0()

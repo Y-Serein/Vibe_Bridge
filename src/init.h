@@ -27,7 +27,10 @@ struct RxDma {
 };
 
 extern uint spi1clk;
-extern struct RxRing rxring __attribute__((section(".scratch_x")));
+extern struct RxRing rxring __attribute__((section(".scratch_y")));
+extern volatile uint32_t rxring_overflow_count;
+extern volatile uint32_t rx_pio_stall_count;
+extern volatile uint32_t rx_rearm_max_us;
 extern PIO rxpio;
 extern uint rxsm;
 extern uint rxofs;
@@ -36,7 +39,7 @@ extern uint32_t dirqc;
 extern uint32_t pirqc;
 extern int sdch;
 extern dma_channel_config clkdcfg;
-extern const uint8_t Z;
+extern uint8_t Z;
 
 void init();
 void rx_poll();

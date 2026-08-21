@@ -49,12 +49,12 @@ enum {
 #define TUD_VIDEO_DESC_STD_VC_UVC11(_itfnum, _nEPs, _stridx) \
     TUD_VIDEO_DESC_STD_VC_LEN, TUSB_DESC_INTERFACE, _itfnum, 0x00, \
         _nEPs, TUSB_CLASS_VIDEO, VIDEO_SUBCLASS_CONTROL, \
-        VIDEO_ITF_PROTOCOL_UNDEFINED, _stridx
+        VIDEO_ITF_PROTOCOL_15, _stridx
 
 #define TUD_VIDEO_DESC_STD_VS_UVC11(_itfnum, _alt, _epn, _stridx) \
     TUD_VIDEO_DESC_STD_VS_LEN, TUSB_DESC_INTERFACE, _itfnum, _alt, \
         _epn, TUSB_CLASS_VIDEO, VIDEO_SUBCLASS_STREAMING, \
-        VIDEO_ITF_PROTOCOL_UNDEFINED, _stridx
+        VIDEO_ITF_PROTOCOL_15, _stridx
 
 #define TUD_VIDEO_CAPTURE_DESC_UNCOMPR_LEN \
     (TUD_VIDEO_DESC_IAD_LEN /* control */ \
@@ -75,9 +75,7 @@ enum {
      + TUD_VIDEO_DESC_STD_VC_LEN \
      + (TUD_VIDEO_DESC_CS_VC_LEN + 1 /*bInCollection*/) \
      + TUD_VIDEO_DESC_CAMERA_TERM_LEN \
-     + TUD_VIDEO_DESC_OUTPUT_TERM_LEN \
-     + TUD_VIDEO_DESC_STD_VC_INT_EP_LEN \
-     + TUD_VIDEO_DESC_CS_VC_INT_EP_LEN /* Interface 1, Alternate 0 */ \
+     + TUD_VIDEO_DESC_OUTPUT_TERM_LEN /* Interface 1, Alternate 0 */ \
      + TUD_VIDEO_DESC_STD_VS_LEN \
      + (TUD_VIDEO_DESC_CS_VS_IN_LEN + 1 /*bNumFormats x bControlSize*/) \
      + TUD_VIDEO_DESC_CS_VS_FMT_UNCOMPR_LEN \
@@ -275,11 +273,11 @@ enum {
         TUD_VIDEO_DESC_EP_ISO(_epin, _epsize, 1)
 
 #define TUD_VIDEO_CAPTURE_DESCRIPTOR_UNCOMPR_BULK( \
-    _stridx, _epctl, _epin, _width, _height, _fps, _epsize) \
+    _stridx, _epin, _width, _height, _fps, _epsize) \
     TUD_VIDEO_DESC_IAD(ITF_NUM_VIDEO_CONTROL, \
                        /* 2 Interfaces */ 0x02, \
                        _stridx), /* Video control 0 */ \
-        TUD_VIDEO_DESC_STD_VC_UVC11(ITF_NUM_VIDEO_CONTROL, 1, _stridx), \
+        TUD_VIDEO_DESC_STD_VC_UVC11(ITF_NUM_VIDEO_CONTROL, 0, _stridx), \
         TUD_VIDEO_DESC_CS_VC( \
             0x0110, /* wTotalLength - bLength */ \
             TUD_VIDEO_DESC_CAMERA_TERM_LEN + TUD_VIDEO_DESC_OUTPUT_TERM_LEN, \
@@ -297,10 +295,6 @@ enum {
                                    0, \
                                    1, \
                                    0), \
-        TUD_VIDEO_DESC_STD_VC_INT_EP(_epctl, \
-                                     UVC_STATUS_MAX_PACKET_SIZE, \
-                                     UVC_STATUS_INTERVAL), \
-        TUD_VIDEO_DESC_CS_VC_INT_EP(UVC_STATUS_MAX_PACKET_SIZE), \
         /* Video stream alt. 0 */ \
         TUD_VIDEO_DESC_STD_VS_UVC11(ITF_NUM_VIDEO_STREAMING, \
                                     0, \

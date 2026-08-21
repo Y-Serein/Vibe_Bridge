@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#080b10">
+  <title>T160 热成像</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "PingFang SC", sans-serif;
+      background: #080b10;
+      color: #f6f7fb;
+      --panel: #111722;
+      --panel-2: #171f2c;
+      --line: #283447;
+      --muted: #91a0b5;
+      --accent: #72e4c1;
+      --hot: #ff536b;
+      --cold: #4edcff;
+    }
+    * { box-sizing: border-box }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 50% -20%, #1a2938 0, #080b10 43%); }
+    button, select, input { font: inherit }
+    button, select { color: inherit }
+    button { cursor: pointer }
+    .app { width: min(560px, 100%); margin: auto; padding: 18px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .top-controls { display: flex; align-items: center; justify-content: center; gap: 6px; }
+    .top-control { display: grid; flex: 0 0 auto; width: 38px; height: 38px; place-items: center; padding: 0; border: 1px solid var(--line);
+      border-radius: 99px; color: #9eacc0; background: #111722cc; transition: .16s; }
+    .top-control svg { width: 19px; height: 19px; }
+    .sr-icon { position: relative; display: block; font-size: 15px; font-weight: 900; letter-spacing: -1px; line-height: 1; }
+    .sr-icon.relaxed::after { content: "↗"; position: absolute; top: -5px; right: -5px; font-size: 10px; font-weight: 800; }
+    .top-control:hover { color: #e7edf6; border-color: #4c5b70; }
+    .top-control.active { color: #06251d; border-color: var(--accent); background: var(--accent); box-shadow: 0 5px 20px #72e4c124; }
+    .top-control:disabled { opacity: .35; cursor: not-allowed; }
+    .language { min-width: 42px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 99px;
+      color: #c9d3e0; background: #111722cc; font-size: 12px; }
+    .brand { display: flex; align-items: center; gap: 11px; }
+    .logo { width: 38px; height: 38px; flex: 0 0 auto; border-radius: 12px; box-shadow: 0 8px 30px #dd26292b; overflow: hidden; }
+    .logo svg { display: block; width: 100%; height: 100%; }
+    h1 { margin: 0; font-size: 21px; line-height: 1.1; letter-spacing: -.3px; }
+    .subtitle { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .workspace { display: block; min-width: 0; }
+    .viewer, .panel { min-width: 0; border: 1px solid var(--line); background: #0d121bda; border-radius: 20px; box-shadow: 0 20px 70px #0008; }
+    .viewer { padding: 11px; }
+    .screen { position: relative; width: min(100%, 480px); height: 640px; margin: auto; aspect-ratio: 3/4; overflow: hidden;
+      border-radius: 14px; background: #020305; box-shadow: inset 0 0 0 1px #ffffff0d; touch-action: pan-y; }
+    .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #overlay { pointer-events: none; }
+    .compare-line { position: absolute; z-index: 3; top: 0; bottom: 0; left: 50%; width: 36px; display: none;
+      transform: translateX(-50%); cursor: ew-resize; touch-action: none; pointer-events: auto;
+      background: linear-gradient(90deg, transparent 16px, #fff 17px, #fff 19px, transparent 20px);
+      filter: drop-shadow(0 0 7px #000); }
+    .compare-line::after { content: ""; position: absolute; top: 12px; left: 50%; width: 36px; height: 22px;
+      transform: translateX(-50%); border: 2px solid #fff; border-radius: 12px; background: #111d; box-shadow: 0 3px 12px #000a; }
+    .compare-line::before { content: ""; position: absolute; z-index: 1; top: 21px; left: 50%; width: 10px; height: 2px;
+      transform: translateX(-50%); border-radius: 2px; background: #fff; box-shadow: 0 -4px #fff, 0 4px #fff; }
+    .screen.comparing .compare-line { display: block; }
+    .loading { position: absolute; z-index: 5; left: 50%; bottom: 12px; transform: translateX(-50%); display: none;
+      padding: 7px 11px; border: 1px solid #ffffff1a; border-radius: 99px; background: #090d12dc; color: #d8e0eb; font-size: 12px; }
+    .loading.show { display: block; }
+    .viewer-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 4px 1px;
+      color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .viewer-foot strong { color: #e8edf5; font-weight: 650; }
+    .capture-actions { position: absolute; z-index: 4; left: 50%; bottom: 14px; display: flex; gap: 12px; transform: translateX(-50%); }
+    .capture { display: grid; width: 46px; height: 46px; place-items: center; padding: 0; border: 1px solid #ffffff3b;
+      border-radius: 50%; color: #f5f8fc; background: #1017229e; box-shadow: 0 5px 20px #0008; backdrop-filter: blur(7px); }
+    .capture svg { width: 21px; height: 21px; }
+    .capture:hover { border-color: #ffffff73; background: #182232c7; }
+    .capture:disabled { opacity: .42; cursor: not-allowed; }
+    .capture.recording { border-color: #934455; color: #ffd7df; background: #351a21; }
+    .record-icon { width: 13px; height: 13px; border-radius: 50%; background: #ff536b; box-shadow: 0 0 0 4px #ff536b1e; transition: .16s; }
+    .capture.recording .record-icon { width: 12px; height: 12px; border-radius: 2px; box-shadow: 0 0 0 4px #ff536b18; }
+    .capture-message { position: absolute; z-index: 4; left: 50%; bottom: 70px; max-width: calc(100% - 24px); padding: 6px 10px;
+      transform: translateX(-50%) translateY(4px); border: 1px solid #ffffff1a; border-radius: 99px; color: #e3e9f1; background: #090d12c9;
+      font-size: 11px; text-align: center; white-space: nowrap; opacity: 0; pointer-events: none; transition: .18s; backdrop-filter: blur(6px); }
+    .capture-message.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+    .panel { margin-top: 14px; padding: 14px; }
+    .section { min-width: 0; }
+    .section + .section { margin-top: 14px; padding-top: 14px; border-top: 1px solid #253042; }
+    .section-title { margin: 0 0 9px; color: #aab6c7; font-size: 12px; font-weight: 650; letter-spacing: .04em; }
+    .select-row { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .field { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+    select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid #2d394c; border-radius: 10px; outline: 0;
+      background: #151d29; font-size: 13px; }
+    select:focus { border-color: #4d8f7e; }
+    .palette-strip { display: flex; width: 100%; max-width: 100%; gap: 8px; margin: 0; padding: 1px 0 8px; overflow-x: auto; overscroll-behavior-x: contain;
+      scroll-snap-type: x proximity; scrollbar-width: thin; scrollbar-color: #3c4a60 transparent; }
+    .palette-option { flex: 0 0 82px; padding: 5px; border: 1px solid #2b374a; border-radius: 10px; background: #121925;
+      color: #aeb9c8; scroll-snap-align: start; text-align: left; }
+    .palette-option canvas { display: block; width: 70px; height: 52px; border-radius: 6px; background: #020305; image-rendering: auto; }
+    .palette-option span { display: block; padding: 5px 2px 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .palette-option.active { border-color: var(--accent); color: #ecfff9; background: #183128; box-shadow: 0 0 0 1px #72e4c125; }
+    .select-row { grid-template-columns: 1fr; }
+    details { margin-top: 14px; border: 1px solid var(--line); border-radius: 14px; background: #0d121bcc; overflow: hidden; }
+    summary { cursor: pointer; padding: 13px 14px; color: #b4c0d0; font-size: 13px; list-style: none; }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; float: right; color: var(--muted); font-size: 18px; line-height: 14px; }
+    details[open] summary::after { content: "−"; }
+    .details-body { padding: 0 14px 14px; }
+    .diagnostics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; margin-bottom: 14px; }
+    .diag { padding: 9px; border-radius: 9px; background: #151d29; }
+    .diag span { display: block; color: var(--muted); font-size: 10px; }
+    .diag strong { display: block; margin-top: 4px; font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .update { padding-top: 13px; border-top: 1px solid #253042; }
+    .update h2 { margin: 0 0 4px; font-size: 14px; }
+    .update p { margin: 0 0 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .file-row { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
+    input[type=file] { min-width: 0; padding: 8px; border: 1px dashed #35445a; border-radius: 9px; color: var(--muted); font-size: 11px; }
+    .segment-box { display: flex; align-items: center; gap: 3px; min-width: 0; padding: 7px 10px; border: 1px solid #35445a; border-radius: 9px; color: var(--muted); font-size: 12px; }
+    .segment-box input { width: 54px; padding: 3px 5px; border: 0; border-radius: 5px; color: var(--text); background: #111824; text-align: center; }
+    .primary { padding: 9px 12px; border: 0; border-radius: 9px; color: #052018; background: var(--accent); font-weight: 750; }
+    .primary:disabled { opacity: .5; cursor: wait; }
+    progress { width: 100%; height: 6px; margin-top: 9px; accent-color: var(--accent); }
+    #otaMessage { min-height: 16px; margin-top: 5px; }
+    @media (max-width: 760px) {
+      body { background: #080b10; }
+      .app { padding: 10px 0 18px; }
+      .topbar { justify-content: flex-start; gap: 6px; padding: 0 12px; }
+      .brand { min-width: 0; gap: 8px; }
+      .logo { width: 34px; height: 34px; border-radius: 10px; }
+      h1 { font-size: 18px; white-space: nowrap; }
+      .subtitle { display: none; }
+      .top-controls { gap: 4px; margin-left: auto; }
+      .top-control { width: 34px; height: 34px; }
+      .top-actions { gap: 4px; }
+      .language { min-width: 36px; height: 34px; padding: 0 7px; }
+      .viewer, .panel { border-left: 0; border-right: 0; border-radius: 0; box-shadow: none; }
+      .viewer { padding: 0; border-top: 1px solid #1e2937; }
+      .screen { width: 100%; height: 133.333vw; max-width: none; border-radius: 0; }
+      .viewer-foot { padding: 9px 12px; }
+      .panel { margin-top: 9px; padding: 12px; }
+      .palette-strip { margin-inline: 0; padding-inline: 0; }
+      details { margin: 9px 10px 0; }
+    }
+    @media (max-width: 370px) {
+      .top-control { width: 33px; height: 33px; }
+      .language { min-width: 34px; }
+      h1 { font-size: 17px; }
+      .panel { padding-inline: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand"><div class="logo" aria-label="Sipeed"><svg viewBox="0 0 377.4 377.4" role="img"><path fill="#dd2629" d="M38.2 0h301.1c21.1 0 38.2 17.1 38.2 38.2v301.1c0 21.1-17.1 38.2-38.2 38.2H38.2C17.1 377.4 0 360.4 0 339.3V38.2C0 17.1 17.1 0 38.2 0Z"/><polygon fill="#fff7f0" points="307.1,247.1 225.4,329 103.9,329 103.9,275 244.7,275 244.7,219.1 159.1,219.1 77.2,137.2 159.1,55.2 280.5,55.2 280.5,109.3 139.8,109.3 139.8,165.1 225.1,165.1"/><path fill="#fff7f0" d="M93.6 65.4c-1.2-14.2-13.6-24.7-27.8-23.5-14.2 1.2-24.8 13.6-23.6 27.8 1 12.6 11 22.5 23.6 23.5 14.2 1.1 26.7-9.5 27.8-23.8.1-1.3.1-2.6 0-4Zm-27.1 12.5c-5.7-.8-9.8-6-9-11.8s6-9.8 11.8-9c4.7.6 8.4 4.3 9 9 .7 5.8-3.3 11-9.1 11.8-.9.1-1.8.1-2.7 0Z"/></svg></div><div><h1 data-i18n="product">T160 热成像</h1><div class="subtitle" data-i18n="subtitle">即插即用 · 实时测温</div></div></div>
+      <nav class="top-controls" aria-label="Image controls">
+        <button class="top-control active" id="srToggle"><i class="sr-icon" aria-hidden="true">SR</i></button>
+        <button class="top-control" id="compareToggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 5v14M8.5 9.5 6 12l2.5 2.5M15.5 9.5 18 12l-2.5 2.5"/></svg></button>
+        <button class="top-control active" id="markersToggle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="6"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/></svg></button>
+      </nav>
+      <div class="top-actions"><button class="language" id="languageToggle" aria-label="Switch language">EN</button></div>
+    </header>
+    <div class="workspace">
+      <section class="viewer">
+        <div class="screen" id="screen">
+          <canvas id="view" width="360" height="480"></canvas>
+          <canvas id="overlay" width="360" height="480"></canvas>
+          <div class="compare-line" id="compareLine" aria-label="拖动对比分界线"></div>
+          <div class="loading" id="loading">正在准备画面…</div>
+          <div class="capture-actions">
+            <button class="capture" id="snapshot" aria-label="拍照"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7.5h3l1.4-2h7.2l1.4 2h3a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9.5a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13.5" r="4"/></svg></button>
+            <button class="capture" id="record" aria-label="开始录像"><i class="record-icon" aria-hidden="true"></i></button>
+          </div>
+          <div class="capture-message" id="captureMessage" aria-live="polite"></div>
+        </div>
+        <div class="viewer-foot"><span id="viewState" data-i18n="waiting_frame">等待第一帧画面</span><strong id="fps">-- FPS</strong></div>
+      </section>
+      <aside class="panel">
+        <section class="section">
+          <p class="section-title" data-i18n="palette">伪彩配色</p>
+          <div class="palette-strip" id="paletteStrip" role="radiogroup" aria-label="Palette"></div>
+        </section>
+      </aside>
+    </div>
+    <details>
+      <summary data-i18n="settings">设备设置与固件更新</summary>
+      <div class="details-body">
+        <div class="diagnostics">
+          <div class="diag"><span data-i18n="range">测温范围</span><strong id="range">--</strong></div>
+          <div class="diag"><span data-i18n="frame">当前帧</span><strong id="frame">--</strong></div>
+          <div class="diag"><span data-i18n="processing">处理耗时</span><strong id="processTime">--</strong></div>
+          <div class="diag"><span data-i18n="connection_type">连接方式</span><strong data-i18n="usb_network">USB 网络</strong></div>
+        </div>
+        <div class="update"><h2 data-i18n="network_settings">多设备网段</h2><p data-i18n="network_desc">仅在电脑同时连接多台设备时修改；每台设备应使用不同数字。</p>
+          <div class="file-row"><label class="segment-box">192.168.<input id="networkSegment" type="number" min="1" max="254" value="17" inputmode="numeric">.1</label><button class="primary" id="saveNetwork" data-i18n="save_network">保存并重启</button></div>
+          <p id="networkMessage" data-i18n="network_default">手机单设备使用无需修改。</p>
+        </div>
+        <div class="update"><h2 data-i18n="firmware_update">固件更新</h2><p data-i18n="firmware_desc">选择T160固件文件即可更新，设备中的测温校准数据会保留。</p>
+          <div class="file-row"><input id="firmware" type="file" accept=".bin,application/octet-stream"><button class="primary" id="update" data-i18n="install_update">安装更新</button></div>
+          <progress id="otaProgress" max="100" value="0"></progress><p id="otaMessage" data-i18n="select_firmware">请选择.bin格式的固件文件</p>
+        </div>
+      </div>
+    </details>
+  </main>
+  <script>
+  (() => {
+    'use strict';
+    const W = 160, H = 120, N = W * H, UW = 480, UH = 360, OUT = UW * UH, DW = 360, DH = 480;
+    const $ = id => document.getElementById(id);
+    const strings = {
+      zh: {
+        title: 'T160 热成像', product: 'T160 热成像', subtitle: '即插即用 · 实时测温', connecting: '正在连接', connected: '画面已连接', reconnecting: '正在重连',
+        waiting_frame: '等待第一帧画面', enhancement: '画面增强', raw: '原图', fast: '流畅超分',
+        comparison: '原图对比', compare_title: '开启左右对比', compare_desc: '左侧为当前增强，右侧固定原图', quick_sr: '超分辨率', quick_compare: '原图对比', quick_markers: '显示温标', compare_state: '左：{name} · 右：原图', drag_compare: '拖动对比分界线',
+        temperature: '实时温度', center: '中心', minimum: '最低', maximum: '最高', marker_center: '中', marker_low: '低', marker_high: '高',
+        display: '显示效果', palette: '伪彩配色', markers_title: '显示温标', markers_desc: '在画面中标记中心、最低和最高温度',
+        snapshot: '拍照', record_start: '开始录像', record_stop: '停止录像 {time}', capture_local: '照片和录像仅保存在当前设备', capture_wait_photo: '画面连接后即可拍照', capture_wait_video: '画面连接后即可录像', photo_failed: '照片生成失败，请重试', photo_saved: '照片已保存到当前设备', video_start_failed: '当前浏览器无法开始录像', video_interrupted: '录像中断，请重试', video_failed: '录像生成失败，请重试', video_saved: '录像已保存到当前设备', recording: '正在录像，再次点击即可保存', photo_only: '当前浏览器支持拍照，不支持录像',
+        settings: '设备设置与固件更新', range: '测温范围', frame: '当前帧', processing: '处理耗时', direct: '原图直出', connection_type: '连接方式', usb_network: 'USB 网络', network_settings: '多设备网段', network_desc: '仅在电脑同时连接多台设备时修改；每台设备应使用不同数字。', save_network: '保存并重启', network_default: '手机单设备使用无需修改。', network_invalid: '请输入1到254之间的数字', network_confirm: '把设备地址改为192.168.{segment}.1并重启？', network_saving: '正在保存网络设置…', network_saved: '已保存，设备正在使用新地址重启…', network_failed: '网络设置保存失败', firmware_update: '固件更新', firmware_desc: '选择T160固件文件即可更新，设备中的测温校准数据会保留。', install_update: '安装更新', select_firmware: '请选择.bin格式的固件文件', select_first: '请先选择固件文件', select_bin: '请选择.bin格式的固件文件', install_confirm: '安装“{name}”并重启设备？', writing: '正在安全写入固件…', update_done: '更新完成，设备正在重启…', update_failed: '更新失败，请重新选择固件', connection_lost: '连接中断，请重试',
+        resource_failed: '资源加载失败', model_invalid: '模型校验失败', unsupported: '当前浏览器暂不支持{name}', preparing: '正在准备{name}…', data_error: '画面数据异常', resyncing: '正在重新同步画面', connect_failed: '连接失败', disconnected: '连接已断开', language: '切换语言',
+        palette_white: '白热', palette_black: '黑热', palette_iron: '铁红', palette_rainbow: '彩虹', palette_rainbow_hc: '高对比彩虹', palette_arctic: '北极', palette_lava: '熔岩', palette_red: '红热', palette_fusion: '融合', palette_icefire: '冰火', palette_sepia: '褐色', palette_amber: '琥珀', palette_green: '绿热', palette_medical: '医疗'
+      },
+      en: {
+        title: 'T160 Thermal Imaging', product: 'T160 Thermal Imaging', subtitle: 'Plug in · See temperature', connecting: 'Connecting', connected: 'Live', reconnecting: 'Reconnecting',
+        waiting_frame: 'Waiting for the first frame', enhancement: 'Super Resolution', raw: 'Original', fast: 'Fast SR',
+        comparison: 'Compare with original', compare_title: 'Enable split comparison', compare_desc: 'Selected mode on the left, original on the right', quick_sr: 'Fast SR', quick_compare: 'Compare', quick_markers: 'Markers', compare_state: 'Left: {name} · Right: Original', drag_compare: 'Drag comparison divider',
+        temperature: 'Live temperature', center: 'Center', minimum: 'Minimum', maximum: 'Maximum', marker_center: 'C', marker_low: 'L', marker_high: 'H',
+        display: 'Appearance', palette: 'Color palette', markers_title: 'Show temperature markers', markers_desc: 'Mark center, minimum and maximum on the image',
+        snapshot: 'Take photo', record_start: 'Record video', record_stop: 'Stop {time}', capture_local: 'Photos and videos are saved only on this device', capture_wait_photo: 'Connect the image before taking a photo', capture_wait_video: 'Connect the image before recording', photo_failed: 'Could not create the photo. Try again.', photo_saved: 'Photo saved to this device', video_start_failed: 'This browser could not start recording', video_interrupted: 'Recording stopped unexpectedly. Try again.', video_failed: 'Could not create the video. Try again.', video_saved: 'Video saved to this device', recording: 'Recording — tap again to save', photo_only: 'This browser supports photos but not video recording',
+        settings: 'Device settings & firmware', range: 'Temperature range', frame: 'Frame', processing: 'Processing time', direct: 'Original', connection_type: 'Connection', usb_network: 'USB network', network_settings: 'Multi-device subnet', network_desc: 'Change this only when several devices share one computer; use a different number for each device.', save_network: 'Save & restart', network_default: 'No change is needed for normal single-device phone use.', network_invalid: 'Enter a number from 1 through 254', network_confirm: 'Change this device to 192.168.{segment}.1 and restart?', network_saving: 'Saving network settings…', network_saved: 'Saved. The device is restarting on its new address…', network_failed: 'Could not save the network setting', firmware_update: 'Firmware update', firmware_desc: 'Choose a T160 firmware file to update. Temperature calibration data is preserved.', install_update: 'Install update', select_firmware: 'Choose a .bin firmware file', select_first: 'Choose a firmware file first', select_bin: 'Choose a .bin firmware file', install_confirm: 'Install “{name}” and restart the device?', writing: 'Safely writing firmware…', update_done: 'Update complete. Device is restarting…', update_failed: 'Update failed. Choose the firmware again.', connection_lost: 'Connection lost. Try again.',
+        resource_failed: 'Resource failed to load', model_invalid: 'Model validation failed', unsupported: '{name} is not supported in this browser', preparing: 'Preparing {name}…', data_error: 'Invalid image data', resyncing: 'Resynchronizing image', connect_failed: 'Connection failed', disconnected: 'Connection lost', language: 'Switch language',
+        palette_white: 'White Hot', palette_black: 'Black Hot', palette_iron: 'Ironbow', palette_rainbow: 'Rainbow', palette_rainbow_hc: 'Rainbow HC', palette_arctic: 'Arctic', palette_lava: 'Lava', palette_red: 'Red Hot', palette_fusion: 'Fusion', palette_icefire: 'Ice & Fire', palette_sepia: 'Sepia', palette_amber: 'Amber', palette_green: 'Green Hot', palette_medical: 'Medical'
+      }
+    };
+    let storedLanguage = '';
+    try { storedLanguage = localStorage.getItem('t160-language') || ''; } catch (error) {}
+    let language = storedLanguage || (/^zh\b/i.test(navigator.language || '') ? 'zh' : 'en');
+    const tr = key => strings[language][key] || strings.zh[key] || key;
+    const format = (key, values) => Object.keys(values || {}).reduce((text, name) => text.replaceAll('{' + name + '}', values[name]), tr(key));
+    const methodName = id => tr(id);
+    const paletteDefinitions = [
+      {id: 'white', name: 'palette_white', stops: [[0,0,0,0],[1,255,255,255]]},
+      {id: 'black', name: 'palette_black', stops: [[0,255,255,255],[1,0,0,0]]},
+      {id: 'iron', name: 'palette_iron', stops: [[0,0,0,8],[.2,35,8,58],[.45,132,25,74],[.68,232,78,35],[.86,255,190,74],[1,255,255,238]]},
+      {id: 'rainbow', name: 'palette_rainbow', stops: [[0,10,0,38],[.18,22,37,180],[.38,0,178,223],[.58,58,210,73],[.78,255,215,30],[1,244,28,18]]},
+      {id: 'rainbow_hc', name: 'palette_rainbow_hc', stops: [[0,0,0,0],[.12,42,0,128],[.28,0,64,255],[.43,0,230,230],[.57,20,210,20],[.72,255,245,0],[.86,255,80,0],[1,255,255,255]]},
+      {id: 'arctic', name: 'palette_arctic', stops: [[0,0,4,22],[.28,18,45,112],[.52,45,139,183],[.7,80,61,115],[.84,242,171,43],[1,255,250,213]]},
+      {id: 'lava', name: 'palette_lava', stops: [[0,0,0,0],[.28,43,0,54],[.5,132,12,111],[.7,235,55,51],[.88,255,164,40],[1,255,251,205]]},
+      {id: 'red', name: 'palette_red', stops: [[0,0,0,0],[.5,70,0,0],[.72,225,10,10],[.9,255,170,18],[1,255,255,235]]},
+      {id: 'fusion', name: 'palette_fusion', stops: [[0,3,3,24],[.24,46,18,105],[.47,17,90,171],[.67,187,40,132],[.84,245,105,43],[1,255,237,131]]},
+      {id: 'icefire', name: 'palette_icefire', stops: [[0,0,10,70],[.25,0,105,220],[.49,183,240,255],[.51,255,242,190],[.75,235,74,16],[1,96,0,0]]},
+      {id: 'sepia', name: 'palette_sepia', stops: [[0,8,5,3],[.35,75,43,25],[.7,177,125,79],[1,255,244,218]]},
+      {id: 'amber', name: 'palette_amber', stops: [[0,0,0,0],[.42,79,33,0],[.76,225,111,0],[1,255,232,153]]},
+      {id: 'green', name: 'palette_green', stops: [[0,0,3,0],[.45,0,79,23],[.78,36,205,80],[1,224,255,222]]},
+      {id: 'medical', name: 'palette_medical', stops: [[0,0,0,20],[.18,34,24,115],[.36,0,124,223],[.54,0,211,142],[.7,230,226,29],[.86,240,66,24],[1,255,255,255]]}
+    ];
+    const modelInfo = {fast: {
+      weights: '/assets/sr-fast.bin',
+      variants: [
+        {kind: 'relaxed', wasm: '/assets/sr-fast.wasm'},
+        {kind: 'simd', wasm: '/assets/sr-fast-simd.wasm'}
+      ]
+    }};
+    const compatibilityPolling = /VivoBrowser\//.test(navigator.userAgent);
+    const cv = $('view'), cx = cv.getContext('2d'), ov = $('overlay'), tx = ov.getContext('2d');
+    const rawCanvas = document.createElement('canvas'), rawContext = rawCanvas.getContext('2d');
+    rawCanvas.width = W; rawCanvas.height = H;
+    const captureCanvas = document.createElement('canvas'), captureContext = captureCanvas.getContext('2d');
+    captureCanvas.width = DW; captureCanvas.height = DH;
+    const surfaces = {raw: makeSurface(W, H), fast: makeSurface(UW, UH)};
+    const lut = new Uint32Array(256), models = {}, modelVariants = {}, modelPromises = {}, modelUnavailable = {};
+    let palette = 'iron', singleMethod = 'fast', compareEnabled = false, showMarkers = true;
+    let split = 50, controller, buffer = new Uint8Array(0), pending = null, processing = false;
+    let frameCount = 0, frameMark = performance.now(), lastMarkerTime = 0, latestMeta = null;
+    let recorder = null, recordStream = null, recordTimer = 0, recordClock = 0, recordStarted = 0, recordChunks = [], captureMessageTimer = 0;
+
+    function makeSurface(width, height) {
+      const canvas = document.createElement('canvas'), context = canvas.getContext('2d');
+      canvas.width = width; canvas.height = height;
+      return {canvas, context, image: context.createImageData(width, height), gray: null};
+    }
+    const clamp = value => Math.max(0, Math.min(255, value));
+    function paletteColor(definition, x) {
+      const stops = definition.stops;
+      let upper = 1;
+      while (upper < stops.length && x > stops[upper][0]) upper++;
+      upper = Math.min(upper, stops.length - 1);
+      const a = stops[Math.max(0, upper - 1)], b = stops[upper], mix = b[0] === a[0] ? 0 : (x - a[0]) / (b[0] - a[0]);
+      return [clamp(Math.round(a[1] + (b[1] - a[1]) * mix)), clamp(Math.round(a[2] + (b[2] - a[2]) * mix)), clamp(Math.round(a[3] + (b[3] - a[3]) * mix))];
+    }
+    function setLut(value) {
+      const definition = paletteDefinitions.find(item => item.id === value) || paletteDefinitions[2];
+      palette = definition.id;
+      for (let q = 0; q < 256; q++) {
+        const [r, g, b] = paletteColor(definition, q / 255);
+        lut[q] = (r | (g << 8) | (b << 16) | 0xff000000) >>> 0;
+      }
+      document.querySelectorAll('[data-palette]').forEach(button => {
+        const active = button.dataset.palette === palette;
+        button.classList.toggle('active', active); button.setAttribute('aria-checked', String(active));
+      });
+      Object.keys(surfaces).forEach(id => { if (surfaces[id].gray) colorize(id, surfaces[id].gray); });
+      render();
+    }
+    function thumbnailScene(width, height) {
+      const values = new Uint8Array(width * height);
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+        let value = 24 + y * .42 + 7 * Math.sin(x * .13) * Math.cos(y * .11);
+        if (y > 41) value = 52 + (x / width) * 14;
+        const saucer = ((x - 34) / 19) ** 2 + ((y - 42) / 3.2) ** 2;
+        if (saucer < 1) value = Math.max(value, 112 - saucer * 30);
+        if (x >= 20 && x <= 44 && y >= 21 && y <= 40) {
+          const edge = Math.min(x - 20, 44 - x, y - 21, 40 - y);
+          value = 174 + Math.max(0, edge) * 2.5 + (40 - y) * .7;
+        }
+        const rim = ((x - 32) / 12.5) ** 2 + ((y - 21) / 3.2) ** 2;
+        if (rim < 1) value = rim < .42 ? 239 : 207;
+        const handle = ((x - 47) / 8.5) ** 2 + ((y - 30) / 8) ** 2;
+        if (handle < 1 && handle > .35) value = Math.max(value, 180);
+        for (let stream = 0; stream < 3; stream++) {
+          const sx = 27 + stream * 5 + Math.sin((y + stream * 4) * .45) * 1.8;
+          if (y > 5 && y < 19) value = Math.max(value, 125 - Math.abs(x - sx) * 34 + (19 - y) * 2);
+        }
+        values[y * width + x] = clamp(Math.round(value));
+      }
+      return values;
+    }
+    function drawPaletteThumbnail(canvas, definition, scene) {
+      const context = canvas.getContext('2d'), image = context.createImageData(canvas.width, canvas.height);
+      for (let i = 0; i < scene.length; i++) {
+        const color = paletteColor(definition, scene[i] / 255), offset = i * 4;
+        image.data[offset] = color[0]; image.data[offset + 1] = color[1]; image.data[offset + 2] = color[2]; image.data[offset + 3] = 255;
+      }
+      context.putImageData(image, 0, 0);
+    }
+    function createPaletteButtons() {
+      const strip = $('paletteStrip'), scene = thumbnailScene(70, 52);
+      paletteDefinitions.forEach(definition => {
+        const button = document.createElement('button'), canvas = document.createElement('canvas'), label = document.createElement('span');
+        button.type = 'button'; button.className = 'palette-option'; button.dataset.palette = definition.id;
+        button.setAttribute('role', 'radio'); canvas.width = 70; canvas.height = 52;
+        drawPaletteThumbnail(canvas, definition, scene); button.append(canvas, label);
+        button.onclick = () => setLut(definition.id); strip.appendChild(button);
+      });
+    }
+    function applyLanguage() {
+      document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'; document.title = tr('title');
+      document.querySelectorAll('[data-i18n]').forEach(element => element.textContent = tr(element.dataset.i18n));
+      $('languageToggle').textContent = language === 'zh' ? 'EN' : '中文';
+      $('languageToggle').setAttribute('aria-label', tr('language')); $('compareLine').setAttribute('aria-label', tr('drag_compare'));
+      $('paletteStrip').setAttribute('aria-label', tr('palette'));
+      document.querySelector('.top-controls').setAttribute('aria-label', tr('enhancement'));
+      $('srToggle').setAttribute('aria-label', tr('quick_sr')); $('srToggle').title = tr('quick_sr');
+      $('compareToggle').setAttribute('aria-label', tr('quick_compare')); $('compareToggle').title = tr('quick_compare');
+      $('markersToggle').setAttribute('aria-label', tr('quick_markers')); $('markersToggle').title = tr('quick_markers');
+      document.querySelectorAll('[data-palette]').forEach(button => {
+        const definition = paletteDefinitions.find(item => item.id === button.dataset.palette);
+        button.querySelector('span').textContent = tr(definition.name); button.title = tr(definition.name);
+      });
+      if (surfaces.raw.gray) $('viewState').textContent = compareEnabled ? format('compare_state', {name: methodName(singleMethod)}) : methodName(singleMethod);
+      if (latestMeta) updateMarkers(latestMeta);
+      $('snapshot').setAttribute('aria-label', tr('snapshot')); $('snapshot').title = tr('snapshot');
+      if (recorder && recorder.state !== 'inactive') {
+        const time = recordingTime(); recordLabel(format('record_stop', {time})); setCaptureMessage(tr('recording') + ' · ' + time, true);
+      } else {
+        recordLabel(tr('record_start')); setCaptureMessage($('record').disabled ? tr('photo_only') : '', $('record').disabled);
+      }
+    }
+    function colorize(id, gray) {
+      const surface = surfaces[id], pixels = new Uint32Array(surface.image.data.buffer);
+      surface.gray = gray;
+      for (let i = 0; i < gray.length; i++) pixels[i] = lut[gray[i]];
+      surface.context.putImageData(surface.image, 0, 0);
+    }
+    function visibleMethods() {
+      return [singleMethod];
+    }
+    function availableSurface(id) { return surfaces[id].gray ? id : 'raw'; }
+    function paintMethod(id) {
+      id = availableSurface(id);
+      const surface = surfaces[id];
+      cx.save();
+      cx.setTransform(0, 1, -1, 0, DW, 0);
+      cx.imageSmoothingEnabled = id === 'raw';
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(surface.canvas, 0, 0, UW, UH);
+      cx.restore();
+    }
+    function render() {
+      cx.setTransform(1, 0, 0, 1, 0, 0); cx.clearRect(0, 0, DW, DH);
+      if (!surfaces.raw.gray) return;
+      if (!compareEnabled) paintMethod(singleMethod);
+      else {
+        paintMethod('raw');
+        cx.save(); cx.beginPath(); cx.rect(0, 0, DW * split / 100, DH); cx.clip(); paintMethod(singleMethod); cx.restore();
+      }
+    }
+    function setLoading(text) { $('loading').textContent = text || ''; $('loading').classList.toggle('show', !!text); }
+    function setConnected(online, text) {
+      document.body.dataset.connection = online ? 'online' : 'offline';
+    }
+    async function fetchBytes(path) {
+      const response = await fetch(path, {cache: 'no-store'});
+      if (!response.ok) throw Error(tr('resource_failed'));
+      return response.arrayBuffer();
+    }
+    async function loadModel(id) {
+      if (models[id]) return models[id];
+      if (modelUnavailable[id]) throw Error(format('unsupported', {name: methodName(id)}));
+      if (modelPromises[id]) return modelPromises[id];
+      const info = modelInfo[id];
+      modelPromises[id] = (async () => {
+        setLoading(format('preparing', {name: methodName(id)}));
+        let selected = null, lastError = null;
+        for (const variant of info.variants) {
+          try {
+            const wasm = await fetchBytes(variant.wasm);
+            if (typeof WebAssembly === 'undefined' || !WebAssembly.validate(wasm)) {
+              throw Error(format('unsupported', {name: methodName(id)}));
+            }
+            const result = await WebAssembly.instantiate(wasm, {});
+            selected = {kind: variant.kind, exports: result.instance.exports};
+            break;
+          } catch (error) { lastError = error; }
+        }
+        if (!selected) throw lastError || Error(format('unsupported', {name: methodName(id)}));
+        const weights = await fetchBytes(info.weights), exports = selected.exports;
+        if (exports.weights_bytes() !== weights.byteLength) throw Error(tr('model_invalid'));
+        new Uint8Array(exports.memory.buffer, exports.weights_ptr(), weights.byteLength).set(new Uint8Array(weights));
+        models[id] = exports;
+        modelVariants[id] = selected.kind;
+        refreshControls();
+        setLoading('');
+        return exports;
+      })().catch(error => {
+        modelPromises[id] = null;
+        modelUnavailable[id] = true;
+        if (id === 'fast') $('srToggle').disabled = true;
+        if (singleMethod === id) singleMethod = 'raw';
+        refreshControls();
+        setLoading(format('unsupported', {name: methodName(id)}));
+        setTimeout(() => setLoading(''), 2400);
+        throw error;
+      });
+      return modelPromises[id];
+    }
+    function runModel(id, raw) {
+      const exports = models[id];
+      new Uint8Array(exports.memory.buffer, exports.input_ptr(), N).set(raw);
+      const started = performance.now();
+      exports.run_resphase();
+      const elapsed = performance.now() - started;
+      const output = new Uint8Array(exports.memory.buffer, exports.output_ptr(), OUT).slice();
+      return {output, elapsed};
+    }
+    function temperature(value) { return Number.isFinite(value) ? value.toFixed(1) + '°' : '--'; }
+    function crc32(bytes) {
+      let crc = -1;
+      for (const value of bytes) {
+        crc ^= value;
+        for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+      }
+      return (~crc) >>> 0;
+    }
+    function cross(x, y, color, label) {
+      tx.lineCap = 'round'; tx.lineJoin = 'round';
+      tx.beginPath(); tx.moveTo(x - 7, y); tx.lineTo(x + 7, y); tx.moveTo(x, y - 7); tx.lineTo(x, y + 7);
+      tx.strokeStyle = '#000d'; tx.lineWidth = 4; tx.stroke(); tx.strokeStyle = color; tx.lineWidth = 2; tx.stroke();
+      if (!label) return;
+      tx.font = '700 15px system-ui,-apple-system,sans-serif';
+      const width = tx.measureText(label).width, lx = x + 10 + width > DW - 4 ? Math.max(4, x - width - 10) : x + 10;
+      const ly = y < 22 ? y + 21 : y - 8;
+      tx.strokeStyle = '#000e'; tx.lineWidth = 3; tx.strokeText(label, lx, ly); tx.fillStyle = color; tx.fillText(label, lx, ly);
+    }
+    function updateMarkers(data) {
+      const flags = data.getUint32(12, true);
+      tx.clearRect(0, 0, DW, DH);
+      if ((flags & 0x18) !== 0x18 || !showMarkers) return;
+      const point = (x, y) => ({x: (H - 1 - y) * 3 + 1.5, y: x * 3 + 1.5});
+      const center = point(data.getUint16(68, true), data.getUint16(70, true));
+      const low = point(data.getUint16(72, true), data.getUint16(74, true));
+      const high = point(data.getUint16(76, true), data.getUint16(78, true));
+      cross(center.x, center.y, '#ffffff', 'C ' + temperature(data.getFloat32(56, true)));
+      cross(low.x, low.y, '#4edcff', 'L ' + temperature(data.getFloat32(60, true)));
+      cross(high.x, high.y, '#ff536b', 'H ' + temperature(data.getFloat32(64, true)));
+    }
+    function updateMeta(meta, elapsed) {
+      const data = new DataView(meta.buffer, meta.byteOffset, meta.byteLength);
+      if (String.fromCharCode(...meta.slice(0, 8)) !== 'SITHMETA' || data.getUint16(10, true) !== 120 || crc32(meta.subarray(0, 116)) !== data.getUint32(116, true)) throw Error(tr('data_error'));
+      latestMeta = data;
+      const valid = data.getUint32(12, true) & 0x80, now = performance.now();
+      $('range').textContent = valid ? data.getFloat32(84, true).toFixed(1) + ' – ' + data.getFloat32(88, true).toFixed(1) + ' °C' : '--';
+      $('frame').textContent = data.getUint32(16, true);
+      $('processTime').textContent = elapsed ? elapsed.toFixed(1) + ' ms' : tr('direct');
+      if (now - lastMarkerTime >= 180) { updateMarkers(data); lastMarkerTime = now; }
+      frameCount++;
+      if (now - frameMark >= 1000) {
+        $('fps').textContent = (frameCount * 1000 / (now - frameMark)).toFixed(1) + ' FPS';
+        frameCount = 0; frameMark = now;
+      }
+    }
+    async function processFrame(packet) {
+      colorize('raw', packet.gray);
+      render();
+      let total = 0;
+      for (const id of visibleMethods()) {
+        if (id === 'raw' || modelUnavailable[id]) continue;
+        try {
+          await loadModel(id);
+          const result = runModel(id, packet.gray);
+          total += result.elapsed;
+          colorize(id, result.output);
+        } catch (error) {
+          if (singleMethod === id) setSrEnabled(false);
+        }
+      }
+      render(); updateMeta(packet.meta, total); setConnected(true, tr('connected'));
+      $('viewState').textContent = compareEnabled ? format('compare_state', {name: methodName(singleMethod)}) : methodName(singleMethod);
+    }
+    function queue(packet) {
+      pending = packet;
+      if (processing) return;
+      processing = true;
+      (async function loop() {
+        while (pending) {
+          const next = pending; pending = null;
+          try { await processFrame(next); }
+          catch (error) { $('viewState').textContent = error.message; }
+        }
+        processing = false;
+      })();
+    }
+    function append(chunk) {
+      const next = new Uint8Array(buffer.length + chunk.length);
+      next.set(buffer); next.set(chunk, buffer.length); buffer = next;
+    }
+    function takeRaw(chunk) {
+      append(chunk);
+      for (;;) {
+        if (buffer.length < N + 120) return;
+        const meta = buffer.slice(N, N + 120);
+        if (String.fromCharCode(...meta.slice(0, 8)) !== 'SITHMETA') throw Error(tr('resyncing'));
+        queue({gray: buffer.slice(0, N), meta});
+        buffer = buffer.slice(N + 120);
+      }
+    }
+    async function stream() {
+      const abort = new AbortController(); controller = abort; buffer = new Uint8Array(0);
+      try {
+        setConnected(false, tr('connecting'));
+        if (compatibilityPolling) {
+          for (;;) {
+            const response = await fetch('/frame.temp8?t=' + Date.now(),
+              {cache: 'no-store', signal: abort.signal});
+            const frame = new Uint8Array(await response.arrayBuffer());
+            if (response.status === 503) {
+              await new Promise(resolve => setTimeout(resolve, 20));
+              continue;
+            }
+            if (!response.ok) throw Error(tr('connect_failed'));
+            if (frame.length !== N + 120) throw Error(tr('data_error'));
+            takeRaw(frame);
+          }
+        }
+        const response = await fetch('/stream.temp8', {cache: 'no-store', signal: abort.signal});
+        if (!response.ok || !response.body) throw Error(tr('connect_failed'));
+        const reader = response.body.getReader();
+        for (;;) {
+          const item = await reader.read();
+          if (item.done) throw Error(tr('disconnected'));
+          takeRaw(item.value);
+        }
+      } catch (error) {
+        if (controller === abort && !abort.signal.aborted) {
+          setConnected(false, tr('reconnecting'));
+          $('viewState').textContent = error.message;
+          setTimeout(stream, 400);
+        }
+      }
+    }
+    function refreshControls() {
+      const srEnabled = singleMethod === 'fast';
+      $('srToggle').querySelector('.sr-icon').classList.toggle('relaxed', modelVariants.fast === 'relaxed');
+      $('srToggle').classList.toggle('active', srEnabled); $('srToggle').setAttribute('aria-pressed', String(srEnabled));
+      $('compareToggle').disabled = !srEnabled;
+      $('compareToggle').classList.toggle('active', compareEnabled); $('compareToggle').setAttribute('aria-pressed', String(compareEnabled));
+      $('markersToggle').classList.toggle('active', showMarkers); $('markersToggle').setAttribute('aria-pressed', String(showMarkers));
+      $('screen').classList.toggle('comparing', compareEnabled);
+      $('compareLine').style.left = split + '%'; render();
+    }
+    function setSrEnabled(enabled) {
+      singleMethod = enabled ? 'fast' : 'raw';
+      if (!enabled) compareEnabled = false;
+      refreshControls();
+      if (enabled) loadModel('fast').catch(() => {});
+    }
+    $('srToggle').onclick = () => setSrEnabled(singleMethod !== 'raw' ? false : true);
+    $('compareToggle').onclick = () => {
+      compareEnabled = !compareEnabled;
+      refreshControls();
+      if (compareEnabled && singleMethod !== 'raw') loadModel(singleMethod).catch(() => {});
+    };
+    $('languageToggle').onclick = () => {
+      language = language === 'zh' ? 'en' : 'zh';
+      try { localStorage.setItem('t160-language', language); } catch (error) {}
+      applyLanguage();
+    };
+    $('markersToggle').onclick = () => {
+      showMarkers = !showMarkers; refreshControls();
+      if (latestMeta) updateMarkers(latestMeta); else tx.clearRect(0, 0, DW, DH);
+    };
+    let dragging = false;
+    const divider = $('compareLine');
+    function moveDivider(event) {
+      const rect = $('screen').getBoundingClientRect();
+      split = Math.max(5, Math.min(95, (event.clientX - rect.left) * 100 / rect.width));
+      refreshControls();
+    }
+    divider.onpointerdown = event => { if (!compareEnabled) return; dragging = true; divider.setPointerCapture(event.pointerId); moveDivider(event); };
+    divider.onpointermove = event => { if (dragging) moveDivider(event); };
+    divider.onpointerup = divider.onpointercancel = () => dragging = false;
+    function drawCaptureFrame() {
+      captureContext.clearRect(0, 0, DW, DH);
+      captureContext.drawImage(cv, 0, 0);
+      if (showMarkers) captureContext.drawImage(ov, 0, 0);
+      if (compareEnabled) {
+        const x = Math.round(DW * split / 100) + .5;
+        captureContext.beginPath(); captureContext.moveTo(x, 0); captureContext.lineTo(x, DH);
+        captureContext.strokeStyle = '#fff'; captureContext.lineWidth = 1; captureContext.stroke();
+      }
+    }
+    function captureName(extension) {
+      const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
+      return 'T160_' + stamp + '.' + extension;
+    }
+    function saveBlob(blob, extension) {
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url; link.download = captureName(extension); link.style.display = 'none';
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+    function setCaptureMessage(text, persistent) {
+      clearTimeout(captureMessageTimer); captureMessageTimer = 0;
+      const message = $('captureMessage'); message.textContent = text || ''; message.classList.toggle('show', !!text);
+      if (text && !persistent) captureMessageTimer = setTimeout(() => message.classList.remove('show'), 2200);
+    }
+    $('snapshot').onclick = () => {
+      if (!surfaces.raw.gray) { setCaptureMessage(tr('capture_wait_photo')); return; }
+      drawCaptureFrame();
+      captureCanvas.toBlob(blob => {
+        if (!blob) { setCaptureMessage(tr('photo_failed')); return; }
+        saveBlob(blob, 'png'); setCaptureMessage(tr('photo_saved'));
+      }, 'image/png');
+    };
+    function recordLabel(text) { $('record').setAttribute('aria-label', text); $('record').title = text; }
+    function recordingTime() {
+      const seconds = Math.floor((performance.now() - recordStarted) / 1000);
+      return String(Math.floor(seconds / 60)).padStart(2, '0') + ':' + String(seconds % 60).padStart(2, '0');
+    }
+    function stopRecording() {
+      if (!recorder || recorder.state === 'inactive') return;
+      recorder.stop();
+    }
+    function startRecording() {
+      if (!surfaces.raw.gray) { setCaptureMessage(tr('capture_wait_video')); return; }
+      const mimeTypes = ['video/mp4;codecs=h264', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+      const mimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || '';
+      drawCaptureFrame(); recordStream = captureCanvas.captureStream(15); recordChunks = [];
+      try { recorder = new MediaRecorder(recordStream, mimeType ? {mimeType, videoBitsPerSecond: 1500000} : {videoBitsPerSecond: 1500000}); }
+      catch (error) {
+        recordStream.getTracks().forEach(track => track.stop()); recordStream = null;
+        setCaptureMessage(tr('video_start_failed')); return;
+      }
+      recorder.ondataavailable = event => { if (event.data.size) recordChunks.push(event.data); };
+      recorder.onerror = () => { setCaptureMessage(tr('video_interrupted')); };
+      recorder.onstop = () => {
+        clearInterval(recordTimer); clearInterval(recordClock); recordTimer = recordClock = 0;
+        if (recordStream) recordStream.getTracks().forEach(track => track.stop());
+        const type = recorder.mimeType || 'video/webm', extension = type.includes('mp4') ? 'mp4' : 'webm';
+        const blob = new Blob(recordChunks, {type});
+        if (blob.size) { saveBlob(blob, extension); setCaptureMessage(tr('video_saved')); }
+        else setCaptureMessage(tr('video_failed'));
+        $('record').classList.remove('recording'); recordLabel(tr('record_start'));
+        recorder = null; recordStream = null; recordChunks = [];
+      };
+      recorder.start(1000); recordStarted = performance.now();
+      recordTimer = setInterval(drawCaptureFrame, 66);
+      recordClock = setInterval(() => {
+        const time = recordingTime(); recordLabel(format('record_stop', {time})); setCaptureMessage(tr('recording') + ' · ' + time, true);
+      }, 500);
+      $('record').classList.add('recording'); recordLabel(format('record_stop', {time: '00:00'}));
+      setCaptureMessage(tr('recording') + ' · 00:00', true);
+    }
+    $('record').onclick = () => recorder && recorder.state !== 'inactive' ? stopRecording() : startRecording();
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+      $('record').disabled = true; setCaptureMessage(tr('photo_only'), true);
+    }
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopRecording(); });
+    fetch('/api/v1/network', {cache: 'no-store'}).then(response => response.ok ? response.json() : null).then(info => {
+      if (info && Number.isInteger(info.segment)) $('networkSegment').value = info.segment;
+    }).catch(() => {});
+    $('saveNetwork').onclick = async () => {
+      const segment = Number($('networkSegment').value);
+      if (!Number.isInteger(segment) || segment < 1 || segment > 254) { $('networkMessage').textContent = tr('network_invalid'); return; }
+      if (!confirm(format('network_confirm', {segment}))) return;
+      if (controller) { controller.abort(); controller = null; }
+      $('saveNetwork').disabled = true; $('networkMessage').textContent = tr('network_saving');
+      try {
+        const response = await fetch('/api/v1/network', {method: 'PUT', headers: {'Content-Type': 'application/json', 'X-Sipeed-Request': '1'}, body: JSON.stringify({segment})});
+        if (response.status !== 202) throw Error('network update failed');
+        $('networkMessage').textContent = tr('network_saved');
+        setTimeout(() => { location.href = 'http://192.168.' + segment + '.1/'; }, 3000);
+      } catch (error) {
+        $('networkMessage').textContent = tr('network_failed'); $('saveNetwork').disabled = false; stream();
+      }
+    };
+    function waitForBoot() { fetch('/api/v1/ota/status?t=' + Date.now(), {cache: 'no-store'}).then(response => response.ok ? location.reload() : setTimeout(waitForBoot, 500)).catch(() => setTimeout(waitForBoot, 500)); }
+    $('update').onclick = () => {
+      const file = $('firmware').files[0];
+      if (!file) { $('otaMessage').textContent = tr('select_first'); return; }
+      if (!/\.bin$/i.test(file.name)) { $('otaMessage').textContent = tr('select_bin'); return; }
+      if (!confirm(format('install_confirm', {name: file.name}))) return;
+      if (controller) { controller.abort(); controller = null; }
+      $('update').disabled = true; $('otaMessage').textContent = tr('writing');
+      const request = new XMLHttpRequest(); request.open('POST', '/api/v1/ota'); request.setRequestHeader('Content-Type', 'application/octet-stream'); request.setRequestHeader('X-Sipeed-Request', '1');
+      request.upload.onprogress = event => { if (event.lengthComputable) $('otaProgress').value = event.loaded * 100 / event.total; };
+      request.onload = () => {
+        if (request.status === 202) { $('otaProgress').value = 100; $('otaMessage').textContent = tr('update_done'); setTimeout(waitForBoot, 2500); }
+        else { $('otaMessage').textContent = tr('update_failed'); $('update').disabled = false; stream(); }
+      };
+      request.onerror = () => { $('otaMessage').textContent = tr('connection_lost'); $('update').disabled = false; stream(); };
+      request.send(file);
+    };
+    createPaletteButtons(); setLut('iron'); applyLanguage(); refreshControls(); stream(); loadModel('fast').catch(() => {});
+  })();
+  </script>
+</body>
+</html>

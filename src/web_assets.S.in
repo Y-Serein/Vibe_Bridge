@@ -1,0 +1,31 @@
+.section .rodata.thermal_web_assets,"a",%progbits
+
+.balign 4
+.global thermal_web_index_start
+.global thermal_web_index_end
+thermal_web_index_start:
+.incbin "@CMAKE_CURRENT_SOURCE_DIR@/src/web/index.html"
+thermal_web_index_end:
+
+.balign 4
+.global thermal_sr_fast_wasm_start
+.global thermal_sr_fast_wasm_end
+thermal_sr_fast_wasm_start:
+.incbin "@CMAKE_CURRENT_SOURCE_DIR@/src/web/assets/sr-fast.wasm"
+thermal_sr_fast_wasm_end:
+
+.balign 4
+.global thermal_sr_fast_simd_wasm_start
+.global thermal_sr_fast_simd_wasm_end
+thermal_sr_fast_simd_wasm_start:
+.incbin "@CMAKE_CURRENT_SOURCE_DIR@/src/web/assets/sr-fast-simd.wasm"
+thermal_sr_fast_simd_wasm_end:
+
+.balign 4
+.global thermal_sr_fast_weights_start
+.global thermal_sr_fast_weights_end
+thermal_sr_fast_weights_start:
+.incbin "@CMAKE_CURRENT_SOURCE_DIR@/src/web/assets/sr-fast.bin"
+thermal_sr_fast_weights_end:
+
+.section .note.GNU-stack,"",%progbits

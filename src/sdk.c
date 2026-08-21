@@ -27,21 +27,6 @@ const float* flash_gain =
 const struct BadPt* flash_badpt =
     (const struct BadPt*)(XIP_BASE + FLASH_TARGET_OFFSET + FLASH_OFS_BADPTS);
 
-const struct ThermalV2Info* flash_thermal_v2_header =
-    (const struct ThermalV2Info*)(XIP_BASE + FLASH_TARGET_OFFSET
-                                  + FLASH_OFS_THERMAL_V2_INFO);
-
-const int16_t* flash_thermal_v2_maps[THERMAL_V2_MAP_COUNT] = {
-    (const int16_t*)(XIP_BASE + FLASH_TARGET_OFFSET
-                     + FLASH_OFS_THERMAL_V2_MAP0),
-    (const int16_t*)(XIP_BASE + FLASH_TARGET_OFFSET
-                     + FLASH_OFS_THERMAL_V2_MAP1),
-    (const int16_t*)(XIP_BASE + FLASH_TARGET_OFFSET
-                     + FLASH_OFS_THERMAL_V2_MAP2),
-    (const int16_t*)(XIP_BASE + FLASH_TARGET_OFFSET
-                     + FLASH_OFS_THERMAL_V2_MAP3),
-};
-
 enum DataOutMode dataomode = DATA_OUT_MODE_DEF;
 
 struct Button buttons[BUTTON_NUM_MAX];

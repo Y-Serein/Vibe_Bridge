@@ -10,8 +10,8 @@ project(
 )
 
 option(
-    UVC_MJPEG640_STATIC_TEST
-    "Expose a static 640x480 MJPEG compatibility profile for host testing"
+    THERMAL_OTA_BOOT_PROBE
+    "Erase and verify only the safe OTA header sector once during boot"
     OFF
 )
 
@@ -30,7 +30,79 @@ set(DEFAULT_C_FLAGS
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(pico_sdk_import)
+# U6 is ZD25WQ16C (16 Mbit / 2 MiB). Set this before pico_sdk_init() so the
+# generated linker FLASH region also uses the physical device size.
+set(PICO_FLASH_SIZE_BYTES 2097152)
 pico_sdk_init()
+
+# Pico SDK 2.2.0 carries TinyUSB 0.18.0.  Backport only the CDC-NCM host
+# negotiation fix from TinyUSB PR #3630 into a build-local source overlay.
+# This keeps the SDK checkout immutable and makes the workaround reproducible.
+set(THERMAL_TINYUSB_NCM_OVERLAY
+    ${CMAKE_CURRENT_BINARY_DIR}/tinyusb-ios26
+)
+set(THERMAL_TINYUSB_NCM_PATCH
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tinyusb-0.18-ncm-ios26.patch
+)
+set_property(
+    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${THERMAL_TINYUSB_NCM_PATCH}
+)
+file(MAKE_DIRECTORY ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net)
+foreach(TINYUSB_NCM_FILE ncm_device.c ncm.h net_device.h)
+    configure_file(
+        ${PICO_TINYUSB_PATH}/src/class/net/${TINYUSB_NCM_FILE}
+        ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net/${TINYUSB_NCM_FILE}
+        COPYONLY
+    )
+    # The SDK checkout can be mounted with executable permission bits.  Keep
+    # the build-local copy a normal source file so git apply accepts the
+    # patch's 100644 headers on every host filesystem.
+    file(CHMOD
+        ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net/${TINYUSB_NCM_FILE}
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    )
+endforeach()
+find_package(Git REQUIRED)
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} apply --whitespace=nowarn
+            ${THERMAL_TINYUSB_NCM_PATCH}
+    WORKING_DIRECTORY ${THERMAL_TINYUSB_NCM_OVERLAY}
+    RESULT_VARIABLE THERMAL_TINYUSB_PATCH_RESULT
+    ERROR_VARIABLE THERMAL_TINYUSB_PATCH_ERROR
+)
+if(NOT THERMAL_TINYUSB_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to backport TinyUSB PR #3630: ${THERMAL_TINYUSB_PATCH_ERROR}"
+    )
+endif()
+
+get_target_property(
+    THERMAL_TINYUSB_DEVICE_SOURCES tinyusb_device_base INTERFACE_SOURCES
+)
+list(REMOVE_ITEM THERMAL_TINYUSB_DEVICE_SOURCES
+    ${PICO_TINYUSB_PATH}/src/class/net/ncm_device.c
+)
+list(APPEND THERMAL_TINYUSB_DEVICE_SOURCES
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net/ncm_device.c
+)
+set_property(
+    TARGET tinyusb_device_base PROPERTY INTERFACE_SOURCES
+    "${THERMAL_TINYUSB_DEVICE_SOURCES}"
+)
+
+set(THERMAL_WEB_ASSETS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/web/index.html
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/web/assets/sr-fast.wasm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/web/assets/sr-fast-simd.wasm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/web/assets/sr-fast.bin
+)
+set(THERMAL_WEB_ASSEMBLY ${CMAKE_CURRENT_BINARY_DIR}/web_assets.S)
+configure_file(src/web_assets.S.in ${THERMAL_WEB_ASSEMBLY} @ONLY)
+set_source_files_properties(
+    ${THERMAL_WEB_ASSEMBLY}
+    PROPERTIES OBJECT_DEPENDS "${THERMAL_WEB_ASSETS}"
+)
 
 set(FAMILY rp2040)
 set(BOARD pico_sdk)
@@ -45,6 +117,9 @@ add_executable(
     ${PROJECT_NAME} 
     src/sdk.c
     src/main.c
+    src/thermal_ncm.c
+    src/thermal_ota.c
+    src/cmap/turbo.c
     src/init.c
     src/led.c
     src/static_data.c
@@ -52,33 +127,33 @@ add_executable(
     src/dutx.c
     src/utils.c
     src/usb_descriptors.c
-    # src/usb_descriptors_cdc.c
-    src/uvc.c
-    src/cmap/hot.c
-    src/cmap/cool.c
-    src/cmap/magma.c
-    src/cmap/turbo.c
-    src/cmap/gray.c
-    src/cmap/deepgreen.c
-    src/yuy2_smpte_bars.c
-    src/yuy2_red.c
-    src/yuy2_green.c
-    src/yuy2_blue.c
-    src/frame_FF0000.c
-    src/frame_00FF00.c
-    src/frame_0000FF.c
-    src/frame_FFFFFF.c
+    ${THERMAL_WEB_ASSEMBLY}
+    ${PICO_TINYUSB_PATH}/lib/networking/dhserver.c
+    src/dnserver.c
+)
+target_link_options(
+    ${PROJECT_NAME} PRIVATE
+    "LINKER:--script=${CMAKE_CURRENT_SOURCE_DIR}/pico_flash_region_custom.ld"
+)
+set_property(
+    TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/pico_flash_region_custom.ld
 )
 set_property(TARGET ${PROJECT_NAME} PROPERTY OUTPUT_NAME "${PROJECT_NAME}.elf")
+set_property(
+    SOURCE src/main.c APPEND PROPERTY COMPILE_DEFINITIONS
+    THERMAL_OTA_BOOT_PROBE=$<BOOL:${THERMAL_OTA_BOOT_PROBE}>
+)
 target_compile_options(${PROJECT_NAME} PRIVATE ${DEFAULT_C_FLAGS})
 target_compile_definitions(
     ${PROJECT_NAME} PRIVATE
     REG_DATE_SPI_LEN=1286
     REG_DATE_SPI_LEN32=320
-    PICO_FLASH_SIZE_BYTES=4194304
+    PICO_FLASH_SIZE_BYTES=2097152
     PICO_STACK_SIZE=2048
-    PICO_STACK_SIZE_CORE1=4096
-    UVC_MJPEG640_STATIC_TEST=$<BOOL:${UVC_MJPEG640_STATIC_TEST}>
+    PICO_CORE1_STACK_SIZE=4096
+    THERMAL_NCM_MODE=1
+    PICO_TN160_VERSION=\"${PROJECT_VERSION}\"
 )
 
 target_link_libraries(
@@ -90,6 +165,7 @@ target_link_libraries(
     pico_unique_id
     tinyusb_device
     tinyusb_board
+    pico_lwip_nosys
     pico_multicore
     hardware_adc
     hardware_flash
@@ -98,6 +174,12 @@ target_link_libraries(
 target_include_directories(
     ${PROJECT_NAME} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${PICO_TINYUSB_PATH}/lib/networking>
+)
+
+target_compile_options(${PROJECT_NAME} PRIVATE
+    -Wno-error=sign-conversion
+    -Wno-error=conversion
 )
 
 target_link_options(

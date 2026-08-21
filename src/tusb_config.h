@@ -1,62 +1,36 @@
-#ifndef _TUSB_CONFIG_H_
-#define _TUSB_CONFIG_H_
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+#ifndef TUSB_CONFIG_H
+#define TUSB_CONFIG_H
 
 #define CFG_TUSB_MCU          OPT_MCU_RP2040
 #define BOARD_TUD_MAX_SPEED   OPT_MODE_FULL_SPEED
 #define CFG_TUD_MAX_SPEED     OPT_MODE_FULL_SPEED
 #define CFG_TUSB_RHPORT0_MODE OPT_MODE_DEVICE
 #define BOARD_TUD_RHPORT      0
-
 #ifdef CFG_TUSB_OS
-#    undef CFG_TUSB_OS
+#undef CFG_TUSB_OS
 #endif
 #define CFG_TUSB_OS OPT_OS_NONE
+#define CFG_TUSB_DEBUG        0
+#define CFG_TUD_ENABLED       1
 
-#ifndef CFG_TUSB_DEBUG
-#    define CFG_TUSB_DEBUG 0
+#define CFG_TUSB_MEM_SECTION
+#define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
+#define CFG_TUD_ENDPOINT0_SIZE 64
+
+#define CFG_TUD_VIDEO     0
+#define CFG_TUD_CDC       0
+#define CFG_TUD_MSC       0
+#define CFG_TUD_HID       0
+#define CFG_TUD_MIDI      0
+#define CFG_TUD_VENDOR    0
+#define CFG_TUD_ECM_RNDIS 0
+#define CFG_TUD_NCM       1
+
+#define CFG_TUD_NCM_IN_NTB_MAX_SIZE  8192
+#define CFG_TUD_NCM_OUT_NTB_MAX_SIZE 8192
+#define CFG_TUD_NCM_IN_NTB_N         3
+#define CFG_TUD_NCM_OUT_NTB_N        1
+#define CFG_TUD_NCM_IN_MAX_DATAGRAMS_PER_NTB  8
+#define CFG_TUD_NCM_OUT_MAX_DATAGRAMS_PER_NTB 6
+
 #endif
-
-// Enable Device stack
-#define CFG_TUD_ENABLED 1
-
-/* USB DMA on some MCUs can only access a specific SRAM region with restriction
- * on alignment. Tinyusb use follows macros to declare transferring memory so
- * that they can be put into those specific section. e.g
- * - CFG_TUSB_MEM SECTION : __attribute__ (( section(".usb_ram") ))
- * - CFG_TUSB_MEM_ALIGN   : __attribute__ ((aligned(4)))
- */
-#ifndef CFG_TUSB_MEM_SECTION
-#    define CFG_TUSB_MEM_SECTION
-#endif
-
-#ifndef CFG_TUSB_MEM_ALIGN
-#    define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
-#endif
-
-//--------------------------------------------------------------------
-// DEVICE CONFIGURATION
-//--------------------------------------------------------------------
-
-#ifndef CFG_TUD_ENDPOINT0_SIZE
-#    define CFG_TUD_ENDPOINT0_SIZE 64
-#endif
-
-//------------- CLASS -------------//
-// The number of video control interfaces
-#define CFG_TUD_VIDEO 1
-
-// The number of video streaming interfaces
-#define CFG_TUD_VIDEO_STREAMING 1
-
-// Use full-speed bulk UVC on Linux/WSL; USB/IP is unreliable with FS ISO.
-#define CFG_TUD_VIDEO_STREAMING_BULK 1
-
-// TinyUSB video packet buffer / UVC dwMaxPayloadTransferSize for bulk.
-#define CFG_TUD_VIDEO_STREAMING_EP_BUFSIZE 256
-#define CFG_TUD_VIDEO_STREAMING_MAX_PAYLOAD_SIZE 256
-
-#endif /* _TUSB_CONFIG_H_ */

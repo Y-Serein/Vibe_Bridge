@@ -1,406 +1,91 @@
 # pico_tn160
 
-`pico_tn160` 是一个基于 RP2350、TinyUSB 和 PIO/DMA 的热成像采集项目。当前主线围绕 `160x120` 热成像数据采集、双核缓冲处理、UART 输出、USB UVC 输出、双点校准、自动 FFC、温度范围估算和 Flash 校准数据持久化展开。
-
-## 项目目标
-
-- 采集 `160x120` 热成像原始数据
-- 通过双核结构降低采集与输出之间的互相阻塞
-- 支持通过 UART 输出原始或归一化图像数据
-- 支持通过 USB UVC 输出电脑可识别的视频流
-- 支持双点校准，生成背景图、增益表、坏点表
-- 支持运行时坏点修复
-- 支持自动 FFC，刷新背景偏置并补偿 FPA 温漂
-- 支持基于双点标定的温度范围估算
-- 将校准结果写入 Flash，并在后续启动时加载
-
-## 当前主线与默认业务逻辑
-
-默认模式来自 [src/sdk.h](src/sdk.h)：
-
-- `MAIN_FUNC_MODE = MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`
-
-对应入口：
-
-- `main() -> spi_init_40MHz4()`
-
-当前主线流程可以概括为：
-
-- 传感器输出原始热成像数据
-- Core0 通过底层采集链路接收原始包并写入 `rxring`
-- Core0 根据包头/包尾规则将原始包组装成完整帧并写入 `rawbuf`
-- Core1 从 `rawbuf` 读取 `RAWBUF_READY` 帧
-- Core1 将帧处理成：
-  - `norm_buf`，用于 UART 输出
-  - `uvc_buf`，用于 UVC 输出
-- Core1 在正常输出过程中执行：
-  - 校准背景扣除
-  - 增益校正
-  - 坏点修复
-  - 百分位平滑
-  - 温度范围映射
-  - 自动 FFC 判断与执行
-- 如果处于校准模式：
-  - Core1 采集两张参考图
-  - 调用 `start_cali()`
-  - 计算并写入校准数据
-
-### Core0 负责
-
-- 初始化采集环境
-- 从底层链路接收原始包
-- 将原始包写入 `rxring`
-- 根据包头/包尾规则组装成完整帧
-- 将完整帧写入 `rawbuf`
-- 在帧尾进行：
-  - ADC 收尾
-  - 快门状态切换
-  - 当前帧标记为 `RAWBUF_READY`
-  - 申请下一帧缓冲
-  - 采集同步重启
-
-### Core1 负责
-
-- 初始化 UART、DMA、TinyUSB、按键扫描
-- 轮询串口命令并切换运行模式
-- 从 `rawbuf` 读取 `RAWBUF_READY` 帧
-- 将图像处理为 `norm_buf`
-- 根据当前模式执行：
-  - UART DMA 输出
-  - UVC 帧准备与 USB 输出
-  - 自动 FFC
-  - 校准流程
-  - Flash 校准数据导出
-
-### 数据链路
-
-- `传感器 -> rxring -> rawbuf -> norm_buf / uvc_buf -> UART / UVC`
-
-注意：
-
-- Core0 和 Core1 之间走共享缓冲区和状态位
-- 不走 Core 间串口通信
-
-## 软件结构
-
-### 主线文件
-
-- [src/main.c](src/main.c)
-  - 主入口
-  - 模式分发
-  - 当前默认业务逻辑
-- [src/init.c](src/init.c)
-  - SPI/PIO/DMA 初始化
-  - 原始包接收与环形缓冲
-- [src/sdk.h](src/sdk.h)
-  - GPIO 定义
-  - 模式开关
-  - Flash 布局
-  - 全局结构体
-- [src/sdk.c](src/sdk.c)
-  - 公共状态
-  - 错误处理
-  - 按键扫描
-  - Flash 指针映射
-- [src/usb_descriptors.c](src/usb_descriptors.c)
-  - USB/UVC 描述符
-- [src/utils.c](src/utils.c)
-  - 行处理
-  - 14bit 到 8bit 映射辅助逻辑
-- [src/dutx.c](src/dutx.c)
-  - 调试日志输出
+`pico_tn160` 是基于 RP2350、TinyUSB、PIO/DMA 的 `160×120` 热成像固件。当前产品基线仅使用 USB CDC-NCM 和设备内 HTTP 服务；不再把 UART、USB CDC 或 UVC 作为产品数据、标定或诊断入口。
 
-### 相关目录
+完整的跨产品协议见 [Sipeed Thermal USB/NCM/HTTP Protocol v1](docs/SIPEED_THERMAL_USB_NCM_HTTP_PROTOCOL_V1.md)。
 
-- [src](src)
-  - 固件主线源码
-- [docs](docs)
-  - 当前整理后的开发文档、接口文档和 TODO
-- [tools/backup](tools/backup)
-  - 历史脚本、抓包、分析 notebook、参考数据
+## 当前产品接口
 
-如果只是继续当前主线开发，通常优先关注：
+- USB class：CDC-NCM（`CFG_TUD_NCM=1`）
+- UVC / USB CDC：已关闭（`CFG_TUD_VIDEO=0`、`CFG_TUD_CDC=0`）
+- 默认设备地址：`http://192.168.17.1/`
+- 设备能力：`GET /api/v1/device`
+- 已处理预览：`GET /frame.temp8`、`GET /stream.temp8`
+- 产测原始帧：`GET /frame.adc16`（160×120、14-bit 有效 ADC、little-endian）
+- 网络设置：`GET` / `PUT /api/v1/network`
+- 固件升级：`POST /api/v1/ota`，状态为 `GET /api/v1/ota/status`
 
-1. [README.md](README.md)
-2. [docs](docs)
-3. [src/sdk.h](src/sdk.h)
-4. [src/main.c](src/main.c)
-5. [src/init.c](src/init.c)
+设备内置网页、DHCP、DNS captive portal 与 HTTP 服务均运行在同一条 USB NCM 链路上。Windows 使用 Microsoft OS 2.0 `WINNCM` 绑定；构建时还会对 TinyUSB 0.18.0 应用可复现的 NCM 协商补丁。
 
-## 文档入口
+## 数据链路
 
-更详细的接手文档已经整理到 [docs](docs)：
+```text
+传感器 -> PIO/DMA -> rxring -> rawbuf -> Core1 校正/FFC -> NCM HTTP
+```
 
-- [docs/README.md](docs/README.md)
-- [docs/development.md](docs/development.md)
-- [docs/interfaces.md](docs/interfaces.md)
-- [docs/TODO.md](docs/TODO.md)
+- Core0 接收并组装原始帧，维护采集同步。
+- Core1 完成背景扣除、增益校正、坏点修复、显示范围映射、自动 FFC 和 NCM/TCP 服务。
+- `temp8` 帧为 `160×120 uint8 + 120-byte SITHMETA`；`adc16` 用于产测读取校正前的原始 ADC。
 
-建议第一次接手按下面顺序看：
+源代码仍保留少量旧 UART/UVC 测试和兼容代码，避免影响传感器/FFC 逻辑；它们不在当前产品入口和 USB 描述符中，也不构成支持接口。
 
-1. [README.md](README.md)
-2. [docs/development.md](docs/development.md)
-3. [docs/interfaces.md](docs/interfaces.md)
-4. [src/sdk.h](src/sdk.h)
-5. [src/main.c](src/main.c)
-6. [src/init.c](src/init.c)
+## 标定与 Flash
 
-## 当前支持的输出模式
+运行时仍使用既有的双点标定数据、坏点表与自动 FFC。2 MiB Flash 固定布局如下：
 
-### UART
+| 地址范围 | 大小 | 用途 |
+| --- | ---: | --- |
+| `0x000000-0x0BFFFF` | 768 KiB | 当前运行固件 |
+| `0x0C0000-0x17FFFF` | 768 KiB | OTA 暂存镜像 |
+| `0x180000-0x1FDFFF` | 504 KiB | 传感器标定数据 |
+| `0x1FE000-0x1FEFFF` | 4 KiB | OTA 事务头 |
+| `0x1FF000-0x1FFFFF` | 4 KiB | 产品设置（当前为网络段号） |
 
-支持两类内部输出：
+链接脚本会拒绝超过 768 KiB 的活动镜像，保证可构建镜像能放入等大的 OTA 槽。
 
-- `UOM_CALI_U8`
-  - 8bit 灰度帧
-- `UOM_RAW_U16`
-  - 原始 16bit 数据流，含附加信息
+### 重要边界
 
-当前 `UOM_CALI_U8` 输出不仅包含 8bit 灰度帧，还会在帧尾附带温度范围信息：
+`/frame.adc16` 已使产测主机能够通过 USB 获取原始帧；但“把新的双点标定结果写入 Flash”的 HTTP 请求格式、鉴权和掉电恢复语义尚未定义，也尚未实现。旧串口标定命令不应再用于产品流程。实现 USB 标定写入前，必须先冻结该协议契约并在真机上验证 Flash 事务安全性。
 
-- `[PX_CNT+3..PX_CNT+4]`
-  - 当前帧低温估计，单位 `0.1°C`
-- `[PX_CNT+5..PX_CNT+6]`
-  - 当前帧高温估计，单位 `0.1°C`
+当前 OTA 端点只完成长度、CRC 和 RP2350 向量范围检查，设备能力会声明 `"rollback": false`；没有签名、型号/硬件匹配或掉电回滚。它仅可用于非生产板联调，不能作为量产升级机制。
 
-当温度映射尚未建立时，这两个字段返回 `INT16_MAX` 作为 `N/A`。
+## 构建
 
-运行时可通过串口命令切换波特率、输出格式、校准模式和 Flash dump 模式。更详细的协议说明见 [docs/interfaces.md](docs/interfaces.md)。
+项目使用 `build.sh`：
 
-### UVC
+```bash
+bash /home/slam/Sipeed/pico_tn160/build.sh
+```
 
-UVC 当前成功基线如下：
+NCM 依赖 Pico SDK 2.2.0 的 lwIP submodule。SDK 副本的 `lib/lwip` 若未初始化，先提供一个完整的 lwIP 根目录：
 
-- 分辨率：`160x120`
-- 帧率：`10fps`
-- 像素格式：`YUY2`
-- USB 传输：full-speed Bulk UVC
-- Bulk endpoint：`wMaxPacketSize=64`
-- UVC payload / TinyUSB epbuf：`256`
-- 已验证：Windows 可见，Linux/V4L2 可连续抓取 10fps，guvcview 可用
+```bash
+PICO_LWIP_PATH=/path/to/lwip bash /home/slam/Sipeed/pico_tn160/build.sh
+```
 
-当前流程是：
+不要把临时下载的依赖或构建产物提交到仓库。构建产物为：
 
-- 先将内部灰度帧通过色图 LUT 转换
-- 再编码为 `YUY2`
-- 最后通过 TinyUSB 作为 UVC 设备输出
+```text
+/home/slam/build/pico_tn160/pico_tn160.elf.uf2
+```
 
-### CDC
+## 验证
 
-仓库中保留了 `cdc_func()` 测试模式，用于 USB CDC 串口验证，但当前主线默认不走这一模式。
+静态协议校验脚本需要已连接的 NCM 设备：
 
-## 校准、FFC 与温度
+```bash
+python3 scripts/validate_thermal_protocol_v1.py http://192.168.17.1
+```
 
-当前主线支持双点校准、Flash 持久化加载、自动 FFC 和基于双点标定的温度范围估算。
+本仓库不能用构建结果代替上板验证。发布前至少验证：Windows、Linux 与 Android/iOS 的 NCM 枚举；DHCP 后可访问设备页；`/frame.temp8`、`/frame.adc16`、OTA 及反复拔插均按协议工作。
 
-### 双点校准
+## 主要文件
 
-校准流程大致为：
+- [src/main.c](src/main.c)：采集、校正、FFC、Core0/Core1 协作和 NCM 帧发布
+- [src/thermal_ncm.c](src/thermal_ncm.c)：NCM、DHCP/DNS、HTTP 与帧传输
+- [src/thermal_ota.c](src/thermal_ota.c)：OTA 与 Flash 事务
+- [src/usb_descriptors.c](src/usb_descriptors.c)：NCM USB 描述符和 Windows 绑定
+- [src/tusb_config.h](src/tusb_config.h)：TinyUSB class 与 NCM 缓冲配置
+- [docs/SIPEED_THERMAL_USB_NCM_HTTP_PROTOCOL_V1.md](docs/SIPEED_THERMAL_USB_NCM_HTTP_PROTOCOL_V1.md)：公开协议
 
-1. 进入校准模式
-2. 采集两张参考图
-3. Core1 调用 `start_cali()`
-4. 计算：
-   - 背景图
-   - 增益表
-   - 坏点表
-   - `mean_diff`
-5. 写入 Flash
-6. 通过 UART 回传校准结果
-7. 重启
-
-当前双点标定会把以下关键量写入 Flash：
-
-- 低温参考背景图
-- 每像素增益表
-- 坏点表
-- `mean_diff`
-  - 高低参考帧的平均响应差
-- `t_ref_low`
-  - 低温参考点温度
-
-当前代码中的高温参考点固定为：
-
-- `T_REF_HIGH = 100.0°C`
-
-也就是说，当前温度映射使用：
-
-- 低温参考点：`t_ref_low`
-- 高温参考点：`100°C`
-
-### 运行时图像校正
-
-正常输出时，主线对每帧执行：
-
-1. 原始 `14bit` 数据 Gray 转普通二进制
-2. 背景扣除
-3. 增益校正
-4. 坏点修复
-5. 百分位范围统计
-6. 低/高范围平滑
-7. 线性映射到 `8bit`
-8. 估算当前帧温度范围
-
-其中坏点修复已经接入主线，不再只是“识别和写入”。
-
-### 自动 FFC
-
-当前代码已经实现运行时 FFC，不需要每次都重新做完整双点校准。
-
-FFC 的作用是：
-
-- 在快门闭合时采集一帧均匀背景
-- 刷新运行时背景图 `ram_calibg`
-- 重新计算全局背景均值
-- 重置显示百分位平滑器
-- 更新温度锚点 `ram_temp_anchor`
-
-这样可以在不改变原始增益表和 `mean_diff` 的前提下，补偿自上次完整标定以来的 FPA 漂移。
-
-当前 FFC 触发条件有两类：
-
-- 首次启动后的短延时触发
-- 正常运行阶段按时间或 FPA ADC 漂移量触发
-
-当前阈值为：
-
-- 首次 FFC：`3000 ms`
-- 稳态周期 FFC：`120000 ms`
-- FPA ADC 漂移阈值：`150`
-
-### 温度映射与温漂补偿
-
-当前代码已经把温度映射从“仅有双点标定数据”推进到“带 FFC 温漂补偿”的状态。
-
-当前温度映射核心依赖：
-
-- `ram_mean_diff`
-- `ram_t_ref_low`
-- `ram_temp_anchor`
-
-运行时不再直接使用当前背景均值作为温度零点，而是使用：
-
-- 低温参考帧均值 `ram_l_ref_mean`
-- 配合 FFC 后更新的 `ram_temp_anchor`
-
-这样可以避免“FFC 后快门温度变化导致绝对温度整体偏移”的问题。代码里已经显式修正了这类常数偏移误差。
-
-当前 Flash 目标区域为最后 `512KB`，详细偏移见 [docs/development.md](docs/development.md)。
-
-已知限制：
-
-- 当前输出的是“当前帧温度范围”，不是完整逐像素温度矩阵
-- 低温参考点仍由标定数据决定，当前默认产测流程里写入的是 `0.0°C`
-- 高温参考点当前写死为 `100°C`，如果产线标定点变化，需要同步修改固件常量
-- FFC 主要补偿偏置漂移，不会替代完整双点标定
-
-## 构建环境
-
-- `CMake + Ninja`
-- `pico-sdk`
-- `TinyUSB`
-- `Arm GNU Toolchain`
-
-项目自带脚本 [cdk](cdk) 依赖：
-
-- `PICO_SDK_PATH`
-- `PICO_TOOLCHAIN_PATH`
-
-- Arm GNU Toolchain Downloads: <https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads>
-- 常见 WSL x86_64 环境使用：
-  - `arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz`
-
-### `cdk` 常用命令
-
-- `./cdk b`
-  - 格式化并构建
-- `./cdk r`
-  - 清理后重构建
-- `./cdk c`
-  - 删除 `build`
-- `./cdk f`
-  - 格式化代码
-- `./cdk a`
-  - 构建并复制 UF2 到设备
-
-注意：
-
-- `cdk` 中有本机路径和挂载设备的写死依赖
-- 接手前应先本地化
-
-## 固件烧录
-
-1. 下载固件和烧录程序
-   - 固件 `sha256`:
-     - `be941b84b7265ced7d715bae93dbf48c3704d0fa722575c79824bbf4c5927131`
-   - 烧录程序：
-     - 构建于 `https://git.corp.sipeed.com/iawak9lkm/th160flash`
-2. 双击打开烧录程序
-3. 点击 `Select Fireware`，选择固件
-4. 点击 `Start Monitoring`
-5. 按住 `Th160` 的 `BOOT` 按钮上电，等待自动检测并烧录
-6. 显示绿色 `SUCCESS` 后拔掉设备
-
-## 产测 / 双点校准流程
-
-以下内容保留自旧文档，作为当前可参考的产测流程草稿。
-
-### 环境准备
-
-1. 下载产测软件（Windows）
-   - 构建于 `https://git.corp.sipeed.com/iawak9lkm/th160pt`
-2. 安装 `PotPlayerSetup64`
-3. 准备两条 Type-C 线：
-   - 一条接产测电脑
-   - 一条接电源适配器
-
-术语约定：
-
-- 连接电脑的线：数据线
-- 连接电源适配器的线：电源线
-- `USB 转串口模块`：串口模块
-- `Thermal160`：`th160`
-
-### 当前产测步骤
-
-注意：以下流程不包含烧录固件，仅为双点校准。
-
-1. 打开产测软件 `th160pt_xxx.exe`
-2. 将数据线接到串口模块，再将串口模块连接到 `th160`，注：串口模块要求2M-5M的波特率
-3. 将电源线接到 `th160`
-4. 连续按两次 `RST`
-5. 在产测软件中刷新串口并确认设备探测成功
-6. 点击开始校准
-7. 对准低温平面，稳定后按下 `BOOT`，观察 LED
-8. 对准高温平面，稳定后再次按下 `BOOT`
-9. 等待校准结果
-10. 连续按两次 `RST`，打开串口预览，观察图像是否清晰
-11. 再切换到 UVC 预览，观察图像是否清晰、是否正常出图
-
-### 常见不良项
-
-- 无法探测设备
-- 校准灯不亮
-- 串口模糊
-- UVC 模糊
-- UVC 不出图
-
-## 当前状态
-
-已经可以从源码确认的内容：
-
-- 默认主流程是 `spi_init_40MHz4()`
-- Core0/Core1 双核架构已打通
-- UART 输出链路存在
-- UVC 输出链路存在
-- 双点校准链路存在
-- Flash 校准数据写入和读回校验存在
-- 运行时坏点修复已经接入主线
-- 自动 FFC 已接入主线
-- FFC 后温度锚点更新和温漂补偿已接入主线
-- 当前帧温度范围估算已接入 UART 输出
-- 板级 ID / Flash UID / ADC / 快门 / GPIO / CDC 等测试模式存在
-
-还没有完全闭环的内容：
-
-- 有时FFC的快门会留下一个残影在屏幕上
+`docs/README/` 中的 UART/UVC 内容是历史资料，不应作为当前产品或产测契约。

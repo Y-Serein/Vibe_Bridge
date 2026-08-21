@@ -1,43 +1,43 @@
 # AGENTS.md
 
 本文件是 `/home/slam/Sipeed/pico_tn160` 的项目级规则。
-全局行为规则由 `~/.codex/AGENTS.md` 负责；本文件只补充本项目独有的启动、测试、目录、UVC/硬件坑点和交接规则。
+全局行为规则由 `~/.codex/AGENTS.md` 负责；本文件只补充本项目独有的启动、测试、目录、USB NCM/硬件坑点和交接规则。
 如果本文件与全局规则冲突，优先遵守本文件中更具体的项目规则。
 
 ---
 
 ## 0. 工程控制论式项目执行协议
 
-本文件是项目级规则；全局规则只放在 `/home/rv_nano/.codex/AGENTS.md`。本项目任务默认按闭环推进：目标 -> 状态 -> 误差 -> 控制动作 -> 反馈 -> 修正 -> 验证 -> 沉淀。
+本文件是项目级规则；全局规则只放在 `/home/slam/.codex/AGENTS.md`。本项目任务默认按闭环推进：目标 -> 状态 -> 误差 -> 控制动作 -> 反馈 -> 修正 -> 验证 -> 沉淀。
 
 - 动手前先说明当前目标、系统状态、目标与现状误差、本轮控制变量和最小闭环验证方式。
 - 只调整完成目标所需的最小变量，不把无关优化、重构或格式化混进当前任务。
-- 修改后必须用构建结果、UVC 抓帧、主机兼容性反馈、硬件实测或用户反馈验证；反馈不一致时先定位误差来源，再继续改。
-- USB 描述符、UVC payload、PIO、DMA、时序和硬件参数必须保持稳定性优先；禁止为了当前任务破坏 Windows/Linux 已跑通基线。
+- 修改后必须用构建结果、NCM/HTTP 帧读取、主机兼容性反馈、硬件实测或用户反馈验证；反馈不一致时先定位误差来源，再继续改。
+- USB NCM 描述符、TinyUSB 网络缓冲、PIO、DMA、时序和 Flash/OTA 参数必须保持稳定性优先；禁止为了当前任务破坏已跑通的多平台 NCM 基线。
 - 长任务或上下文可能丢失时，按项目规则更新 HANDOFF，而不是依赖对话记忆。
 
 辅助工具：
 
-- 开工前优先运行只读 preflight：`python3 /home/rv_nano/Sipeed/T_tools/agent_preflight.py --project pico-tn160`。
-- 用户要求接手、先看看、对齐需求、以结果为导向、可反驳、先不要改代码时，优先读取 `/home/rv_nano/Sipeed/.claude/skills/project-intake/SKILL.md`。
-- UVC、USB descriptor、Bulk/ISO、PIO/DMA、热成像采集或烧录器任务优先读取 `/home/rv_nano/Sipeed/.claude/skills/pico-tn160-uvc/SKILL.md`。
-- 遇到重复问题先查 `/home/rv_nano/Sipeed/C_context/KNOWN_FAILURES.md`。
+- 开工前优先运行只读 preflight：`python3 /home/slam/Sipeed/T_tools/agent_preflight.py --project pico-tn160`。
+- 用户要求接手、先看看、对齐需求、以结果为导向、可反驳、先不要改代码时，优先读取 `/home/slam/Sipeed/.agents/skills/project-intake/SKILL.md`。
+- UVC、USB descriptor、Bulk/ISO、PIO/DMA、热成像采集或烧录器任务优先读取 `/home/slam/Sipeed/.agents/skills/pico-tn160-uvc/SKILL.md`。
+- 遇到重复问题先查 `/home/slam/Sipeed/C_context/KNOWN_FAILURES.md`。
 
 ---
 
 ## 1. 项目概览
 
-- 本项目是：基于 RP2350 的 TN160 热成像采集与 USB UVC 输出固件。
-- 主要技术栈：Pico SDK、TinyUSB、PIO、DMA、双核处理、UART 协议、UVC YUY2 视频输出。
-- 主要运行环境：RP2350 固件；主机侧主要验证 Windows、Linux/WSL V4L2、guvcview。
-- 当前核心目标：保持正式热成像固件可构建，并维持 Windows/Linux 可用的 UVC 成功基线。
+- 本项目是：基于 RP2350 的 TN160 热成像采集与 USB NCM/HTTP 输出固件。
+- 主要技术栈：Pico SDK、TinyUSB CDC-NCM、lwIP、PIO、DMA、双核处理、HTTP、Flash/OTA。
+- 主要运行环境：RP2350 固件；主机侧验证 Windows、Linux、Android/iOS 的 USB NCM 与 HTTP。
+- 当前核心目标：保持正式热成像固件可构建，并维持多平台可用的 NCM 成功基线。
 - 产品/工程优先级：稳定性 > 可验证性 > 小改动 > 跨平台兼容 > 性能 > 重构。
 
 不要把本项目当成：
 
 - 普通桌面/后端项目：它的主要风险在固件、USB 协议、时序、DMA/PIO 和硬件实测。
 - 可随便重构的实验项目：很多参数来自硬件验证，不能凭经验改。
-- 只看 Windows 的 UVC 项目：Linux/V4L2/guvcview 兼容性也是当前基线的一部分。
+- 只看单一主机系统的 USB 项目：Windows、Linux、Android/iOS 的 NCM 枚举和 HTTP 可达性都是当前基线的一部分。
 
 ---
 
@@ -82,18 +82,17 @@ bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 | tail -5
 bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 | tail -5
 ```
 
-涉及 UVC 时，硬件侧由用户在 Windows/Linux 上验证。没有上板实测时，必须明确写“未上板验证”。
+涉及 NCM/HTTP/OTA 时，硬件侧由用户在 Windows、Linux、Android/iOS 上验证。没有上板实测时，必须明确写“未上板验证”。
 
 ### 运行单个测试 / 最小相关测试
 
-UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命令即可；命令未变化时，不要反复整段发送，直接说“用上次的 v4l2-ctl 命令”。
+NCM 当前最小真机校验使用 `python3 scripts/validate_thermal_protocol_v1.py http://192.168.17.1`；必须在设备已通过 DHCP 枚举且 HTTP 可达时执行。
 
 期望结果：
 
-- `VIDIOC_STREAMON returned 0`
-- 连续 `DQBUF`
-- `bytesused=38400`
-- 5 帧输出文件大小为 `192000` bytes
+- `/api/v1/device` 返回协议版本和 NCM 地址。
+- `/frame.temp8` 与 `/frame.adc16` 的 payload、metadata 和 CRC 满足 HTTP v1。
+- 拔插后主机重新得到 DHCP 地址并能恢复访问。
 
 ### Lint / Format / Type Check
 
@@ -103,26 +102,39 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 
 ## 3. 项目结构
 
-- `src/`：固件主线源码，包含采集、处理、UVC、USB 描述符、模式配置。
-- `src/main.c`：主入口、双核处理、UVC 发送、校准/FFC 主逻辑。
+- `src/`：固件主线源码，包含采集、处理、NCM/HTTP、USB 描述符、Flash/OTA 和模式配置。
+- `src/main.c`：主入口、双核处理、NCM 帧发布、校准/FFC 主逻辑。
 - `src/init.c`：SPI/PIO/DMA 初始化和原始数据接收链路。
 - `src/sdk.h`：GPIO、模式开关、Flash 布局和全局结构定义。
-- `src/tusb_config.h`：TinyUSB 配置，UVC payload/buffer 等关键参数在这里。
-- `src/usb_descriptors.c` / `src/usb_descriptors.h`：USB/UVC 描述符。
+- `src/tusb_config.h`：TinyUSB 配置，NCM NTB 缓冲等关键参数在这里。
+- `src/usb_descriptors.c` / `src/usb_descriptors.h`：USB CDC-NCM 描述符。
+- `src/thermal_ncm.c` / `src/thermal_ncm.h`：NCM、DHCP/DNS、HTTP 与热帧协议。
+- `src/thermal_ota.c` / `src/thermal_ota.h`：OTA 和 Flash 事务。
 - `tools/pico-sdk-2.2.0/`：本项目实际使用的 Pico SDK/TinyUSB 副本；不要改 `/home/slam/pico-sdk` 这类旧路径。
 - `tools/backup/`：历史脚本、抓包、分析 notebook、参考数据。
 - `docs/`：开发文档、接口文档、日志和 TODO。
+- `docs/design/`：设计文档、架构、方案。
+- `docs/adr/`：架构决策记录，可选。
+- `docs/reference/`：芯片资料、协议资料、外部参考。
+- `docs/runbooks/`：操作手册、排障流程。
+- `docs/release/`：发布说明、验收记录。
+- `scripts/`：项目脚本，偏工程流程。
+- `tools/`：独立小工具，偏可复用工具；本项目已有 Pico SDK 副本也在此目录，按现有说明处理。
+- `tests/`：测试。
+- `examples/`：示例。
+- `assets/`：正式资源。
+- `build/`：构建产物，通常忽略。
+- `out/`：临时输出或生成结果。
 - `build.sh`：当前固定构建入口。
 - `HANDOFF.md`：当前 session 交接状态；顶部当前状态优先。
-- `C_context/`：本地背景资料和 QA 日志，不上传，已在 `.gitignore` 中忽略。
-- `D_deliverables/`：最终交付物。
-- `R_raw/`：临时分析、实验结果、草稿。
-- `T_tools/`：可复用的小工具或脚本。
 
 规则：
 
 - 代码、测试、配置、资源文件优先遵守项目原有目录结构。
-- 文档、交付物、草稿、临时分析、工具脚本才使用 CDTR。
+- 正式文档优先放 `docs/`；设计文档、架构、方案优先放 `docs/design/`。
+- 项目脚本优先放 `scripts/`；独立可复用工具优先放 `tools/`。
+- 测试、示例和正式资源分别优先放 `tests/`、`examples/`、`assets/`。
+- 构建产物和临时输出优先放 `build/` 或 `out/`，并按项目规则忽略。
 - 不要把临时文件、测试输出、分析草稿平铺到项目根目录。
 - `AGENTS.md` 是用户明确要求的项目根配置文件，属于根目录例外。
 - 不确定新文件放哪里时，先看已有结构；仍不确定再问用户。
@@ -136,7 +148,7 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 - 不做无关重构。
 - 不做无关格式化；当前工作区存在一些历史换行/格式噪声，不能顺手纳入。
 - 不引入新依赖，除非用户明确要求或现有方案无法解决。
-- 不改变 USB 描述符、UVC payload、端点、帧率、UART 协议、Flash 格式、GPIO/ADC 定义，除非当前任务明确要求。
+- 不改变 USB NCM 描述符、NTB 缓冲、端点、HTTP 协议、Flash/OTA 格式、GPIO/ADC 定义，除非当前任务明确要求。
 - 不把 bug fix 扩大成架构改造。
 - 不为了“高级写法”牺牲稳定性、可读性和调试便利。
 - 如果发现无关但重要的问题，只报告，不直接修改。
@@ -151,7 +163,7 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 
 1. 文档或规则文件修改：读回文件并检查 diff。
 2. 固件源码修改：运行最小构建命令。
-3. UVC/USB/硬件相关修改：构建通过后等待用户上板验证 Windows/Linux/guvcview。
+3. NCM/USB/硬件相关修改：构建通过后等待用户上板验证 Windows、Linux、Android/iOS 的枚举、DHCP 与 HTTP。
 4. GUI/工具脚本修改：运行对应脚本或最小启动检查。
 5. 如果无法实测硬件，明确标注“未上板验证”。
 
@@ -185,12 +197,12 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 
 ## 7. 常见坑点
 
-- 当前 UVC 成功基线是 full-speed Bulk UVC，不要回退到历史 ISO payload 猜测路线。
-- UVC 基线参数：`160x120`、`YUY2`、`10fps`、Bulk endpoint `wMaxPacketSize=64`、UVC payload / TinyUSB epbuf `256`。
-- Windows 可见、Linux/V4L2 可连续抓 10fps、guvcview 可用，三者都属于成功条件。
-- guvcview 曾只能选择 `1/1 fps`，原因是 continuous frame interval 的 max 暴露到了 1fps；当前已收窄到 10fps。
-- `MAIN_FUNC_MODE` 必须保持正式热成像模式 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`，不要把 `MAIN_FUNC_MODE_UVC_MAX` 测试模式留在正式源码里。
-- `/dev/video0` 是当前 Linux YUYV capture 节点；历史上 `/dev/video1` 不是这路采集入口。
+- 当前成功基线是 full-speed USB CDC-NCM + HTTP v1，不要回退到 UVC、CDC 或串口产品路径。
+- NCM 基线参数：`CFG_TUD_NCM=1`、NCM IN/OUT NTB 均为 `8192`、HTTP 默认地址 `192.168.17.1`、`temp8` 和 `adc16` 均带 120-byte `SITHMETA`。
+- Windows、Linux、Android/iOS 的 NCM 枚举、DHCP 和 HTTP 帧访问都属于成功条件。
+- `MAIN_FUNC_MODE` 必须保持正式热成像模式 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`，不要把历史 UVC/CDC 测试模式留在正式源码里。
+- Pico SDK 2.2.0 的 lwIP 必须完整初始化；若 SDK 中的 `lib/lwip` 为空，设置 `PICO_LWIP_PATH`，不要为构建静默下载未知版本。
+- 新 Flash 布局为活动镜像 768 KiB、OTA 镜像 768 KiB、校准数据 504 KiB、OTA 头 4 KiB、设置 4 KiB；未经上板验证不要改变其偏移。
 - `tools/pico-sdk-2.2.0/` 是当前实际 SDK。根目录旧 SDK 副本已清理，不要再引用 `/home/slam/pico-sdk` 或 `/home/slam/pico-sdk-2.2.0`。
 - `C_context/` 是本地资料目录，不上传；不要把 `C_context/QA_Log.md` 重新纳入 Git。
 - 大文件、大目录、生成物不要全文读取，优先用 `rg`、`find`、`sed -n` 精确定位。
@@ -243,8 +255,8 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 
 本项目不是 UI / 桌面主项目，但仓库内有辅助 GUI/脚本。
 
-- 修改 `tools/pico_th160_thermocam_gui/` 时，保持现有 GUI 风格和串口协议解析方式。
-- GUI 改动不能要求固件协议同时变化，除非任务明确要求。
+- 修改 `tools/pico_th160_thermocam_gui/` 时，保持现有 GUI 风格，并优先适配 NCM/HTTP 协议；不要恢复串口作为产品通道。
+- GUI 改动不能擅自要求固件协议同时变化，除非任务明确要求。
 - 不要把 GUI 体验优化混进固件 bug 修复。
 - 工具输出、截图、临时分析文件不要放在项目根目录。
 
@@ -263,8 +275,8 @@ UVC 当前常用 Linux/WSL 验证使用用户上次那条 `v4l2-ctl` 抓帧命�
 
 - 不凭经验猜寄存器值、USB 描述符、帧率、端点、GPIO 复用或时序参数。
 - 涉及 I2C 地址必须区分 7-bit 和 8-bit。
-- 涉及 USB / UVC / HID 时，优先保证协议合法性和 Windows / Linux / macOS 兼容性。
-- 涉及 UVC Payload Header、endpoint descriptor、commit/probe 参数时，必须说明当前行为、目标行为、修改层级和可能影响的主机系统。
+- 涉及 USB NCM / HTTP 时，优先保证协议合法性和 Windows / Linux / Android/iOS 兼容性。
+- 涉及 NCM descriptor、NTB、DHCP/DNS、HTTP 帧格式、OTA 或 Flash 事务时，必须说明当前行为、目标行为、修改层级和可能影响的主机系统。
 - 涉及实时任务、线程优先级、DMA、USB 中断、显示刷新时，必须说明是否可能影响系统流畅度或资源占用。
 - 涉及 GPIO/ADC/NTC/AVDD 时，不要只从软件角度判断；硬件连线和供电问题可能是根因。
 - 涉及电源、MOS、充电、OTG、过流、发热时，不要只从软件角度判断，必须提示可能存在硬件风险。
