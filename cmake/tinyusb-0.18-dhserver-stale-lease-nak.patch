@@ -1,0 +1,104 @@
+diff --git a/lib/networking/dhserver.c b/lib/networking/dhserver.c
+--- a/lib/networking/dhserver.c
++++ b/lib/networking/dhserver.c
+@@ -179,6 +179,13 @@ int fill_options(void *dest,
+ 	set_ip(ptr, serverid);
+ 	ptr += 4;
+ 
++	/* A DHCPNAK contains only the message type, server identifier, and
++	 * end marker.  In particular it must not advertise a lease. */
++	if (msg_type == DHCP_NAK) {
++		*ptr++ = DHCP_END;
++		return ptr - (uint8_t *)dest;
++	}
++
+ 	/* lease time */
+ 	*ptr++ = DHCP_LEASETIME;
+ 	*ptr++ = 4;
+@@ -230,6 +238,8 @@ static void udp_recv_proc(void *arg, struct udp_pcb *upcb, struct pbuf *p, const
+ 	dhcp_entry_t *entry;
+ 	struct pbuf *pp;
+ 	struct netif *netif = netif_get_by_index(p->if_idx);
++	ip4_addr_t requested_ip;
++	int renewing;
+ 
+ 	(void)arg;
+ 	(void)addr;
+@@ -280,23 +289,50 @@ static void udp_recv_proc(void *arg, struct udp_pcb *upcb, struct pbuf *p, const
+ 			break;
+ 
+ 		case DHCP_REQUEST:
+-			/* 1. find requested ipaddr in option list */
++			/* SELECTING/INIT-REBOOT uses option 50.  BOUND/RENEWING/
++			 * REBINDING must omit option 50 and put the current address in
++			 * ciaddr (RFC 2131 sections 4.3.2 and 4.4.5). */
+ 			ptr = find_dhcp_option(dhcp_data.dp_options, sizeof(dhcp_data.dp_options), DHCP_IPADDRESS);
+-			if (ptr == NULL) break;
+-			if (ptr[1] != 4) break;
+-			ptr += 2;
++			renewing = 0;
++			if (ptr != NULL) {
++				if (ptr[1] != 4) break;
++				requested_ip = get_ip(ptr + 2);
++			} else {
++				requested_ip = get_ip(dhcp_data.dp_ciaddr);
++				if (ip4_addr_isany_val(requested_ip)) break;
++				renewing = 1;
++			}
+ 
+-			/* 2. does hw-address registered? */
++			/* Release a previous binding for this client before checking the
++			 * requested address.  This also makes a same-address renewal
++			 * idempotent after a device-side DHCP restart. */
+ 			entry = entry_by_mac(dhcp_data.dp_chaddr);
+ 			if (entry != NULL) free_entry(entry);
+ 
+-			/* 3. find requested ipaddr */
+-			entry = entry_by_ip(get_ip(ptr));
+-			if (entry == NULL) break;
+-			if (!is_vacant(entry)) break;
++			entry = entry_by_ip(requested_ip);
++			if (entry == NULL || !is_vacant(entry)) {
++				/* Silence makes Windows keep retrying a stale lease before it
++				 * eventually falls back to DISCOVER.  Reject it immediately. */
++				dhcp_data.dp_op = 2; /* reply */
++				dhcp_data.dp_secs = 0;
++				dhcp_data.dp_flags = 0;
++				memset(dhcp_data.dp_ciaddr, 0, sizeof(dhcp_data.dp_ciaddr));
++				memset(dhcp_data.dp_yiaddr, 0, sizeof(dhcp_data.dp_yiaddr));
++				memcpy(dhcp_data.dp_magic, magic_cookie, 4);
++				memset(dhcp_data.dp_options, 0, sizeof(dhcp_data.dp_options));
++				fill_options(dhcp_data.dp_options, DHCP_NAK, config->domain,
++					config->dns, 0, *netif_ip4_addr(netif), config->router,
++					*netif_ip4_netmask(netif));
++				pp = pbuf_alloc(PBUF_TRANSPORT, sizeof(dhcp_data), PBUF_POOL);
++				if (pp == NULL) break;
++				memcpy(pp->payload, &dhcp_data, sizeof(dhcp_data));
++				udp_sendto(upcb, pp, IP_ADDR_BROADCAST, port);
++				pbuf_free(pp);
++				break;
++			}
+ 
+ 			/* 4. fill struct fields */
+-			memcpy(dhcp_data.dp_yiaddr, ptr, 4);
++			set_ip(dhcp_data.dp_yiaddr, requested_ip);
+ 			dhcp_data.dp_op = 2; /* reply */
+ 			dhcp_data.dp_secs = 0;
+ 			dhcp_data.dp_flags = 0;
+@@ -316,7 +352,15 @@ static void udp_recv_proc(void *arg, struct udp_pcb *upcb, struct pbuf *p, const
+ 			if (pp == NULL) break;
+ 			memcpy(entry->mac, dhcp_data.dp_chaddr, 6);
+ 			memcpy(pp->payload, &dhcp_data, sizeof(dhcp_data));
+-			udp_sendto(upcb, pp, IP_ADDR_BROADCAST, port);
++			if (renewing) {
++				/* The renewing client is already configured, so reply directly
++				 * to ciaddr instead of waiting for another broadcast cycle. */
++				ip_addr_t destination;
++				ip_addr_set_ip4_u32(&destination, requested_ip.addr);
++				udp_sendto(upcb, pp, &destination, port);
++			} else {
++				udp_sendto(upcb, pp, IP_ADDR_BROADCAST, port);
++			}
+ 			pbuf_free(pp);
+ 			break;
+ 

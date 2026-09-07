@@ -42,6 +42,23 @@ enum sipeed_thermal_pixel_format {
     SIPEED_THERMAL_PIXEL_JPG = 7,
 };
 
+enum sipeed_thermal_ffc_state {
+    SIPEED_FFC_STATE_IDLE = 0,
+    SIPEED_FFC_STATE_PENDING = 1,
+    SIPEED_FFC_STATE_ACQUIRING = 2,
+    SIPEED_FFC_STATE_APPLYING = 3,
+    SIPEED_FFC_STATE_FAILED = 4,
+    SIPEED_FFC_STATE_UNKNOWN = 255,
+};
+
+enum sipeed_thermal_shutter_state {
+    SIPEED_SHUTTER_STATE_OPEN = 0,
+    SIPEED_SHUTTER_STATE_CLOSED = 1,
+    SIPEED_SHUTTER_STATE_MOVING = 2,
+    SIPEED_SHUTTER_STATE_NOT_PRESENT = 3,
+    SIPEED_SHUTTER_STATE_UNKNOWN = 255,
+};
+
 /* Sipeed Thermal USB/NCM/HTTP protocol v1 metadata. All multi-byte fields
  * are IEEE-754/little-endian on the wire. meta_crc32 covers bytes 0..115. */
 struct __attribute__((packed)) sipeed_thermal_meta_v1 {

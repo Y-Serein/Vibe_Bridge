@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件是 `/home/slam/Sipeed/pico_tn160` 的项目级规则。
+本文件是 `/home/slam/dev/pico_tn160` 的项目级规则。
 全局行为规则由 `~/.codex/AGENTS.md` 负责；本文件只补充本项目独有的启动、测试、目录、USB NCM/硬件坑点和交接规则。
 如果本文件与全局规则冲突，优先遵守本文件中更具体的项目规则。
 
@@ -18,7 +18,7 @@
 
 辅助工具：
 
-- 开工前优先运行只读 preflight：`python3 /home/slam/Sipeed/T_tools/agent_preflight.py --project pico-tn160`。
+- 开工前优先运行只读 preflight：`python3 /home/slam/tools/agent_preflight.py --project pico-tn160`。
 - 用户要求接手、先看看、对齐需求、以结果为导向、可反驳、先不要改代码时，优先读取 `/home/slam/Sipeed/.agents/skills/project-intake/SKILL.md`。
 - UVC、USB descriptor、Bulk/ISO、PIO/DMA、热成像采集或烧录器任务优先读取 `/home/slam/Sipeed/.agents/skills/pico-tn160-uvc/SKILL.md`。
 - 遇到重复问题先查 `/home/slam/Sipeed/C_context/KNOWN_FAILURES.md`。
@@ -47,7 +47,8 @@
 
 - `README.md`
 - `HANDOFF.md`
-- `build.sh`
+- `CMakePresets.json`
+- `../env.sh`
 - `CMakeLists.txt`
 - `tools/pico-sdk-2.2.0/`
 - `docs/`
@@ -60,26 +61,49 @@
 
 ### 启动开发环境
 
-没有长期运行的开发服务。默认工作流是修改固件源码、构建 UF2、用户上板验证。
+没有长期运行的开发服务。默认工作流是代理修改固件源码、用户手动构建 UF2、用户上板验证。
 
-### 构建
+### 构建权限（用户固定要求）
+
+- 固件构建和最终 UF2 生成默认全部由用户手动执行。
+- 代理不得主动运行 `cmake --build`、`cmake --fresh`、配置加构建或其他会更新 `build/`、ELF、UF2 的命令。
+- 用户说“继续”、“尝试一下”、“修改”、“验证”或认可方案，都不等于授权代理构建。
+- 只有用户在当轮明确说“请你构建”或等价精确指令时，代理才可例外执行该次构建。
+- 代理修改固件后，只做不生成固件的源码、diff 和静态检查；然后提供一行用户可直接执行的真实构建命令，并等待用户反馈。
+- 未收到用户构建结果前，必须标注“未经用户最终构建”；代理曾生成的产物不得当作最终交付件。
+
+下列命令是用户手动构建的参考合同，它们出现在本文中不构成对代理的构建授权。
+
+### 增量构建
 
 ```bash
-bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 | tail -5
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --build --preset pico2-release --parallel "$(nproc)"
+```
+
+### 配置并构建
+
+```bash
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --preset pico2-release && cmake --build --preset pico2-release --parallel "$(nproc)"
+```
+
+### 彻底刷新
+
+```bash
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --fresh --preset pico2-release && cmake --build --preset pico2-release --parallel "$(nproc)"
 ```
 
 构建产物：
 
 ```text
-/home/slam/build/pico_tn160/pico_tn160.elf.uf2
+/home/slam/dev/pico_tn160/build/pico_tn160.elf.uf2
 ```
 
 ### 运行测试
 
-本项目没有完整自动化测试。固件相关修改优先运行最小构建：
+本项目没有完整自动化测试。固件相关修改的最小构建由用户手动运行：
 
 ```bash
-bash /home/slam/Sipeed/pico_tn160/build.sh 2>&1 | tail -5
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --build --preset pico2-release --parallel "$(nproc)"
 ```
 
 涉及 NCM/HTTP/OTA 时，硬件侧由用户在 Windows、Linux、Android/iOS 上验证。没有上板实测时，必须明确写“未上板验证”。
@@ -125,7 +149,7 @@ NCM 当前最小真机校验使用 `python3 scripts/validate_thermal_protocol_v1
 - `assets/`：正式资源。
 - `build/`：构建产物，通常忽略。
 - `out/`：临时输出或生成结果。
-- `build.sh`：当前固定构建入口。
+- `CMakePresets.json`：当前固定配置与构建预设。
 - `HANDOFF.md`：当前 session 交接状态；顶部当前状态优先。
 
 规则：
@@ -162,8 +186,8 @@ NCM 当前最小真机校验使用 `python3 scripts/validate_thermal_protocol_v1
 推荐顺序：
 
 1. 文档或规则文件修改：读回文件并检查 diff。
-2. 固件源码修改：运行最小构建命令。
-3. NCM/USB/硬件相关修改：构建通过后等待用户上板验证 Windows、Linux、Android/iOS 的枚举、DHCP 与 HTTP。
+2. 固件源码修改：代理运行不生成固件的静态检查，然后由用户手动运行最小构建命令。
+3. NCM/USB/硬件相关修改：收到用户构建通过的反馈后，再等待用户上板验证 Windows、Linux、Android/iOS 的枚举、DHCP 与 HTTP。
 4. GUI/工具脚本修改：运行对应脚本或最小启动检查。
 5. 如果无法实测硬件，明确标注“未上板验证”。
 
@@ -201,7 +225,7 @@ NCM 当前最小真机校验使用 `python3 scripts/validate_thermal_protocol_v1
 - NCM 基线参数：`CFG_TUD_NCM=1`、NCM IN/OUT NTB 均为 `8192`、HTTP 默认地址 `192.168.17.1`、`temp8` 和 `adc16` 均带 120-byte `SITHMETA`。
 - Windows、Linux、Android/iOS 的 NCM 枚举、DHCP 和 HTTP 帧访问都属于成功条件。
 - `MAIN_FUNC_MODE` 必须保持正式热成像模式 `MAIN_FUNC_MODE_SPI_INIT_40MHZ_4`，不要把历史 UVC/CDC 测试模式留在正式源码里。
-- Pico SDK 2.2.0 的 lwIP 必须完整初始化；若 SDK 中的 `lib/lwip` 为空，设置 `PICO_LWIP_PATH`，不要为构建静默下载未知版本。
+- 构建环境统一由 `../env.sh` 和 `CMakePresets.json` 提供；缺少 lwIP 时必须失败，不要为构建静默下载未知版本。
 - 新 Flash 布局为活动镜像 768 KiB、OTA 镜像 768 KiB、校准数据 504 KiB、OTA 头 4 KiB、设置 4 KiB；未经上板验证不要改变其偏移。
 - `tools/pico-sdk-2.2.0/` 是当前实际 SDK。根目录旧 SDK 副本已清理，不要再引用 `/home/slam/pico-sdk` 或 `/home/slam/pico-sdk-2.2.0`。
 - `C_context/` 是本地资料目录，不上传；不要把 `C_context/QA_Log.md` 重新纳入 Git。

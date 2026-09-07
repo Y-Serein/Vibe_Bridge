@@ -252,7 +252,14 @@ struct __attribute__((packed)) FlashDataInfo {
     uint32_t gain_size;
     float mean_diff; /* avg(raw_h - raw_l) across valid pixels */
     float t_ref_low; /* scene temperature (°C) of the low reference frame */
-    uint8_t _pad1[24];
+    /* Optional per-device thermal model.  The tag defines the meaning of the
+     * following three fields; the layout stays compatible with the original
+     * NTC model and keeps the 64-byte V1 header unchanged. */
+    uint16_t thermal_ntc_tag;
+    uint16_t thermal_ntc_reference_adu;
+    int16_t thermal_ntc_k_q8;
+    uint16_t thermal_ntc_limit_adu;
+    uint8_t _pad1[16];
 };
 
 struct FlashOpInfo {

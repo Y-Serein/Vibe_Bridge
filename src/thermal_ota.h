@@ -43,6 +43,18 @@ uint32_t thermal_ota_diag_stage(void);
 uint32_t thermal_ota_diag_offset(void);
 int32_t thermal_ota_diag_result(void);
 
+/* Internal persistent-data helpers. Offsets are relative to the calibration
+ * window and are intentionally restricted to that window. They use the same
+ * Core0 SRAM flash rendezvous as OTA. */
+bool thermal_ota_calibration_flash_erase(uint32_t relative_offset);
+bool thermal_ota_calibration_flash_program(uint32_t relative_offset,
+                                           const uint8_t* page);
+uint32_t thermal_flash_crc32_begin(void);
+uint32_t thermal_flash_crc32_update(uint32_t crc, const uint8_t* data,
+                                    size_t bytes);
+uint32_t thermal_flash_crc32_finish(uint32_t crc);
+uint32_t thermal_flash_crc32(const uint8_t* data, size_t bytes);
+
 /* One flash page in the final dedicated 4 KiB sector. Intended for small
  * product settings, never sensor calibration data. */
 bool thermal_settings_read(void* data, size_t bytes);
@@ -50,6 +62,8 @@ bool thermal_settings_read(void* data, size_t bytes);
  * migration. New settings must never be written there. */
 bool thermal_settings_read_legacy(void* data, size_t bytes);
 bool thermal_settings_write(const void* data, size_t bytes);
+bool thermal_settings_write_during_calibration(const void* data,
+                                               size_t bytes);
 
 void thermal_ota_schedule_install(uint32_t delay_ms);
 void thermal_ota_task(void);

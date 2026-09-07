@@ -1,7 +1,6 @@
 ---
 name: handoff
 description: Write or update ./HANDOFF.md so the user or next AI session can resume the project in 30 seconds after several days.
-disable-model-invocation: true
 ---
 
 # HANDOFF Skill

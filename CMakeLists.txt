@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.22)
 include(FetchContent)
 get_filename_component(prj_name ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(pico_sdk_import)
+
 project(
     ${prj_name}
     VERSION 0.1.0
@@ -28,8 +31,6 @@ set(DEFAULT_C_FLAGS
     -Wbuiltin-macro-redefined
 )
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(pico_sdk_import)
 # U6 is ZD25WQ16C (16 Mbit / 2 MiB). Set this before pico_sdk_init() so the
 # generated linker FLASH region also uses the physical device size.
 set(PICO_FLASH_SIZE_BYTES 2097152)
@@ -41,14 +42,29 @@ pico_sdk_init()
 set(THERMAL_TINYUSB_NCM_OVERLAY
     ${CMAKE_CURRENT_BINARY_DIR}/tinyusb-ios26
 )
+file(RELATIVE_PATH
+    THERMAL_TINYUSB_NCM_OVERLAY_RELATIVE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${THERMAL_TINYUSB_NCM_OVERLAY}
+)
+if(THERMAL_TINYUSB_NCM_OVERLAY_RELATIVE MATCHES "^\\.\\.")
+    message(FATAL_ERROR
+        "TinyUSB overlay must stay inside the pico_tn160 workspace"
+    )
+endif()
 set(THERMAL_TINYUSB_NCM_PATCH
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tinyusb-0.18-ncm-ios26.patch
+)
+set(THERMAL_TINYUSB_DHCP_PATCH
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tinyusb-0.18-dhserver-stale-lease-nak.patch
 )
 set_property(
     DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${THERMAL_TINYUSB_NCM_PATCH}
+    ${THERMAL_TINYUSB_DHCP_PATCH}
 )
 file(MAKE_DIRECTORY ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net)
+file(MAKE_DIRECTORY ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking)
 foreach(TINYUSB_NCM_FILE ncm_device.c ncm.h net_device.h)
     configure_file(
         ${PICO_TINYUSB_PATH}/src/class/net/${TINYUSB_NCM_FILE}
@@ -63,17 +79,73 @@ foreach(TINYUSB_NCM_FILE ncm_device.c ncm.h net_device.h)
         FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
     )
 endforeach()
+configure_file(
+    ${PICO_TINYUSB_PATH}/lib/networking/dhserver.c
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking/dhserver.c
+    COPYONLY
+)
+file(CHMOD
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking/dhserver.c
+    FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+)
 find_package(Git REQUIRED)
 execute_process(
     COMMAND ${GIT_EXECUTABLE} apply --whitespace=nowarn
+            --directory=${THERMAL_TINYUSB_NCM_OVERLAY_RELATIVE}
             ${THERMAL_TINYUSB_NCM_PATCH}
-    WORKING_DIRECTORY ${THERMAL_TINYUSB_NCM_OVERLAY}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     RESULT_VARIABLE THERMAL_TINYUSB_PATCH_RESULT
     ERROR_VARIABLE THERMAL_TINYUSB_PATCH_ERROR
 )
 if(NOT THERMAL_TINYUSB_PATCH_RESULT EQUAL 0)
     message(FATAL_ERROR
         "Failed to backport TinyUSB PR #3630: ${THERMAL_TINYUSB_PATCH_ERROR}"
+    )
+endif()
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} apply --whitespace=nowarn
+            --directory=${THERMAL_TINYUSB_NCM_OVERLAY_RELATIVE}
+            ${THERMAL_TINYUSB_DHCP_PATCH}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    RESULT_VARIABLE THERMAL_TINYUSB_DHCP_PATCH_RESULT
+    ERROR_VARIABLE THERMAL_TINYUSB_DHCP_PATCH_ERROR
+)
+if(NOT THERMAL_TINYUSB_DHCP_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to patch TinyUSB DHCP stale leases: "
+        "${THERMAL_TINYUSB_DHCP_PATCH_ERROR}"
+    )
+endif()
+
+# Do not silently reuse a stale, unpatched overlay after a workspace/cache
+# migration.  The Release target below compiles these generated copies, so a
+# successful configure must prove that both required backports are present.
+file(READ
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/src/class/net/ncm_device.c
+    THERMAL_TINYUSB_NCM_OVERLAY_SOURCE
+)
+string(FIND
+    "${THERMAL_TINYUSB_NCM_OVERLAY_SOURCE}"
+    "NCM_SET_NTB_INPUT_SIZE"
+    THERMAL_TINYUSB_NCM_MARKER_OFFSET
+)
+if(THERMAL_TINYUSB_NCM_MARKER_OFFSET LESS 0)
+    message(FATAL_ERROR
+        "TinyUSB NCM overlay is stale or unpatched"
+    )
+endif()
+file(READ
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking/dhserver.c
+    THERMAL_TINYUSB_DHCP_OVERLAY_SOURCE
+)
+string(FIND
+    "${THERMAL_TINYUSB_DHCP_OVERLAY_SOURCE}"
+    "requested_ip = get_ip(dhcp_data.dp_ciaddr)"
+    THERMAL_TINYUSB_DHCP_MARKER_OFFSET
+)
+if(THERMAL_TINYUSB_DHCP_MARKER_OFFSET LESS 0)
+    message(FATAL_ERROR
+        "TinyUSB DHCP overlay is stale or unpatched"
     )
 endif()
 
@@ -117,6 +189,7 @@ add_executable(
     ${PROJECT_NAME} 
     src/sdk.c
     src/main.c
+    src/thermal_calibration_v1.c
     src/thermal_ncm.c
     src/thermal_ota.c
     src/cmap/turbo.c
@@ -128,7 +201,7 @@ add_executable(
     src/utils.c
     src/usb_descriptors.c
     ${THERMAL_WEB_ASSEMBLY}
-    ${PICO_TINYUSB_PATH}/lib/networking/dhserver.c
+    ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking/dhserver.c
     src/dnserver.c
 )
 target_link_options(
@@ -140,6 +213,7 @@ set_property(
     ${CMAKE_CURRENT_SOURCE_DIR}/pico_flash_region_custom.ld
 )
 set_property(TARGET ${PROJECT_NAME} PROPERTY OUTPUT_NAME "${PROJECT_NAME}.elf")
+set_property(TARGET ${PROJECT_NAME} PROPERTY SUFFIX "")
 set_property(
     SOURCE src/main.c APPEND PROPERTY COMPILE_DEFINITIONS
     THERMAL_OTA_BOOT_PROBE=$<BOOL:${THERMAL_OTA_BOOT_PROBE}>

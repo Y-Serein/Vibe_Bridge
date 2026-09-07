@@ -13,6 +13,7 @@
 #include "pico/stdlib.h"
 
 #include "sdk.h"
+#include "thermal_calibration_v1.h"
 
 /* Flash layout (ZD25WQ16C, 16 Mbit / 2 MiB):
  *   0x000000..0x0bffff  active application slot       (768 KiB)
@@ -178,7 +179,8 @@ void ota_diag_set(uint32_t stage, uint32_t offset)
     watchdog_hw->scratch[2] = offset;
 }
 
-static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len)
+uint32_t thermal_flash_crc32_update(uint32_t crc, const uint8_t* data,
+                                    size_t len)
 {
     static const uint32_t table[16] = {
         0x00000000u, 0x1DB71064u, 0x3B6E20C8u, 0x26D930ACu,
@@ -192,6 +194,19 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len)
         crc = (crc >> 4) ^ table[crc & 0x0fu];
     }
     return crc;
+}
+
+uint32_t thermal_flash_crc32_begin(void) { return UINT32_MAX; }
+
+uint32_t thermal_flash_crc32_finish(uint32_t crc) { return ~crc; }
+
+uint32_t thermal_flash_crc32(const uint8_t* data, size_t bytes)
+{
+    return data || !bytes
+               ? thermal_flash_crc32_finish(
+                     thermal_flash_crc32_update(thermal_flash_crc32_begin(),
+                                                data, bytes))
+               : 0u;
 }
 
 static int __attribute__((noinline,
@@ -310,6 +325,23 @@ static bool ota_flash_program(uint32_t offset, const uint8_t* page)
     return ota_submit_core0_flash(OTA_FLASH_PROGRAM, offset, page);
 }
 
+bool thermal_ota_calibration_flash_erase(uint32_t relative_offset)
+{
+    return thermal_calibration_v1_active()
+           && relative_offset < FLASH_CALIBRATION_DATA_SIZE
+           && relative_offset % FLASH_SECTOR_SIZE == 0u
+           && ota_flash_erase(FLASH_TARGET_OFFSET + relative_offset);
+}
+
+bool thermal_ota_calibration_flash_program(uint32_t relative_offset,
+                                           const uint8_t* page)
+{
+    return thermal_calibration_v1_active() && page
+           && relative_offset + FLASH_PAGE_SIZE <= FLASH_CALIBRATION_DATA_SIZE
+           && relative_offset % FLASH_PAGE_SIZE == 0u
+           && ota_flash_program(FLASH_TARGET_OFFSET + relative_offset, page);
+}
+
 bool thermal_settings_read(void* data, size_t bytes)
 {
     if (!data || bytes > FLASH_PAGE_SIZE) return false;
@@ -327,7 +359,7 @@ bool thermal_settings_read_legacy(void* data, size_t bytes)
 bool thermal_settings_write(const void* data, size_t bytes)
 {
     if (!data || !bytes || bytes > FLASH_PAGE_SIZE
-        || ota.active || ota.install_pending) {
+        || ota.active || ota.install_pending || thermal_calibration_v1_active()) {
         return false;
     }
     uint8_t page[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
@@ -335,6 +367,24 @@ bool thermal_settings_write(const void* data, size_t bytes)
     memcpy(page, data, bytes);
     if (!ota_flash_erase(PRODUCT_SETTINGS_OFS)) return false;
     return ota_flash_program(PRODUCT_SETTINGS_OFS, page);
+}
+
+bool thermal_settings_write_during_calibration(const void* data, size_t bytes)
+{
+    if (!data || !bytes || bytes > FLASH_PAGE_SIZE
+        || ota.active || ota.install_pending
+        || !thermal_calibration_v1_upload_active()) {
+        return false;
+    }
+    uint8_t page[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
+    memset(page, 0xff, sizeof(page));
+    memcpy(page, data, bytes);
+    if (!ota_flash_erase(PRODUCT_SETTINGS_OFS)
+        || !ota_flash_program(PRODUCT_SETTINGS_OFS, page)) {
+        return false;
+    }
+    return memcmp((const void*)(XIP_BASE + PRODUCT_SETTINGS_OFS), page,
+                  FLASH_PAGE_SIZE) == 0;
 }
 
 static void ota_watchdog_disarm(void)
@@ -369,7 +419,9 @@ static bool ota_flush_page(void)
 
 enum thermal_ota_result thermal_ota_begin(uint32_t image_bytes)
 {
-    if (ota.active || ota.install_pending) return THERMAL_OTA_BUSY;
+    if (ota.active || ota.install_pending || thermal_calibration_v1_active()) {
+        return THERMAL_OTA_BUSY;
+    }
     if (image_bytes < OTA_MIN_IMAGE_BYTES
         || image_bytes > OTA_MAX_IMAGE_BYTES
         || image_bytes > OTA_ACTIVE_LIMIT) {
@@ -396,7 +448,7 @@ enum thermal_ota_result thermal_ota_write(const uint8_t* data, size_t bytes)
 {
     if (!ota.active || (!data && bytes)) return THERMAL_OTA_BUSY;
     if (bytes > ota.expected - ota.received) return THERMAL_OTA_BAD_SIZE;
-    ota.crc = crc32_update(ota.crc, data, bytes);
+    ota.crc = thermal_flash_crc32_update(ota.crc, data, bytes);
     ota.received += (uint32_t)bytes;
 
     while (bytes) {
@@ -446,7 +498,7 @@ enum thermal_ota_result thermal_ota_finish(uint32_t* crc32_out)
         (const uint8_t*)(XIP_BASE + OTA_STAGE_IMAGE_OFS);
     const uint32_t crc = ~ota.crc;
     const uint32_t readback_crc =
-        ~crc32_update(UINT32_MAX, image, ota.expected);
+        thermal_flash_crc32(image, ota.expected);
     if (crc != readback_crc) {
         ota.active = false;
         ota_watchdog_disarm();
@@ -513,8 +565,7 @@ uint32_t thermal_ota_calibration_crc32(void)
 {
     const uint8_t* calibration =
         (const uint8_t*)(XIP_BASE + FLASH_TARGET_OFFSET);
-    return ~crc32_update(UINT32_MAX, calibration,
-                         FLASH_CALIBRATION_DATA_SIZE);
+    return thermal_flash_crc32(calibration, FLASH_CALIBRATION_DATA_SIZE);
 }
 
 bool thermal_ota_last_watchdog_reset(void)
@@ -570,7 +621,7 @@ static int thermal_ota_install_now(void)
     const uint8_t* staged_image =
         (const uint8_t*)(XIP_BASE + OTA_STAGE_IMAGE_OFS);
     const uint32_t staged_crc =
-        ~crc32_update(UINT32_MAX, staged_image, header.image_bytes);
+        thermal_flash_crc32(staged_image, header.image_bytes);
     if (staged_crc != header.image_crc32) {
         watchdog_hw->scratch[3] = staged_crc;
         ota_diag_set(OTA_DIAG_BAD_STAGED_CRC, header.image_bytes);

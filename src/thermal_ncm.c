@@ -21,6 +21,7 @@
 #include "tusb.h"
 
 #include "init.h"
+#include "thermal_calibration_v1.h"
 #include "thermal_ota.h"
 #include "web_assets.h"
 
@@ -30,6 +31,27 @@ extern volatile uint16_t g_ffc_bg_max_row_jump_adu;
 extern volatile uint8_t g_ffc_bg_max_row_jump_line;
 extern volatile uint16_t g_ffc_bg_min_row_mean;
 extern volatile uint16_t g_ffc_bg_max_row_mean;
+extern volatile uint16_t g_ffc_bg_max_col_jump_adu;
+extern volatile uint8_t g_ffc_bg_max_col_jump_column;
+extern volatile uint16_t g_ffc_bg_min_col_mean;
+extern volatile uint16_t g_ffc_bg_max_col_mean;
+extern volatile uint16_t g_ffc_captured_frames;
+extern volatile uint16_t g_ffc_frame_mean_span_adu;
+extern volatile uint16_t g_ffc_vtemp_span_adu;
+extern volatile uint16_t g_ffc_ntc_span_adu;
+extern volatile uint32_t g_ffc_last_duration_ms;
+extern volatile uint8_t g_ffc_state;
+extern volatile uint8_t g_shutter_state;
+extern volatile uint16_t ffc_count;
+extern volatile uint8_t g_thermal_ntc_model_valid;
+extern volatile uint16_t g_thermal_ntc_model_reference_adu;
+extern volatile int16_t g_thermal_ntc_model_k_q8;
+extern volatile uint16_t g_thermal_ntc_model_limit_adu;
+extern volatile uint8_t g_thermal_startup_model_valid;
+extern volatile uint8_t g_thermal_startup_model_active;
+extern volatile uint16_t g_thermal_startup_model_ntc_threshold_adu;
+extern volatile int16_t g_thermal_startup_model_amplitude_adu;
+extern volatile uint16_t g_thermal_startup_model_tau_ds;
 extern volatile uint32_t g_capture_packet_heads;
 extern volatile uint32_t g_capture_packet_mids;
 extern volatile uint32_t g_capture_packet_tails;
@@ -57,13 +79,13 @@ extern uint16_t g_capture_row_ref_diag[];
 
 #define INIT_IP4(a, b, c, d) { PP_HTONL(LWIP_MAKEU32(a, b, c, d)) }
 #define HTTP_CLIENT_COUNT 4
-#define HTTP_REQUEST_BYTES 1280
+#define HTTP_REQUEST_BYTES 2048
 #define HTTP_HEADER_BYTES  640
 #define HTTP_PORT          80
 
 uint8_t tud_network_mac_address[6] = {0x48, 0xDA, 0x35, 0x60, 0x00, 0x01};
 
-static ip4_addr_t ipaddr = INIT_IP4(192, 168, 17, 1);
+static ip4_addr_t ipaddr = INIT_IP4(192, 168, 10, 1);
 static const ip4_addr_t netmask = INIT_IP4(255, 255, 255, 0);
 static const ip4_addr_t gateway = INIT_IP4(0, 0, 0, 0);
 static struct netif netif_data;
@@ -79,8 +101,71 @@ static struct sipeed_thermal_meta_v1 adc16_meta;
 static uint32_t frame_counter;
 static uint32_t adc16_generation;
 static volatile uint8_t latest_meta_token = UINT8_MAX;
-static uint8_t network_segment = 17;
+#define THERMAL_NCM_FIXED_PRODUCT_ADDRESS 1
+#define THERMAL_NCM_PRODUCT_SEGMENT       17u
+static uint8_t network_segment = THERMAL_NCM_PRODUCT_SEGMENT;
 static uint32_t network_reboot_at_ms;
+
+/* A read-only projection of the existing normalized-frame diagnostic tail.
+ * Keep this separate from the public 120-byte frame metadata: production
+ * calibration needs the raw ADU history, while regular frame consumers do
+ * not need to depend on a growing binary metadata structure. */
+struct thermal_diagnostics_snapshot {
+    bool valid;
+    uint32_t frame_number;
+    uint32_t timestamp_ms;
+    uint16_t vtemp_adu;
+    int16_t temperature_low_x10;
+    int16_t temperature_high_x10;
+    int32_t anchor_adu;
+    uint16_t smooth_low_adu;
+    uint16_t smooth_high_adu;
+    float mean_diff;
+    uint16_t ntc_reference_adu;
+    uint16_t ntc_adu;
+    uint8_t nuc_decision;
+    uint16_t nuc_count;
+    uint8_t ffc_state;
+    uint8_t shutter_state;
+    int16_t nuc_dg;
+    int16_t nuc_dv;
+    int16_t nuc_dn;
+    uint16_t boot_ntc_adu;
+    uint16_t boot_ntc_delta_adu;
+    int16_t warmup_comp_adu;
+    int16_t normal_comp_adu;
+    int16_t total_comp_adu;
+    int32_t effective_anchor_adu;
+    uint16_t smooth_vtemp_adu;
+    int16_t center_raw_x10;
+    int16_t center_roi_x10;
+    uint16_t center_raw_adu;
+    uint16_t center_roi_adu;
+    uint16_t ffc_captured_frames;
+    uint16_t ffc_frame_mean_span_adu;
+    uint16_t ffc_vtemp_span_adu;
+    uint16_t ffc_ntc_span_adu;
+    uint16_t ffc_bg_min_row_mean;
+    uint16_t ffc_bg_max_row_mean;
+    uint16_t ffc_bg_max_row_jump_adu;
+    uint8_t ffc_bg_max_row_jump_line;
+    uint16_t ffc_bg_min_col_mean;
+    uint16_t ffc_bg_max_col_mean;
+    uint16_t ffc_bg_max_col_jump_adu;
+    uint8_t ffc_bg_max_col_jump_column;
+    uint32_t ffc_duration_ms;
+    uint8_t thermal_ntc_model_valid;
+    uint16_t thermal_ntc_model_reference_adu;
+    int16_t thermal_ntc_model_k_q8;
+    uint16_t thermal_ntc_model_limit_adu;
+    uint8_t thermal_startup_model_valid;
+    uint8_t thermal_startup_model_active;
+    uint16_t thermal_startup_model_ntc_threshold_adu;
+    int16_t thermal_startup_model_amplitude_adu;
+    uint16_t thermal_startup_model_tau_ds;
+};
+
+static struct thermal_diagnostics_snapshot diagnostics_snapshot;
 
 static dhcp_entry_t dhcp_entries[] = {
     {{0}, INIT_IP4(192, 168, 17, 2), 24 * 60 * 60},
@@ -105,6 +190,7 @@ enum response_kind {
     RESPONSE_STREAM_TEMP8,
     RESPONSE_FRAME_ADC16,
     RESPONSE_OTA_UPLOAD,
+    RESPONSE_CALIBRATION_UPLOAD,
     RESPONSE_NETWORK_UPDATE,
 };
 
@@ -127,6 +213,12 @@ struct http_client {
     uint8_t ota_error;
     bool ota_owner;
     bool ota_v1;
+    uint32_t calibration_expected;
+    uint32_t calibration_received;
+    uint8_t calibration_error;
+    bool calibration_owner;
+    bool calibration_complete;
+    uint8_t calibration_header[THERMAL_CALIBRATION_V1_HEADER_BYTES];
     uint8_t config_body[32];
     uint8_t config_expected;
     uint8_t config_received;
@@ -143,10 +235,20 @@ static uint16_t read_be16(const uint8_t* p)
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
+static int16_t read_be_i16(const uint8_t* p)
+{
+    return (int16_t)read_be16(p);
+}
+
 static uint32_t read_be32(const uint8_t* p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
            | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static int32_t read_be_i32(const uint8_t* p)
+{
+    return (int32_t)read_be32(p);
 }
 
 static uint32_t pixel_crc32(const uint8_t* data, size_t len);
@@ -170,6 +272,7 @@ static void network_apply_segment(uint8_t segment)
     }
 }
 
+#if !THERMAL_NCM_FIXED_PRODUCT_ADDRESS
 static bool network_settings_valid(
     const struct product_network_settings* settings)
 {
@@ -181,9 +284,17 @@ static bool network_settings_valid(
                   offsetof(struct product_network_settings, crc32))
                   == settings->crc32;
 }
+#endif
 
 static void network_load_settings(void)
 {
+#if THERMAL_NCM_FIXED_PRODUCT_ADDRESS
+    /* The production workflow owns one device at a time.  Always boot on the
+     * user-facing address so BOOTSEL flashing, diagnostics, calibration and
+     * readback share one stable endpoint without an address-change reboot. */
+    network_apply_segment(THERMAL_NCM_PRODUCT_SEGMENT);
+    return;
+#else
     struct product_network_settings settings;
     if (thermal_settings_read(&settings, sizeof(settings))
         && network_settings_valid(&settings)) {
@@ -202,9 +313,16 @@ static void network_load_settings(void)
         return;
     }
 
-    network_apply_segment(17);
+    /* A blank production unit starts on the provisioning subnet.  If its
+     * network record is lost after calibration, keep the user-facing product
+     * address instead of exposing the factory-only endpoint. */
+    network_apply_segment(thermal_calibration_v1_boot_has_calibration()
+                              ? 17
+                              : 10);
+#endif
 }
 
+#if !THERMAL_NCM_FIXED_PRODUCT_ADDRESS
 static bool network_save_segment(uint8_t segment)
 {
     struct product_network_settings settings;
@@ -216,6 +334,26 @@ static bool network_save_segment(uint8_t segment)
         (const uint8_t*)&settings,
         offsetof(struct product_network_settings, crc32));
     return thermal_settings_write(&settings, sizeof(settings));
+}
+#endif
+
+static bool network_save_product_segment(void* context)
+{
+    (void)context;
+#if THERMAL_NCM_FIXED_PRODUCT_ADDRESS
+    return true;
+#else
+    struct product_network_settings settings;
+    memset(&settings, 0, sizeof(settings));
+    memcpy(settings.magic, "SIPNET1", 8);
+    settings.version = 1;
+    settings.segment = 17;
+    settings.crc32 = pixel_crc32(
+        (const uint8_t*)&settings,
+        offsetof(struct product_network_settings, crc32));
+    return thermal_settings_write_during_calibration(
+        &settings, sizeof(settings));
+#endif
 }
 
 static float canonical_nan(void)
@@ -387,6 +525,30 @@ static bool request_header_value_starts_with(const char* request,
     return false;
 }
 
+static bool request_header_value_equals(const char* request,
+                                        const char* name,
+                                        const char* value)
+{
+    const size_t name_len = strlen(name);
+    const size_t value_len = strlen(value);
+    for (const char* p = request; *p; p++) {
+        size_t i = 0;
+        while (i < name_len && p[i] && ascii_equal_ci(p[i], name[i])) i++;
+        if (i != name_len || p[i] != ':') continue;
+        p += i + 1;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t value_index = 0;
+        while (value_index < value_len && p[value_index]
+               && ascii_equal_ci(p[value_index], value[value_index])) {
+            value_index++;
+        }
+        if (value_index != value_len) return false;
+        p += value_index;
+        while (*p == ' ' || *p == '\t') p++;
+        return *p == '\r' || *p == '\n';
+    }
+    return false;
+}
 static bool captive_probe_request(const char* request)
 {
     static const char* const paths[] = {
@@ -422,6 +584,7 @@ static void client_clear(struct http_client* client)
 {
     if (stream_owner == client) stream_owner = NULL;
     if (client->ota_owner) thermal_ota_abort();
+    if (client->calibration_owner) thermal_calibration_v1_abort();
     client_release_frame(client);
     if (adc16_owner == client) {
         adc16_owner = NULL;
@@ -542,6 +705,56 @@ static void prepare_response(struct http_client* client)
             return;
         }
     } else if (strncmp(client->request, "POST ", 5) == 0
+               && (request_has_path(client->request,
+                                    "/api/v1/calibration/v1/complete")
+                   || request_has_path(client->request,
+                                       "/api/v1/calibration/v1"))) {
+        const bool complete = request_has_path(
+            client->request, "/api/v1/calibration/v1/complete");
+        uint32_t content_length = 0;
+        enum thermal_calibration_v1_result result =
+            THERMAL_CALIBRATION_V1_BAD_SIZE;
+        if (network_reboot_at_ms) {
+            result = THERMAL_CALIBRATION_V1_BUSY;
+        } else if (request_header_value_starts_with(client->request,
+                                                     "X-Sipeed-Request", "1")
+                   && request_header_value_starts_with(
+                       client->request, "X-Sipeed-Calibration-Confirm",
+                       "write-v1")
+                   && request_header_value_starts_with(
+                       client->request, "Content-Type",
+                       "application/vnd.sipeed.tn160-calibration-v1")
+                   && (!complete || request_header_value_equals(
+                       client->request, "X-Sipeed-Final-Segment",
+                       "17"))
+                   && request_content_length(client->request,
+                                             &content_length)) {
+            result = thermal_calibration_v1_begin(content_length);
+        }
+        if (result == THERMAL_CALIBRATION_V1_OK) {
+            client->response = RESPONSE_CALIBRATION_UPLOAD;
+            client->calibration_expected = content_length;
+            client->calibration_received = 0;
+            client->calibration_error = THERMAL_CALIBRATION_V1_OK;
+            client->calibration_owner = true;
+            client->calibration_complete = complete;
+            client->header_used = 0;
+            client->header_sent = 0;
+            client->body_length = 0;
+            client->body_sent = 0;
+            return;
+        }
+        status = result == THERMAL_CALIBRATION_V1_BUSY
+                     ? "409 Conflict"
+                     : "400 Bad Request";
+        type = "application/json; charset=utf-8";
+        const int body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"ok\":false,\"error\":\"%s\"}\n",
+            thermal_calibration_v1_result_string(result));
+        client->flash_data = (const uint8_t*)client->request;
+        client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (strncmp(client->request, "POST ", 5) == 0
         && (request_has_path(client->request, "/ota.bin")
             || request_has_path(client->request, "/api/v1/ota"))) {
         const bool v1 = request_has_path(client->request, "/api/v1/ota");
@@ -591,20 +804,124 @@ static void prepare_response(struct http_client* client)
             "{\"api\":{\"name\":\"sipeed-thermal-http\",\"major\":1,\"minor\":0},"
             "\"device\":{\"model\":\"T160\",\"serial\":\"%s\",\"hardware\":\"1.0\",\"firmware\":\"%s\",\"build\":\"%s\"},"
             "\"sensor\":{\"native_width\":160,\"native_height\":120,\"recommended_rotation\":1},"
-            "\"network\":{\"segment\":%u,\"device_ip\":\"192.168.%u.1\",\"configurable\":true,\"config_url\":\"/api/v1/network\"},"
+            "\"network\":{\"segment\":%u,\"device_ip\":\"192.168.%u.1\",\"configurable\":%s,\"config_url\":\"/api/v1/network\"},"
             "\"streaming\":{\"max_stream_clients\":1,\"simultaneous_formats\":false},"
             "\"measurement\":{\"supported\":true,\"center_roi\":{\"width\":5,\"height\":5},\"config_url\":\"/api/v1/measurement\",\"summary_url\":\"/api/v1/thermal\"},"
+            "\"diagnostics\":{\"supported\":true,\"url\":\"/api/v1/diagnostics\",\"version\":1},"
             "\"super_resolution\":{\"device\":false,\"client_recommended\":true,\"client_max_native_width\":256,\"client_max_native_height\":192},"
             "\"formats\":["
             "{\"id\":\"adc16\",\"width\":160,\"height\":120,\"stride_bytes\":320,\"bits_per_pixel\":16,\"effective_bits\":14,\"temperature_encoding\":\"none\",\"metadata\":\"sipeed-thermal-meta-v1\",\"frame\":\"/frame.adc16\"},"
             "{\"id\":\"temp8\",\"width\":160,\"height\":120,\"stride_bytes\":160,\"bits_per_pixel\":8,\"temperature_encoding\":\"linear\",\"metadata\":\"sipeed-thermal-meta-v1\",\"frame\":\"/frame.temp8\",\"stream\":\"/stream.temp8\"}],"
+            "\"calibration\":{\"supported\":true,\"format\":\"tn160-calibration-v1\",\"packet_bytes\":%u,\"upload\":\"/api/v1/calibration/v1\",\"manifest\":\"/api/v1/calibration/v1/manifest\",\"data_prefix\":\"/api/v1/calibration/v1/data/\"},"
             "\"ota\":{\"supported\":true,\"format\":\"t160-bin\",\"max_bytes\":%lu,\"rollback\":false,\"upload\":\"/api/v1/ota\",\"status\":\"/api/v1/ota/status\"}}\n",
             serial, PICO_TN160_VERSION, thermal_ota_build_id(),
             (unsigned)network_segment,
             (unsigned)network_segment,
+            THERMAL_NCM_FIXED_PRODUCT_ADDRESS ? "false" : "true",
+            (unsigned)THERMAL_CALIBRATION_V1_PACKET_BYTES,
             (unsigned long)thermal_ota_max_image_bytes());
         client->flash_data = (const uint8_t*)client->request;
         client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/manifest")) {
+        type = "application/json; charset=utf-8";
+        struct thermal_calibration_v1_manifest manifest;
+        if (thermal_calibration_v1_manifest(&manifest)) {
+            const int body_len = snprintf(
+                client->request, sizeof(client->request),
+                "{\"valid\":true,\"format\":\"tn160-calibration-v1\","
+                "\"generation\":%lu,\"calibration_id\":%lu,"
+                "\"packet_bytes\":%u,\"header_bytes\":%u,"
+                "\"image_bytes\":%u,\"gain_bytes\":%u,"
+                "\"badpoint_bytes\":%u,"
+                "\"crc32\":{\"image\":\"%08lx\",\"gain\":\"%08lx\","
+                "\"badpoints\":\"%08lx\",\"payload\":\"%08lx\","
+                "\"package_header\":\"%08lx\",\"flash_header\":\"%08lx\"},"
+                "\"data\":{\"header\":\"/api/v1/calibration/v1/data/header\","
+                "\"image\":\"/api/v1/calibration/v1/data/image\","
+                "\"gain\":\"/api/v1/calibration/v1/data/gain\","
+                "\"badpoints\":\"/api/v1/calibration/v1/data/badpoints\"}}\n",
+                (unsigned long)manifest.generation,
+                (unsigned long)manifest.calibration_id,
+                (unsigned)THERMAL_CALIBRATION_V1_PACKET_BYTES,
+                (unsigned)THERMAL_CALIBRATION_V1_HEADER_BYTES,
+                (unsigned)THERMAL_CALIBRATION_V1_IMAGE_BYTES,
+                (unsigned)THERMAL_CALIBRATION_V1_GAIN_BYTES,
+                (unsigned)THERMAL_CALIBRATION_V1_BADPOINT_BYTES,
+                (unsigned long)manifest.image_crc32,
+                (unsigned long)manifest.gain_crc32,
+                (unsigned long)manifest.badpoint_crc32,
+                (unsigned long)manifest.payload_crc32,
+                (unsigned long)manifest.package_header_crc32,
+                (unsigned long)manifest.flash_header_crc32);
+            client->flash_data = (const uint8_t*)client->request;
+            client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+        } else {
+            status = "404 Not Found";
+            static const char missing[] =
+                "{\"valid\":false,\"error\":\"no valid V1 calibration\"}\n";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/data/header")) {
+        type = "application/vnd.sipeed.tn160-calibration-v1; part=header";
+        if (thermal_calibration_v1_make_packet_header(
+                client->calibration_header)) {
+            client->flash_data = client->calibration_header;
+            client->body_length = THERMAL_CALIBRATION_V1_HEADER_BYTES;
+        } else {
+            status = "404 Not Found";
+            static const char missing[] =
+                "{\"ok\":false,\"error\":\"no valid V1 calibration\"}\n";
+            type = "application/json; charset=utf-8";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/data/image")) {
+        type = "application/octet-stream";
+        if (!thermal_calibration_v1_data(THERMAL_CALIBRATION_V1_DATA_IMAGE,
+                                         &client->flash_data,
+                                         &client->body_length)) {
+            status = "404 Not Found";
+            static const char missing[] =
+                "{\"ok\":false,\"error\":\"no valid V1 calibration\"}\n";
+            type = "application/json; charset=utf-8";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/data/gain")) {
+        type = "application/octet-stream";
+        if (!thermal_calibration_v1_data(THERMAL_CALIBRATION_V1_DATA_GAIN,
+                                         &client->flash_data,
+                                         &client->body_length)) {
+            status = "404 Not Found";
+            static const char missing[] =
+                "{\"ok\":false,\"error\":\"no valid V1 calibration\"}\n";
+            type = "application/json; charset=utf-8";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
+    } else if (is_read
+               && request_has_path(
+                   client->request, "/api/v1/calibration/v1/data/badpoints")) {
+        type = "application/octet-stream";
+        if (!thermal_calibration_v1_data(
+                THERMAL_CALIBRATION_V1_DATA_BADPOINTS, &client->flash_data,
+                &client->body_length)) {
+            status = "404 Not Found";
+            static const char missing[] =
+                "{\"ok\":false,\"error\":\"no valid V1 calibration\"}\n";
+            type = "application/json; charset=utf-8";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
     } else if (is_read
                && request_has_path(client->request, "/api/v1/network")) {
         type = "application/json; charset=utf-8";
@@ -613,9 +930,12 @@ static void prepare_response(struct http_client* client)
             "{\"mode\":\"fixed_private_subnet\",\"segment\":%u,"
             "\"device_ip\":\"192.168.%u.1\",\"prefix_length\":24,"
             "\"dhcp_first\":\"192.168.%u.2\",\"dhcp_last\":\"192.168.%u.4\","
-            "\"default_segment\":17}\n",
+            "\"default_segment\":%u,\"product_segment\":17,"
+            "\"configurable\":%s}\n",
             (unsigned)network_segment, (unsigned)network_segment,
-            (unsigned)network_segment, (unsigned)network_segment);
+            (unsigned)network_segment, (unsigned)network_segment,
+            THERMAL_NCM_FIXED_PRODUCT_ADDRESS ? 17u : 10u,
+            THERMAL_NCM_FIXED_PRODUCT_ADDRESS ? "false" : "true");
         client->flash_data = (const uint8_t*)client->request;
         client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
     } else if (is_read
@@ -628,6 +948,148 @@ static void prepare_response(struct http_client* client)
             "\"reflected_temperature_c\":25.0}}\n";
         client->flash_data = (const uint8_t*)measurement;
         client->body_length = sizeof(measurement) - 1;
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/diagnostics")) {
+        type = "application/json; charset=utf-8";
+        if (diagnostics_snapshot.valid) {
+            struct thermal_diagnostics_snapshot diagnostics =
+                diagnostics_snapshot;
+            /* FFC can run while the last published frame remains held for
+             * display.  Report the live controller state here; public frame
+             * metadata continues to describe the state when that frame was
+             * actually produced. */
+            diagnostics.nuc_count = ffc_count;
+            diagnostics.ffc_state = g_ffc_state;
+            diagnostics.shutter_state = g_shutter_state;
+            diagnostics.ffc_captured_frames = g_ffc_captured_frames;
+            diagnostics.ffc_frame_mean_span_adu =
+                g_ffc_frame_mean_span_adu;
+            diagnostics.ffc_vtemp_span_adu = g_ffc_vtemp_span_adu;
+            diagnostics.ffc_ntc_span_adu = g_ffc_ntc_span_adu;
+            diagnostics.ffc_bg_min_row_mean = g_ffc_bg_min_row_mean;
+            diagnostics.ffc_bg_max_row_mean = g_ffc_bg_max_row_mean;
+            diagnostics.ffc_bg_max_row_jump_adu =
+                g_ffc_bg_max_row_jump_adu;
+            diagnostics.ffc_bg_max_row_jump_line =
+                g_ffc_bg_max_row_jump_line;
+            diagnostics.ffc_bg_min_col_mean = g_ffc_bg_min_col_mean;
+            diagnostics.ffc_bg_max_col_mean = g_ffc_bg_max_col_mean;
+            diagnostics.ffc_bg_max_col_jump_adu =
+                g_ffc_bg_max_col_jump_adu;
+            diagnostics.ffc_bg_max_col_jump_column =
+                g_ffc_bg_max_col_jump_column;
+            diagnostics.ffc_duration_ms = g_ffc_last_duration_ms;
+            diagnostics.thermal_ntc_model_valid =
+                g_thermal_ntc_model_valid;
+            diagnostics.thermal_ntc_model_reference_adu =
+                g_thermal_ntc_model_reference_adu;
+            diagnostics.thermal_ntc_model_k_q8 = g_thermal_ntc_model_k_q8;
+            diagnostics.thermal_ntc_model_limit_adu =
+                g_thermal_ntc_model_limit_adu;
+            diagnostics.thermal_startup_model_valid =
+                g_thermal_startup_model_valid;
+            diagnostics.thermal_startup_model_active =
+                g_thermal_startup_model_active;
+            diagnostics.thermal_startup_model_ntc_threshold_adu =
+                g_thermal_startup_model_ntc_threshold_adu;
+            diagnostics.thermal_startup_model_amplitude_adu =
+                g_thermal_startup_model_amplitude_adu;
+            diagnostics.thermal_startup_model_tau_ds =
+                g_thermal_startup_model_tau_ds;
+            const int body_len = snprintf(
+                client->request, sizeof(client->request),
+                "{\"valid\":true,\"version\":1,\"frame_number\":%lu,"
+                "\"timestamp_ms\":%lu,\"vtemp_adu\":%u,"
+                "\"temperature_low_x10\":%d,\"temperature_high_x10\":%d,"
+                "\"anchor_adu\":%ld,\"smooth_low_adu\":%u,"
+                "\"smooth_high_adu\":%u,\"mean_diff\":%.7g,"
+                "\"ntc_reference_adu\":%u,\"ntc_adu\":%u,"
+                "\"nuc_decision\":%u,\"nuc_count\":%u,"
+                "\"ffc_state\":%u,\"shutter_state\":%u,"
+                "\"nuc_dg\":%d,\"nuc_dv\":%d,\"nuc_dn\":%d,"
+                "\"boot_ntc_adu\":%u,\"boot_ntc_delta_adu\":%u,"
+                "\"warmup_comp_adu\":%d,\"normal_comp_adu\":%d,"
+                "\"total_comp_adu\":%d,\"effective_anchor_adu\":%ld,"
+                "\"smooth_vtemp_adu\":%u,\"center_raw_x10\":%d,"
+                "\"center_roi_x10\":%d,\"center_raw_adu\":%u,"
+                "\"center_roi_adu\":%u,\"ffc_frames\":%u,"
+                "\"ffc_frame_mean_span_adu\":%u,"
+                "\"ffc_vtemp_span_adu\":%u,\"ffc_ntc_span_adu\":%u,"
+                "\"ffc_row_mean_min_adu\":%u,\"ffc_row_mean_max_adu\":%u,"
+                "\"ffc_row_jump_max_adu\":%u,\"ffc_row_jump_line\":%u,"
+                "\"ffc_col_mean_min_adu\":%u,\"ffc_col_mean_max_adu\":%u,"
+                "\"ffc_col_jump_max_adu\":%u,\"ffc_col_jump_column\":%u,"
+                "\"ffc_duration_ms\":%lu,\"thermal_ntc_model_valid\":%u,"
+                "\"thermal_ntc_model_active\":false,"
+                "\"thermal_ntc_model_reference_adu\":%u,"
+                "\"thermal_ntc_model_k_q8\":%d,"
+                "\"thermal_ntc_model_limit_adu\":%u,"
+                "\"thermal_startup_model_valid\":%u,"
+                "\"thermal_startup_model_active\":%u,"
+                "\"thermal_startup_model_ntc_threshold_adu\":%u,"
+                "\"thermal_startup_model_amplitude_adu\":%d,"
+                "\"thermal_startup_model_tau_ds\":%u}\n",
+                (unsigned long)diagnostics.frame_number,
+                (unsigned long)diagnostics.timestamp_ms,
+                (unsigned)diagnostics.vtemp_adu,
+                (int)diagnostics.temperature_low_x10,
+                (int)diagnostics.temperature_high_x10,
+                (long)diagnostics.anchor_adu,
+                (unsigned)diagnostics.smooth_low_adu,
+                (unsigned)diagnostics.smooth_high_adu,
+                (double)diagnostics.mean_diff,
+                (unsigned)diagnostics.ntc_reference_adu,
+                (unsigned)diagnostics.ntc_adu,
+                (unsigned)diagnostics.nuc_decision,
+                (unsigned)diagnostics.nuc_count,
+                (unsigned)diagnostics.ffc_state,
+                (unsigned)diagnostics.shutter_state,
+                (int)diagnostics.nuc_dg, (int)diagnostics.nuc_dv,
+                (int)diagnostics.nuc_dn,
+                (unsigned)diagnostics.boot_ntc_adu,
+                (unsigned)diagnostics.boot_ntc_delta_adu,
+                (int)diagnostics.warmup_comp_adu,
+                (int)diagnostics.normal_comp_adu,
+                (int)diagnostics.total_comp_adu,
+                (long)diagnostics.effective_anchor_adu,
+                (unsigned)diagnostics.smooth_vtemp_adu,
+                (int)diagnostics.center_raw_x10,
+                (int)diagnostics.center_roi_x10,
+                (unsigned)diagnostics.center_raw_adu,
+                (unsigned)diagnostics.center_roi_adu,
+                (unsigned)diagnostics.ffc_captured_frames,
+                (unsigned)diagnostics.ffc_frame_mean_span_adu,
+                (unsigned)diagnostics.ffc_vtemp_span_adu,
+                (unsigned)diagnostics.ffc_ntc_span_adu,
+                (unsigned)diagnostics.ffc_bg_min_row_mean,
+                (unsigned)diagnostics.ffc_bg_max_row_mean,
+                (unsigned)diagnostics.ffc_bg_max_row_jump_adu,
+                (unsigned)diagnostics.ffc_bg_max_row_jump_line,
+                (unsigned)diagnostics.ffc_bg_min_col_mean,
+                (unsigned)diagnostics.ffc_bg_max_col_mean,
+                (unsigned)diagnostics.ffc_bg_max_col_jump_adu,
+                (unsigned)diagnostics.ffc_bg_max_col_jump_column,
+                (unsigned long)diagnostics.ffc_duration_ms,
+                (unsigned)diagnostics.thermal_ntc_model_valid,
+                (unsigned)diagnostics.thermal_ntc_model_reference_adu,
+                (int)diagnostics.thermal_ntc_model_k_q8,
+                (unsigned)diagnostics.thermal_ntc_model_limit_adu,
+                (unsigned)diagnostics.thermal_startup_model_valid,
+                (unsigned)diagnostics.thermal_startup_model_active,
+                (unsigned)diagnostics.thermal_startup_model_ntc_threshold_adu,
+                (int)diagnostics.thermal_startup_model_amplitude_adu,
+                (unsigned)diagnostics.thermal_startup_model_tau_ds);
+            client->flash_data = (const uint8_t*)client->request;
+            client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+        } else {
+            status = "503 Service Unavailable";
+            extra = "Retry-After: 1\r\n";
+            static const char unavailable[] =
+                "{\"valid\":false,\"error\":\"diagnostics_not_ready\"}\n";
+            client->flash_data = (const uint8_t*)unavailable;
+            client->body_length = sizeof(unavailable) - 1u;
+        }
     } else if (is_read
                && request_has_path(client->request, "/api/v1/thermal")) {
         type = "application/json; charset=utf-8";
@@ -730,6 +1192,14 @@ static void prepare_response(struct http_client* client)
             (long)thermal_ota_diag_result());
         client->flash_data = (const uint8_t*)client->request;
         client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (request_has_path(client->request, "/api/v1/calibration/v1")) {
+        status = "405 Method Not Allowed";
+        type = "application/json; charset=utf-8";
+        static const char method[] =
+            "{\"ok\":false,\"error\":\"POST TNC1 package required\"}\n";
+        client->flash_data = (const uint8_t*)method;
+        client->body_length = sizeof(method) - 1;
+        extra = "Allow: POST\r\n";
     } else if (request_has_path(client->request, "/ota.bin")
                || request_has_path(client->request, "/api/v1/ota")) {
         status = "405 Method Not Allowed";
@@ -1010,8 +1480,77 @@ static void ota_prepare_result(struct http_client* client,
     if (ok) thermal_ota_schedule_install(1500u);
 }
 
+static void calibration_prepare_result(
+    struct http_client* client, enum thermal_calibration_v1_result result,
+    const struct thermal_calibration_v1_commit* commit)
+{
+    client->calibration_owner = false;
+    client->response = RESPONSE_FLASH;
+    client->body_sent = 0;
+    const bool ok = result == THERMAL_CALIBRATION_V1_OK && commit;
+    int body_len;
+    if (ok) {
+        body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"accepted\":true,\"format\":\"tn160-calibration-v1\","
+            "\"generation\":%lu,\"calibration_id\":%lu,"
+            "\"payload_crc32\":\"%08lx\","
+            "\"package_header_crc32\":\"%08lx\","
+            "\"flash_header_crc32\":\"%08lx\","
+            "\"state\":\"verified\",\"rebooting\":true}\n",
+            (unsigned long)commit->generation,
+            (unsigned long)commit->calibration_id,
+            (unsigned long)commit->payload_crc32,
+            (unsigned long)commit->package_header_crc32,
+            (unsigned long)commit->flash_header_crc32);
+    } else {
+        body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"ok\":false,\"error\":\"%s\"}\n",
+            thermal_calibration_v1_result_string(result));
+    }
+    client->flash_data = (const uint8_t*)client->request;
+    client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    const int header_len = snprintf(
+        client->header, sizeof(client->header),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n",
+        ok ? "202 Accepted" : "500 Internal Server Error",
+        (unsigned long)client->body_length);
+    client->header_used = (uint16_t)(header_len > 0 ? header_len : 0);
+    client->header_sent = 0;
+    if (ok) {
+        network_reboot_at_ms =
+            to_ms_since_boot(get_absolute_time()) + 1500u;
+    }
+}
+
 static void network_prepare_result(struct http_client* client)
 {
+#if THERMAL_NCM_FIXED_PRODUCT_ADDRESS
+    client->response = RESPONSE_FLASH;
+    client->body_sent = 0;
+    const int body_len = snprintf(
+        client->request, sizeof(client->request),
+        "{\"ok\":false,\"error\":{\"code\":\"network_fixed\","
+        "\"message\":\"Production address is fixed at 192.168.17.1\"}}\n");
+    client->flash_data = (const uint8_t*)client->request;
+    client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    const int header_len = snprintf(
+        client->header, sizeof(client->header),
+        "HTTP/1.1 409 Conflict\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n",
+        (unsigned long)client->body_length);
+    client->header_used = (uint16_t)(header_len > 0 ? header_len : 0);
+    client->header_sent = 0;
+    return;
+#else
     client->config_body[client->config_received] = '\0';
     unsigned segment = 0;
     int consumed = 0;
@@ -1057,6 +1596,7 @@ static void network_prepare_result(struct http_client* client)
         status, (unsigned long)client->body_length);
     client->header_used = (uint16_t)(header_len > 0 ? header_len : 0);
     client->header_sent = 0;
+#endif
 }
 
 static err_t http_sent(void* arg, struct tcp_pcb* pcb, uint16_t len);
@@ -1182,6 +1722,7 @@ static err_t http_poll(void* arg, struct tcp_pcb* pcb)
     (void)pcb;
     struct http_client* client = (struct http_client*)arg;
     if (client->response == RESPONSE_OTA_UPLOAD
+        || client->response == RESPONSE_CALIBRATION_UPLOAD
         || client->response == RESPONSE_NETWORK_UPDATE) return ERR_OK;
     if (client->request_done) return client_send(client);
     client_abort(client);
@@ -1247,6 +1788,47 @@ static err_t http_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err
                 if (!take) break;
                 continue;
             }
+            if (client->response == RESPONSE_CALIBRATION_UPLOAD) {
+                const uint32_t remaining = client->calibration_expected
+                                           - client->calibration_received;
+                uint16_t take = (uint16_t)(part->len - i);
+                if (take > remaining) take = (uint16_t)remaining;
+                if (take) {
+                    if (client->calibration_error
+                        == THERMAL_CALIBRATION_V1_OK) {
+                        const enum thermal_calibration_v1_result result =
+                            thermal_calibration_v1_write(data + i, take);
+                        if (result != THERMAL_CALIBRATION_V1_OK) {
+                            client->calibration_error = (uint8_t)result;
+                        }
+                    }
+                    client->calibration_received += take;
+                    i += take;
+                }
+                if (client->calibration_received
+                    == client->calibration_expected) {
+                    struct thermal_calibration_v1_commit commit;
+                    enum thermal_calibration_v1_result result =
+                        (enum thermal_calibration_v1_result)
+                            client->calibration_error;
+                    if (result == THERMAL_CALIBRATION_V1_OK) {
+                        result = client->calibration_complete
+                                     ? thermal_calibration_v1_finish_with_precommit(
+                                           &commit,
+                                           network_save_product_segment,
+                                           NULL)
+                                     : thermal_calibration_v1_finish(&commit);
+                    } else {
+                        thermal_calibration_v1_abort();
+                    }
+                    calibration_prepare_result(
+                        client, result,
+                        result == THERMAL_CALIBRATION_V1_OK ? &commit : NULL);
+                    break;
+                }
+                if (!take) break;
+                continue;
+            }
             if (client->response != RESPONSE_OTA_UPLOAD) break;
             const uint32_t remaining =
                 client->ota_expected - client->ota_received;
@@ -1281,6 +1863,7 @@ static err_t http_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     if (client->request_done && client->response != RESPONSE_OTA_UPLOAD
+        && client->response != RESPONSE_CALIBRATION_UPLOAD
         && client->response != RESPONSE_NETWORK_UPDATE) {
         if (client->response == RESPONSE_NONE) prepare_response(client);
         return client_send(client);
@@ -1379,7 +1962,23 @@ void thermal_ncm_note_frame(uint8_t token, const uint8_t* frame,
     meta->flags = SIPEED_META_IMAGE_VALID
                   | SIPEED_META_PAYLOAD_CRC_VALID
                   | SIPEED_META_SOURCE_FRAME_VALID;
+    const uint8_t ffc_state = g_ffc_state;
+    const uint8_t shutter_state = g_shutter_state;
+    meta->ffc_state = ffc_state;
+    meta->shutter_state = shutter_state;
+    if (ffc_state == SIPEED_FFC_STATE_ACQUIRING
+        || ffc_state == SIPEED_FFC_STATE_APPLYING) {
+        meta->flags |= SIPEED_META_FFC_ACTIVE;
+    }
+    if (shutter_state == SIPEED_SHUTTER_STATE_CLOSED) {
+        meta->flags |= SIPEED_META_SHUTTER_CLOSED;
+    }
     if (calibrated) meta->flags |= SIPEED_META_CALIBRATED;
+    const uint32_t calibration_id = thermal_calibration_v1_id();
+    if (calibration_id) {
+        meta->calibration_id = calibration_id;
+        meta->flags |= SIPEED_META_CALIBRATION_ID_VALID;
+    }
     meta->frame_number = ++frame_counter;
     meta->source_frame_number = meta->frame_number;
     meta->timestamp_ms = to_ms_since_boot(get_absolute_time());
@@ -1409,7 +2008,7 @@ void thermal_ncm_note_frame(uint8_t token, const uint8_t* frame,
     meta->source_low = invalid;
     meta->source_high = invalid;
     meta->nuc_table_index = UINT16_MAX;
-    meta->ffc_count = frame[THERMAL_FRAME_IMAGE_BYTES + 24];
+    meta->ffc_count = ffc_count;
 
     if (isfinite(temp_low) && isfinite(temp_high)
         && temp_high > temp_low) {
@@ -1441,6 +2040,80 @@ void thermal_ncm_note_frame(uint8_t token, const uint8_t* frame,
             25.0f + ((int32_t)sensor_vtemp - 8192) / 70.0f;
         meta->flags |= SIPEED_META_DETECTOR_TEMPERATURE_VALID;
     }
+    uint32_t mean_diff_bits =
+        read_be32(&frame[THERMAL_FRAME_IMAGE_BYTES + 15]);
+    struct thermal_diagnostics_snapshot diagnostics = {
+        .valid = true,
+        .frame_number = meta->frame_number,
+        .timestamp_ms = meta->timestamp_ms,
+        .vtemp_adu = sensor_vtemp,
+        .temperature_low_x10 =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 3]),
+        .temperature_high_x10 =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 5]),
+        .anchor_adu = read_be_i32(&frame[THERMAL_FRAME_IMAGE_BYTES + 7]),
+        .smooth_low_adu = read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 11]),
+        .smooth_high_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 13]),
+        .ntc_reference_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 19]),
+        .ntc_adu = read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 21]),
+        .nuc_decision = frame[THERMAL_FRAME_IMAGE_BYTES + 23],
+        .nuc_count = ffc_count,
+        .ffc_state = ffc_state,
+        .shutter_state = shutter_state,
+        .nuc_dg = read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 25]),
+        .nuc_dv = read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 27]),
+        .nuc_dn = read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 29]),
+        .boot_ntc_adu = read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 31]),
+        .boot_ntc_delta_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 33]),
+        .warmup_comp_adu =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 35]),
+        .normal_comp_adu =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 37]),
+        .total_comp_adu =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 39]),
+        .effective_anchor_adu =
+            read_be_i32(&frame[THERMAL_FRAME_IMAGE_BYTES + 41]),
+        .smooth_vtemp_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 45]),
+        .center_raw_x10 =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 47]),
+        .center_roi_x10 =
+            read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 49]),
+        .center_raw_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 51]),
+        .center_roi_adu =
+            read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 53]),
+        .ffc_captured_frames = g_ffc_captured_frames,
+        .ffc_frame_mean_span_adu = g_ffc_frame_mean_span_adu,
+        .ffc_vtemp_span_adu = g_ffc_vtemp_span_adu,
+        .ffc_ntc_span_adu = g_ffc_ntc_span_adu,
+        .ffc_bg_min_row_mean = g_ffc_bg_min_row_mean,
+        .ffc_bg_max_row_mean = g_ffc_bg_max_row_mean,
+        .ffc_bg_max_row_jump_adu = g_ffc_bg_max_row_jump_adu,
+        .ffc_bg_max_row_jump_line = g_ffc_bg_max_row_jump_line,
+        .ffc_bg_min_col_mean = g_ffc_bg_min_col_mean,
+        .ffc_bg_max_col_mean = g_ffc_bg_max_col_mean,
+        .ffc_bg_max_col_jump_adu = g_ffc_bg_max_col_jump_adu,
+        .ffc_bg_max_col_jump_column = g_ffc_bg_max_col_jump_column,
+        .ffc_duration_ms = g_ffc_last_duration_ms,
+        .thermal_ntc_model_valid = g_thermal_ntc_model_valid,
+        .thermal_ntc_model_reference_adu =
+            g_thermal_ntc_model_reference_adu,
+        .thermal_ntc_model_k_q8 = g_thermal_ntc_model_k_q8,
+        .thermal_ntc_model_limit_adu = g_thermal_ntc_model_limit_adu,
+        .thermal_startup_model_valid = g_thermal_startup_model_valid,
+        .thermal_startup_model_active = g_thermal_startup_model_active,
+        .thermal_startup_model_ntc_threshold_adu =
+            g_thermal_startup_model_ntc_threshold_adu,
+        .thermal_startup_model_amplitude_adu =
+            g_thermal_startup_model_amplitude_adu,
+        .thermal_startup_model_tau_ds = g_thermal_startup_model_tau_ds,
+    };
+    memcpy(&diagnostics.mean_diff, &mean_diff_bits, sizeof(mean_diff_bits));
+    diagnostics_snapshot = diagnostics;
     meta->meta_crc32 = pixel_crc32((const uint8_t*)meta,
                                    SIPEED_THERMAL_META_BYTES - 4u);
     __dmb();
@@ -1467,6 +2140,10 @@ void thermal_ncm_note_adc16(
     adc16_meta.frame_number = source_meta->frame_number;
     adc16_meta.source_frame_number = source_meta->frame_number;
     adc16_meta.timestamp_ms = source_meta->timestamp_ms;
+    if (source_meta->flags & SIPEED_META_CALIBRATION_ID_VALID) {
+        adc16_meta.calibration_id = source_meta->calibration_id;
+        adc16_meta.flags |= SIPEED_META_CALIBRATION_ID_VALID;
+    }
     adc16_meta.payload_bytes = THERMAL_FRAME_ADC16_BYTES;
     adc16_meta.payload_crc32 =
         pixel_crc32(adc16_pixels, THERMAL_FRAME_ADC16_BYTES);
@@ -1581,6 +2258,11 @@ void thermal_ncm_task(void)
     if (network_reboot_at_ms
         && (int32_t)(to_ms_since_boot(get_absolute_time())
                      - network_reboot_at_ms) >= 0) {
+        /* Give the host a real USB disconnect window before resetting.
+         * A 10 ms watchdog-only reset can leave Windows NCM re-enumeration
+         * racing the old DHCP lease and interface state. */
+        tud_disconnect();
+        sleep_ms(250);
         watchdog_reboot(0, 0, 10);
         while (true) __wfi();
     }

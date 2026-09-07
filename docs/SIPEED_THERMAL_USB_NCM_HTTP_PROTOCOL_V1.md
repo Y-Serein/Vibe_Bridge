@@ -55,7 +55,7 @@ USB NCM
 
 ### 3.1 默认网络参数
 
-设备默认使用：
+交付用户的已标定设备统一使用：
 
 | 项目 | 默认值 |
 | --- | --- |
@@ -67,9 +67,22 @@ USB NCM
 | 用户入口 | `http://ir.sipeed.com/` |
 | IP 兜底入口 | `http://192.168.17.1/` |
 
+完全空白、没有有效网段配置且没有有效标定数据的生产设备使用
+`192.168.10.1/24`，只用于 Scope 首次识别和工位分配。Scope 将标定中的设备
+分配到 `192.168.11.1`～`192.168.16.1`；标定、写入和回读全部通过后再切换为
+用户地址 `192.168.17.1` 并提示拔出。临时工位地址不得作为标定阶段或完成状态的
+唯一证据。
+
 设备的本地 DNS 必须将 `ir.sipeed.com` 解析到设备当前地址。不再为每个型号定义 `t160.cam`、`t256s.cam` 等产品专属域名。
 
 DHCP必须通过 Router（Option 3）下发设备当前地址，例如默认的 `192.168.17.1`。这是手机易用性要求：Android获得默认路由后才会把该NCM网络纳入联网验证，继而发起DNS和Captive Portal HTTP探测；设备返回探测响应后，系统才可能自动弹出认证页面。
+
+DHCP server 必须同时处理两类合法的 DHCPREQUEST：SELECTING/INIT-REBOOT
+状态从 Option 50 读取 requested IP；BOUND/RENEWING/REBINDING 状态在不含
+Option 50 时从 `ciaddr` 读取当前地址。地址属于本设备地址池时返回 DHCPACK；旧
+子网地址、越界地址或已分配给其他客户端的地址必须立即返回 DHCPNAK，不能静默
+等待主机租约超时。`ciaddr` 续租的 DHCPACK 应直接发往该客户端地址；尚未配置
+地址的请求继续使用广播回复。
 
 这里的Router只用于主机侧网络选择和Captive Portal检测，不表示设备可以转发公网：设备自身的上游gateway应保持未配置，也不实现NAT或IP forwarding。Wi-Fi/蜂窝网络并存时的最终选路和是否弹窗由手机系统决定；部分OEM系统可能识别出Captive Portal却仍把普通浏览器绑定到Wi-Fi。产品必须验证目标Android/iOS机型，并始终保留字面IP访问及必要的使用提示。
 
@@ -92,9 +105,9 @@ DHCP必须通过 Router（Option 3）下发设备当前地址，例如默认的 
 网页只让用户设置一个“设备网段编号”，不要求用户理解完整 IP 和子网掩码：
 
 ```text
-设备 A：网段 17 → 192.168.17.1/24
-设备 B：网段 18 → 192.168.18.1/24
-设备 C：网段 19 → 192.168.19.1/24
+待分配设备：网段 10 → 192.168.10.1/24
+工位 1～6：网段 11～16 → 192.168.11.1/24～192.168.16.1/24
+完成设备：网段 17 → 192.168.17.1/24
 ```
 
 设备内部同步修改自身 IP、DHCP 地址池、网关、DNS 和 Captive Portal 跳转地址。电脑用户随后使用预设置的字面 IP 访问各设备。
@@ -113,7 +126,8 @@ DHCP必须通过 Router（Option 3）下发设备当前地址，例如默认的 
   "prefix_length": 24,
   "dhcp_first": "192.168.17.2",
   "dhcp_last": "192.168.17.20",
-  "default_segment": 17
+  "default_segment": 10,
+  "product_segment": 17
 }
 ```
 
@@ -135,7 +149,8 @@ X-Sipeed-Request: 1
 - `segment` 必须在 `1..254` 内；设备可以额外屏蔽本产品占用的保留值。
 - 成功返回 `202 Accepted`，应先完整发出响应，再应用新地址或重启网络。
 - 配置必须持久化，但不得写入或覆盖传感器校准区。
-- 产品必须提供恢复默认网段 17 的兜底方法；物理按键方式可以因硬件而异。
+- 产品必须提供恢复生产待分配网段 10 的兜底方法；物理按键方式可以因硬件而异。
+- 有效标定存在但网络设置损坏时，设备必须回退到用户地址 17。
 
 响应示例：
 
@@ -189,6 +204,8 @@ X-Sipeed-Request: 1
 | `PUT` | `/api/v1/measurement` | 设备端允许修改测温参数时提供 |
 | `GET` | `/api/v1/calibration/manifest` | RAW16 可在客户端恢复温度时必须提供 |
 | `GET` | `/api/v1/calibration/data/{id}` | 获取校准表二进制数据 |
+| `POST` | `/api/v1/calibration/v1` | TN160 工厂双点标定包写入；仅设备明确声明该能力时提供 |
+| `GET` | `/api/v1/calibration/v1/manifest` | TN160 工厂标定的只读状态、CRC 和数据 URL |
 | `POST` | `/api/v1/ota` | 支持网页 OTA 时提供 |
 | `GET` | `/api/v1/ota/status` | 支持网页 OTA 时提供 |
 
@@ -943,6 +960,102 @@ KT、BT、NUC-T 和距离修正的实际维度由产品算法决定。NUC-T 常�
 
 若 metadata 的 `calibration_id` 与缓存 manifest 不一致，客户端必须暂停测温并重新获取校准数据，不能继续套用旧表。
 
+### 11.5 TN160 工厂双点标定写入扩展
+
+本节是 TN160 的生产标定扩展，不替代 11.1～11.4 的通用 RAW16 温度算法表接口。
+它只适用于设备信息声明 calibration.supported=true 且
+calibration.format=tn160-calibration-v1 的固件。
+
+#### 11.5.1 写入请求
+
+请求必须为 POST /api/v1/calibration/v1，并带以下 HTTP 头：
+
+    Content-Type: application/vnd.sipeed.tn160-calibration-v1
+    X-Sipeed-Request: 1
+    X-Sipeed-Calibration-Confirm: write-v1
+    Content-Length: 115274
+
+请求 body 是连续 little-endian TNC1 包：
+
+| 偏移 | 长度 | 字段 |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII TNC1 |
+| 4 | 2 | version，固定为 1 |
+| 6 | 2 | header bytes，固定为 64 |
+| 8 | 2 | width，固定为 160 |
+| 10 | 2 | height，固定为 120 |
+| 12 | 2 | bad point count，固定为 5 |
+| 14 | 2 | 保留，必须为零 |
+| 16 | 4 | image bytes，固定为 38400 |
+| 20 | 4 | gain bytes，固定为 76800 |
+| 24 | 4 | bad point bytes，固定为 10 |
+| 28 | 4 | mean_diff，IEEE-754 float；必须为有限值且不小于 100 ADU |
+| 32 | 4 | t_ref_low，IEEE-754 float，单位 °C |
+| 36 | 4 | image CRC32 |
+| 40 | 4 | gain CRC32 |
+| 44 | 4 | bad point CRC32 |
+| 48 | 4 | 三段 payload 串联后的 CRC32 |
+| 52 | 2 | 可选模型 tag：基础 V1 为 0；旧 NTC 模型为 `0x4e54`（`TN`）；冷启动模型为 `0x4354`（`TC`） |
+| 54 | 2 | `TN`：`ntc_reference_adu`；`TC`：`cold_ntc_threshold_adu`；两者范围均为 `9..4087` |
+| 56 | 2 | little-endian int16；`TN`：`ntc_k_q8`，范围 `-8192..8192`；`TC`：`startup_amplitude_adu`，范围 `-600..600`；0 表示该机无需启动幅度修正 |
+| 58 | 2 | `TN`：`ntc_limit_adu`，范围 `1..1500`；`TC`：`startup_tau_ds`，0.1 秒单位，范围 `50..600`（5～60 秒） |
+| 60 | 4 | bytes 0..59 的 CRC32 |
+| 64 | 38400 | img_bg，160×120 个 little-endian uint16 |
+| 38464 | 76800 | gain，160×120 个 little-endian IEEE-754 float |
+| 115264 | 10 | 五个 {y, x} 坏点，0xffff 为尾部终止项 |
+
+模型扩展必须为全零，或按 tag 满足对应的全部字段约束；不接受半初始化参数。旧
+`TN` 参数继续支持写入和回读，但不参与运行，`thermal_ntc_model_active` 固定为
+`false`。`TC` 是当前正式的逐机冷启动模型：只有本次启动捕获的 `boot_ntc_adu`
+严格大于 `cold_ntc_threshold_adu` 时，运行时才给有效 anchor 加上
+`startup_amplitude_adu × exp(-elapsed_ms / (startup_tau_ds × 100))`；幅度是有符号
+anchor ADU，经过 `6τ` 后归零。该绝对时间项不会写入 FFC 基础 anchor，避免 FFC
+后重复补偿。`/api/v1/diagnostics` 的 `thermal_startup_model_valid/active` 及
+`thermal_startup_model_ntc_threshold_adu/amplitude_adu/tau_ds` 用于写后核对。
+
+基础 V1、旧 `TN` 和新 `TC` 均同时保留小幅板载 NTC fallback：相对上次有效 FFC
+计算 `-0.20×ΔNTC`，限幅 `±1500 ADU`，并在下一次 FFC 把累计相对修正写入新
+anchor。VTEMP 只保留为诊断字段，不参与逐帧补偿、模型门控或 FFC anchor。NTC
+无效时相对 fallback 为零；冷启动模型无效或未通过门控时其时间项为零，设备仍继续
+出图。
+
+设备必须拒绝长度、magic、固定尺寸、header CRC、段 CRC 或 payload CRC 不正确的包；
+还必须拒绝非法扩展模型、超出传感器 ADU 范围、非有限/不合理 gain、越界或
+非连续终止的坏点。
+
+成功返回 202 Accepted，并包含 accepted、generation、calibration_id、payload_crc32、
+package_header_crc32、flash_header_crc32、state=verified 和 rebooting=true。
+calibration_id 是完整 64-byte TNC1 header 的 CRC32，并会写入后续帧 metadata。
+客户端必须比较返回的 payload/header CRC 与发送包，不能把 202 当作写入完成。
+
+#### 11.5.2 掉电边界与重启
+
+TN160 使用两个 payload 槽和两个 selector 页。新包先完整擦写到未激活 payload
+槽，逐页回读、校验三段 CRC 和语义，再写入带格式标记、记录 CRC 与 payload CRC 的
+新 selector；启动时只接受 selector 和其 payload 都校验通过、且 generation 最新的槽。
+因而在 selector 写入前断电时，旧标定仍保持有效；擦除中或部分写入的 selector 不会
+被当作旧版标定加载；
+写入成功响应发出约 1.5 秒后设备重启并切换到新标定。
+
+客户端收到成功响应后必须等待 NCM 链路重新枚举，并读取：
+
+    GET /api/v1/calibration/v1/manifest
+    GET /api/v1/calibration/v1/data/header
+    GET /api/v1/calibration/v1/data/image
+    GET /api/v1/calibration/v1/data/gain
+    GET /api/v1/calibration/v1/data/badpoints
+
+完整 64-byte header 和三段数据都必须逐字节与待写入包一致。没有有效 V1 标定时，
+这些只读接口返回 404。
+
+#### 11.5.3 访问边界
+
+该接口没有网络级身份认证；X-Sipeed-Request 和
+X-Sipeed-Calibration-Confirm 只是防止普通网页误触发的显式确认，不是密钥。
+它仅适用于物理直连 USB NCM 的受控工位，禁止暴露到 LAN、Wi-Fi、互联网或
+不受信任的 USB 主机。量产工位若需要访问控制，必须由主机侧账户、USB 物理隔离
+或后续经过专门设计的设备认证机制提供。
+
 ## 12. 伪彩色板
 
 设备公共图传接口只输出灰度，不允许设备色板状态改变 RAW、TEMP、JPGT 或 JPG payload。官方浏览器 v1 以以下 14 种色板作为默认参考基线，按常用程度排列：
@@ -1379,7 +1492,7 @@ source_frame_number
 
 以下内容必须由所有产品保持一致：
 
-- 默认 `192.168.17.1/24` 和可配置 `192.168.xxx.1/24` 模式；
+- 空白设备默认 `192.168.10.1/24`、完成设备统一 `192.168.17.1/24`，并支持可配置 `192.168.xxx.1/24`；
 - 公共入口 `ir.sipeed.com`；
 - `/api/v1/device`、`/frame.<format>`、`/stream.<format>` 路径体系；
 - 格式名称和处理阶段含义；

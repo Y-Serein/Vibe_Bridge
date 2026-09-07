@@ -1,0 +1,4 @@
+interface:
+  display_name: "TN160 Android UVC 诊断"
+  short_description: "分层诊断 Android UVC 闪退、格式协商与三平台兼容"
+  default_prompt: "Use $pico-tn160-android-uvc to diagnose TN160 Android UVC compatibility and close the Windows/Linux/Android validation loop."

@@ -45,28 +45,39 @@
 
 ### 重要边界
 
-`/frame.adc16` 已使产测主机能够通过 USB 获取原始帧；但“把新的双点标定结果写入 Flash”的 HTTP 请求格式、鉴权和掉电恢复语义尚未定义，也尚未实现。旧串口标定命令不应再用于产品流程。实现 USB 标定写入前，必须先冻结该协议契约并在真机上验证 Flash 事务安全性。
+`/frame.adc16` 用于产测主机读取校正前 RAW；`POST /api/v1/calibration/v1`
+及配套只读接口已实现固定长度 TNC1 的双槽事务写入、CRC 回读和掉电保护。TNC1
+保留区支持基础 V1、只读兼容的旧 `TN` 模型，以及当前逐机 `TC` 冷启动模型。
+正式产测由 Scope 先记录同一设备冷启动 0～60 秒 RAW，再完成 0°C/50°C 两点标定，
+自动拟合并写入冷启动幅度、时间常数和 NTC 冷/热启动门槛。旧串口标定命令不再用于
+产品流程；协议和真机验收边界见协议文档 11.5 节。
 
 当前 OTA 端点只完成长度、CRC 和 RP2350 向量范围检查，设备能力会声明 `"rollback": false`；没有签名、型号/硬件匹配或掉电回滚。它仅可用于非生产板联调，不能作为量产升级机制。
 
 ## 构建
 
-项目使用 `build.sh`：
+增量构建：
 
 ```bash
-bash /home/slam/Sipeed/pico_tn160/build.sh
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --build --preset pico2-release --parallel "$(nproc)"
 ```
 
-NCM 依赖 Pico SDK 2.2.0 的 lwIP submodule。SDK 副本的 `lib/lwip` 若未初始化，先提供一个完整的 lwIP 根目录：
+配置并构建：
 
 ```bash
-PICO_LWIP_PATH=/path/to/lwip bash /home/slam/Sipeed/pico_tn160/build.sh
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --preset pico2-release && cmake --build --preset pico2-release --parallel "$(nproc)"
+```
+
+彻底刷新：
+
+```bash
+cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --fresh --preset pico2-release && cmake --build --preset pico2-release --parallel "$(nproc)"
 ```
 
 不要把临时下载的依赖或构建产物提交到仓库。构建产物为：
 
 ```text
-/home/slam/build/pico_tn160/pico_tn160.elf.uf2
+/home/slam/dev/pico_tn160/build/pico_tn160.elf.uf2
 ```
 
 ## 验证

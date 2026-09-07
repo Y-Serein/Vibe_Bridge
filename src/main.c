@@ -38,6 +38,7 @@
 #include <utils.h>
 
 #include "thermal_ncm.h"
+#include "thermal_calibration_v1.h"
 #include "thermal_ota.h"
 #include "usb_descriptors.h"
 
@@ -181,6 +182,11 @@ static uint16_t rawbuf_uniform_rows[RAWBUFCNT];
 static uint16_t rawbuf_uniform_max_run[RAWBUFCNT];
 volatile uint16_t g_capture_last_frame_uniform_rows = 0;
 volatile uint16_t g_capture_last_frame_uniform_max_run = 0;
+/* Last complete sensor frame observed by Core1. FFC scheduling must not
+ * dereference rawbuf_last_ready after that buffer has been released or reused
+ * by Core0. */
+volatile uint16_t g_last_complete_vtemp = 0;
+volatile bool g_last_complete_vtemp_valid = false;
 uint8_t g_capture_raw_diag[RAWBUFSIZE] __attribute__((aligned(4)));
 volatile bool g_capture_raw_diag_frozen = false;
 int8_t g_capture_row_phase[SENSOR_H];
@@ -558,8 +564,6 @@ static const uint16_t* g_last_calib = nullptr;
  * inter-FFC bolometer drift in the quasi-equilibrium regime where the
  * remaining drift is small. */
 #define FFC_INTERVAL_STABLE_MS 30000u
-#define FFC_VTEMP_TRIGGER_ENABLE 0
-#define FFC_VTEMP_DELTA_ADU     150u
 #define FFC_CLOSED_DISCARD_FRAMES 2u
 #define FFC_AVERAGE_FRAMES        8u
 #define FFC_OPEN_DISCARD_FRAMES   4u  /* minimum fresh scene frames */
@@ -568,207 +572,87 @@ static const uint16_t* g_last_calib = nullptr;
 #define FFC_OPEN_STABLE_DELTA_ADU   128u
 #define FFC_POST_GUARD_MAX_REJECT_FRAMES 12u
 #define FFC_FRAME_TIMEOUT_MS       300u
-/* Minimum elapsed time before the |ΔVTEMP| trigger can fire — prevents
- * back-to-back FFCs during fast warmup where VTEMP can swing > 150 ADU
- * within 1–2 s, which would otherwise machine-gun the shutter. */
-#define FFC_MIN_ELAPSED_MS      2000u
-/* FFC sanity check: reject the FFC outright if the new shutter frame mean
- * (or VTEMP) differs from the previous FFC's value by more than these
- * thresholds. Between FFCs (≤ 30 s) the bolometer + FPA can realistically
- * change by ~3 °C ≈ 200 ADU VTEMP and at most ~K·200 ≈ 1500 ADU shutter
- * mean (for K ≤ 5). Anything larger is a sensor sync glitch, partial-
- * shutter capture, or VTEMP register glitch — committing such an FFC
- * poisons calibg/anchor and drives subsequent scene reads wildly off
- * (see trend_20260427_110503.png: scene crashed to −55 °C after one bad
- * FFC absorbed a +2000 ADU VTEMP glitch). Rejecting keeps the previous
- * known-good calibration in use until the next FFC attempt. */
+/* Reject only an implausible shutter-frame mean jump.  VTEMP is diagnostic
+ * only and cannot block periodic FFC or change the temperature anchor. */
 #define FFC_REJECT_DG_ADU       2500
-#define FFC_REJECT_DV_ADU       1000
-/* Thermal-settled gate: defer FFC entirely when |raw_vtemp − smooth_vtemp|
- * exceeds this threshold. During a fast FPA transient (e.g. external heat
- * shock) raw races ahead of the EMA smoother by 100s of ADU; committing
- * FFC at that moment bakes a wildly off K_V·ΔV into ram_temp_anchor and
- * permanently corrupts the scene reading. Wait for the smoother to catch
- * up (~6 s @ τ=3 s) before allowing FFC. 100 ADU ≈ 1.4 °C-equivalent. */
-#define FFC_VTEMP_SETTLED_ADU   100
-/* Thermal compensation model selector.  TABLE is the bounded cold-start
- * correction identified from trend_20260730_092834.csv.  Keep OFF and LEGACY
- * available for a one-line rollback during A/B validation. */
-#define THERMAL_COMP_MODEL_OFF     0
-#define THERMAL_COMP_MODEL_LEGACY  1
-#define THERMAL_COMP_MODEL_TABLE   2
 
-#define THERMAL_COMP_MODEL THERMAL_COMP_MODEL_TABLE
-#define THERMAL_COMP_TABLE_LIMIT_ADU 600
+/* These are populated once from the selected V1 calibration record.  Keep
+ * them public for the NCM diagnostics endpoint, while all runtime writes
+ * happen before the processing loop starts. */
+volatile uint8_t g_thermal_ntc_model_valid = 0;
+volatile uint16_t g_thermal_ntc_model_reference_adu = 0;
+volatile int16_t g_thermal_ntc_model_k_q8 = 0;
+volatile uint16_t g_thermal_ntc_model_limit_adu = 0;
+volatile uint8_t g_thermal_startup_model_valid = 0;
+volatile uint8_t g_thermal_startup_model_active = 0;
+volatile uint16_t g_thermal_startup_model_ntc_threshold_adu = 0;
+volatile int16_t g_thermal_startup_model_amplitude_adu = 0;
+volatile uint16_t g_thermal_startup_model_tau_ds = 0;
 
-struct ThermalCompTablePoint {
-    uint32_t elapsed_ms;
-    int16_t anchor_comp_adu;
-};
-
-static const struct ThermalCompTablePoint thermal_comp_table[] = {
-    {     0u,    0},
-    { 30000u, -230},
-    { 60000u, -345},
-    { 90000u, -395},
-    {120000u, -415},
-    {180000u, -445},
-    {240000u, -455},
-    {320000u, -457},
-};
-
-#if THERMAL_COMP_MODEL < THERMAL_COMP_MODEL_OFF \
-    || THERMAL_COMP_MODEL > THERMAL_COMP_MODEL_TABLE
-#error "Invalid THERMAL_COMP_MODEL"
-#endif
-
-static inline bool thermal_comp_legacy_enabled(void)
-{
-    return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_LEGACY;
-}
-
-static inline bool thermal_comp_table_enabled(void)
-{
-    return THERMAL_COMP_MODEL == THERMAL_COMP_MODEL_TABLE;
-}
-
-/* Between-FFC drift compensation: STATIC (compile-time) coefficients
- * for two independent compensators, applied to eff_anchor as
- *   eff_anchor = ram_temp_anchor + K_V·(V_now - V_lastFFC)
- *                                + K_N·(NTC_now - NTC_lastFFC)
- *
- * K_V (VTEMP-based, FPA-coupled drift):
- *   Disabled for temperature-anchor compensation.  The sensor VTEMP register
- *   is useful for FFC scheduling/sanity checks, but bench tests show it can
- *   move independently of a fixed blackbody scene and can also glitch.  Feeding
- *   that signal into eff_anchor creates false absolute-temperature drift
- *   (50°C blackbody falling toward ~41°C), so keep K_V at zero unless VTEMP is
- *   proven correlated on this hardware revision.
- *
- * K_N (NTC-based, shutter/body-coupled drift):
- *   Targets shutter-blade and lens-housing thermal lag — these heat
- *   on a much longer time constant (~50 s) than the FPA, and the
- *   bolometer raw counts respond to (T_shutter - T_scene) via the
- *   (raw - calibg) term. trend_20260427_143902.png shows the canonical
- *   case: FPA stable at 130 °C from t=0–130 s but scene reading drops
- *   31 °C as shutter blade warms toward equilibrium with the hot FPA.
- *   K_V·ΔV = 0 in this regime; only NTC tracks the slow body warming
- *   and so only K_N can cancel the residual.
- *
- * Sign of K_N depends on the NTC voltage divider topology (thermistor
- * pull-up vs pull-down). If shutter heating produces a scene drift
- * opposite to the compensation (i.e. the residual gets WORSE, not
- * better), flip the sign. Magnitude estimated from the trend:
- *   Δscene ≈ 31 °C → Δsmooth ≈ md/50.4·31 ≈ 120 ADU (md ≈ 200)
- *   ΔNTC ≈ 500–1000 ADU over the 130 s warming window
- *   |K_N| ≈ 0.12–0.24 → start at 0.20.
- *
- * Cap K_COMP_MAX_ADU bounds glitch amplification on either signal. */
-#define K_ANCHOR_COMP_STATIC    0.0f    /* K_V — disabled: VTEMP can be false */
-#define K_NTC_COMP_STATIC       (+2.3f) /* K_N — normal NTC-based */
-#define K_NTC_COMP_LATE_STATIC  (+3.0f) /* K_N — after warmup curve hands off */
-/* dV input clamp for K_V·ΔV. The K_V model (linear bolometer drift with
- * FPA temperature) holds for slow drift (ΔV < ~300 ADU between FFCs) but
- * breaks for thermal shocks (ΔV > 1000 ADU): the bolometer doesn't actually
- * follow the linear extrapolation, so K_V·ΔV over-corrects and crashes the
- * scene reading. Clamping dV at the input bounds the per-frame and per-FFC
- * scene shift to ≤ K_V·CLAMP / mean_diff·range ≈ 8 °C even on a 30 °C FPA
- * jump. Normal operation (dV < 400) is unaffected. */
-#define DV_CLAMP_ADU            400
-/* NTC plausibility cross-check for dV. The VTEMP register can spontaneously
- * glitch (jumps 30 °C-equivalent without any real die heating — confirmed
- * by user: putting hand on lens does NOT change FPA reading, yet FPA jumps
- * by itself in static conditions). NTC measures real PCB body temp via a
- * physical thermistor; it cannot glitch. Real thermal events show NTC and
- * VTEMP changing together (die heats faster than body, so dV/dN is bounded
- * but positive). VTEMP glitches show dN≈0 with huge dV. Bounding |dV| by
- * DV_DN_RATIO_MAX·|dN| makes K_V·dV completely inert during glitches while
- * preserving full strength for real thermal drift. Ratio 10 covers the
- * worst-case warmup phase where die leads body. */
-#define DV_DN_RATIO_MAX         10
-/* FFC hard plausibility gate. Board NTC uses a 10K pull-up, so ADC falls when
- * body temperature rises, while VTEMP rises when the die/FPA warms. Real
- * thermal motion should therefore drive dV and dN in opposite signs. A
- * same-sign large move (for example VTEMP falling while NTC temperature rises)
- * is a VTEMP-register false event; do not commit an FFC in that window. */
-#define FFC_VTEMP_NTC_FREE_ADU      80
-#define FFC_VTEMP_NTC_RATIO_MAX     6
-#define FFC_NTC_SIGN_DEADBAND_ADU   3
+/* The stored TNC1 model remains diagnostic-only.  The current bounded
+ * fallback uses board NTC only: this hardware's VTEMP has repeatable raw
+ * jumps that must never enter the temperature anchor.  Relative NTC
+ * compensation is baked into the next FFC anchor to avoid a sawtooth. */
+#define NTC_FALLBACK_K          (-0.20f)
+#define THERMAL_COMP_LIMIT_ADU  1500
 #define FFC_RETRY_COOLDOWN_MS       15000u
-#define NTC_WARMUP_CURVE_COMP_ADU   120
-#define NTC_WARMUP_CURVE_TAU_MS     12000u
-#define NTC_WARMUP_FADE_START_MS    180000u
-#define NTC_WARMUP_FADE_END_MS      320000u
-#define NTC_WARMUP_NTC_FADE_START_ADU 80
-#define NTC_WARMUP_NTC_FADE_END_ADU   160
-/* Jump guard for runtime FFC.  A single large predicted scene jump is often a
- * partial shutter/glitch and should be rejected.  However, repeatedly rejecting
- * the same direction also starves runtime FFC and lets the temperature window
- * walk away for minutes.  After a few soft-jump rejects, accept a bounded
- * recovery candidate as long as hard dG/dV gates have already passed. */
-#define FFC_SOFT_JUMP_X10       50  /* first reject if predicted jump > 5.0°C */
-#define FFC_HARD_JUMP_X10       250 /* always reject if predicted jump > 25°C */
-#define FFC_RECOVER_AFTER_JUMP_REJECTS 2
-#define K_COMP_MAX_ADU          1500
+/* A candidate predicting more than 5 °C of output discontinuity is never
+ * committed merely because earlier candidates were also rejected.  Keeping
+ * the last valid FFC is safer than turning repeated bad evidence into trust. */
+#define FFC_SOFT_JUMP_X10       50
+/* The first runtime FFC changes the spatial reference from the persisted
+ * blackbody background to a shutter background.  It has no previous FFC
+ * candidate for the existing jump guard to compare against, so replay the
+ * same open-scene samples through both mappings and reject an unsafe handoff. */
+#define FFC_FIRST_CONTINUITY_MAX_JUMP_X10 15
+#define FFC_CONTINUITY_CENTER_SAMPLES     25u
+#define FFC_CONTINUITY_FIELD_COLS         8u
+#define FFC_CONTINUITY_FIELD_ROWS         6u
+#define FFC_CONTINUITY_FIELD_SAMPLES \
+    (FFC_CONTINUITY_FIELD_COLS * FFC_CONTINUITY_FIELD_ROWS)
 static uint32_t ffc_last_ms = 0;
 static uint32_t ffc_retry_after_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
+static bool ffc_ntc_reference_pending = false;
 static uint16_t boot_ntc = 0;                /* valid NTC ADC captured at power-on */
-static uint32_t boot_ntc_ms = 0;             /* timestamp of the first valid NTC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
-static uint16_t ffc_count = 0;               /* number of FFCs run since boot */
+volatile uint16_t ffc_count = 0;             /* number of FFCs run since boot */
 static uint8_t  ffc_consec_reject = 0;        /* consecutive sanity-rejects */
 static bool     ffc_done_first = false;
 
-/* Bounded piecewise-linear correction relative to the first valid board-NTC
- * sample.  It is intentionally independent of each FFC epoch: resetting the
- * curve at every shutter event would replay cold-start compensation and cause
- * a sawtooth temperature error. */
-static int32_t thermal_comp_table_for_now(void)
-{
-    if (!thermal_comp_table_enabled()) {
-        return 0;
-    }
+volatile uint8_t g_ffc_state = SIPEED_FFC_STATE_IDLE;
+#if SHUTTER_ENABLE == 1
+volatile uint8_t g_shutter_state = SIPEED_SHUTTER_STATE_OPEN;
+#else
+volatile uint8_t g_shutter_state = SIPEED_SHUTTER_STATE_NOT_PRESENT;
+#endif
+volatile uint16_t g_ffc_captured_frames = 0;
+volatile uint16_t g_ffc_frame_mean_span_adu = 0;
+volatile uint16_t g_ffc_vtemp_span_adu = 0;
+volatile uint16_t g_ffc_ntc_span_adu = 0;
+volatile uint16_t g_ffc_bg_min_col_mean = 0;
+volatile uint16_t g_ffc_bg_max_col_mean = 0;
+volatile uint16_t g_ffc_bg_max_col_jump_adu = 0;
+volatile uint8_t g_ffc_bg_max_col_jump_column = 0;
+volatile uint32_t g_ffc_last_duration_ms = 0;
 
-    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    const uint32_t start_ms = boot_ntc_ms ? boot_ntc_ms : now_ms;
-    const uint32_t elapsed_ms = now_ms - start_ms;
-    const size_t point_count =
-        sizeof(thermal_comp_table) / sizeof(thermal_comp_table[0]);
-    int32_t comp = thermal_comp_table[point_count - 1u].anchor_comp_adu;
+struct FfcContinuitySample {
+    uint16_t pixel_index;
+    uint16_t raw_adu;
+};
 
-    for (size_t i = 1; i < point_count; i++) {
-        if (elapsed_ms <= thermal_comp_table[i].elapsed_ms) {
-            const struct ThermalCompTablePoint* const p0 =
-                &thermal_comp_table[i - 1u];
-            const struct ThermalCompTablePoint* const p1 =
-                &thermal_comp_table[i];
-            const uint32_t span_ms = p1->elapsed_ms - p0->elapsed_ms;
-            const uint32_t offset_ms = elapsed_ms - p0->elapsed_ms;
-            const int32_t delta =
-                (int32_t)p1->anchor_comp_adu - p0->anchor_comp_adu;
-            comp = p0->anchor_comp_adu
-                   + (int32_t)((delta * (int32_t)offset_ms)
-                               / (int32_t)span_ms);
-            break;
-        }
-    }
-
-    if (comp > THERMAL_COMP_TABLE_LIMIT_ADU) {
-        comp = THERMAL_COMP_TABLE_LIMIT_ADU;
-    } else if (comp < -THERMAL_COMP_TABLE_LIMIT_ADU) {
-        comp = -THERMAL_COMP_TABLE_LIMIT_ADU;
-    }
-    return comp;
-}
+static struct FfcContinuitySample
+    ffc_continuity_center[FFC_CONTINUITY_CENTER_SAMPLES];
+static struct FfcContinuitySample
+    ffc_continuity_field[FFC_CONTINUITY_FIELD_SAMPLES];
+static bool ffc_continuity_reference_valid = false;
 
 enum FfcEventDecision : uint8_t {
     FFC_EVT_ACCEPT = 0,
-    FFC_EVT_REJECT_VN,
-    FFC_EVT_REJECT_LIMIT,
-    FFC_EVT_REJECT_JUMP,
-    FFC_EVT_ABORT_NO_FRAME,
+    FFC_EVT_REJECT_LIMIT = 2,
+    FFC_EVT_REJECT_JUMP = 3,
+    FFC_EVT_ABORT_NO_FRAME = 4,
     FFC_EVT_NONE = 255,
 };
 
@@ -777,7 +661,7 @@ enum FfcEventDecision : uint8_t {
  *    [PX_CNT+11 .. +12] g_smooth_low        u16   BE
  *    [PX_CNT+13 .. +14] g_smooth_high       u16   BE
  *    [PX_CNT+15 .. +18] ram_mean_diff       f32   BE (IEEE 754)
- *    [PX_CNT+19 .. +20] ffc_last_ntc        u16   BE (0 before first FFC)
+ *    [PX_CNT+19 .. +20] active NTC reference u16  BE (last accepted FFC)
  *    [PX_CNT+21 .. +22] cur_ntc             u16   BE
  *    [PX_CNT+23]         last FFC/NUC event decision
  *    [PX_CNT+24]         ffc_count after the last accepted NUC
@@ -786,8 +670,8 @@ enum FfcEventDecision : uint8_t {
  *    [PX_CNT+29 .. +30] last NUC dn         i16   BE
  *    [PX_CNT+31 .. +32] boot_ntc            u16   BE
  *    [PX_CNT+33 .. +34] |cur_ntc-boot_ntc|  u16   BE (0xffff if invalid)
- *    [PX_CNT+35 .. +36] warmup NTC comp     i16   BE
- *    [PX_CNT+37 .. +38] normal NTC comp     i16   BE
+ *    [PX_CNT+35 .. +36] reserved, zero      i16   BE
+ *    [PX_CNT+37 .. +38] active thermal comp i16   BE
  *    [PX_CNT+39 .. +40] total anchor comp   i16   BE
  *    [PX_CNT+41 .. +44] effective anchor    int32 BE
  *    [PX_CNT+45 .. +46] smooth VTEMP        u16   BE
@@ -806,16 +690,11 @@ enum FfcEventDecision : uint8_t {
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
 #define FRAME_DIAG_TAIL     64
 
-/* VTEMP EMA smoother (x256 fixed-point). The raw VTEMP register has
- * frame-to-frame ADC jitter of ~50–100 ADU (~0.7–1.4 °C-equivalent),
- * which K_V·ΔV would otherwise turn into visible scene jitter. EMA with
- * α = 1/32 gives τ ≈ 3 s @ 10 fps — fast enough to track FPA settling
- * over tens of seconds, slow enough to reject per-frame ADC noise. */
+/* VTEMP EMA smoother (x256 fixed-point) retained for diagnostics only. */
 static volatile uint32_t g_vtemp_smooth_x256 = 0;
 
-/* NTC sampling. ADC2 = GPIO28 on the current board.  EMA-smoothed sample is
- * exposed in the diag tail at out[PX_CNT+21..22] and feeds K_NTC compensation
- * only when it is not rail-saturated. */
+/* NTC sampling. ADC2 = GPIO28 on the current board.  The EMA-smoothed sample
+ * is exposed in the diagnostic tail and supplies the startup cold/hot gate. */
 static volatile uint16_t g_cur_ntc_adc = 0;
 static volatile uint32_t g_ntc_smooth_x256 = 0;
 static volatile uint16_t g_adc_temp_adc = 0;
@@ -845,129 +724,98 @@ static inline bool ntc_adc_valid(uint16_t v)
     return v > 8 && v < 4088;
 }
 
-static bool ffc_vtemp_ntc_plausible(
-    uint16_t cur_fpa_vtemp,
-    uint16_t cur_ntc,
-    int32_t* dv_out,
-    int32_t* dn_out)
+static void thermal_ntc_model_boot_load(void)
 {
-    if (ffc_last_fpa_vtemp == 0
-        || !ntc_adc_valid(ffc_last_ntc)
+    g_thermal_ntc_model_valid = 0;
+    g_thermal_ntc_model_reference_adu = 0;
+    g_thermal_ntc_model_k_q8 = 0;
+    g_thermal_ntc_model_limit_adu = 0;
+    g_thermal_startup_model_valid = 0;
+    g_thermal_startup_model_active = 0;
+    g_thermal_startup_model_ntc_threshold_adu = 0;
+    g_thermal_startup_model_amplitude_adu = 0;
+    g_thermal_startup_model_tau_ds = 0;
+
+    struct thermal_calibration_v1_ntc_model model;
+    if (thermal_calibration_v1_ntc_model(&model)) {
+        g_thermal_ntc_model_reference_adu = model.reference_adu;
+        g_thermal_ntc_model_k_q8 = model.k_q8;
+        g_thermal_ntc_model_limit_adu = model.limit_adu;
+        g_thermal_ntc_model_valid = 1;
+        println("Legacy NTC model stored (inactive): ref=%u k_q8=%d limit=%u",
+                (unsigned)g_thermal_ntc_model_reference_adu,
+                (int)g_thermal_ntc_model_k_q8,
+                (unsigned)g_thermal_ntc_model_limit_adu);
+    }
+
+    struct thermal_calibration_v1_startup_model startup;
+    if (thermal_calibration_v1_startup_model(&startup)) {
+        g_thermal_startup_model_ntc_threshold_adu =
+            startup.cold_ntc_threshold_adu;
+        g_thermal_startup_model_amplitude_adu = startup.amplitude_adu;
+        g_thermal_startup_model_tau_ds = startup.tau_ds;
+        g_thermal_startup_model_valid = 1;
+        println("Startup model loaded: ntc_gate=%u amplitude=%d tau_ds=%u",
+                (unsigned)g_thermal_startup_model_ntc_threshold_adu,
+                (int)g_thermal_startup_model_amplitude_adu,
+                (unsigned)g_thermal_startup_model_tau_ds);
+    }
+
+}
+
+static inline int32_t thermal_startup_comp_for_now(void)
+{
+    g_thermal_startup_model_active = 0;
+    if (!g_thermal_startup_model_valid || !ntc_adc_valid(boot_ntc)
+        || boot_ntc <= g_thermal_startup_model_ntc_threshold_adu) {
+        return 0;
+    }
+    const uint32_t tau_ms =
+        (uint32_t)g_thermal_startup_model_tau_ds * 100u;
+    if (tau_ms == 0u) return 0;
+    const uint32_t elapsed_ms = to_ms_since_boot(get_absolute_time());
+    if (elapsed_ms >= tau_ms * 6u) return 0;
+    const float weight = expf(-(float)elapsed_ms / (float)tau_ms);
+    int32_t comp = (int32_t)roundf(
+        (float)g_thermal_startup_model_amplitude_adu * weight);
+    if (comp > THERMAL_COMP_LIMIT_ADU) comp = THERMAL_COMP_LIMIT_ADU;
+    if (comp < -THERMAL_COMP_LIMIT_ADU) comp = -THERMAL_COMP_LIMIT_ADU;
+    if (comp == 0) return 0;
+    g_thermal_startup_model_active = 1;
+    return comp;
+}
+
+static inline int32_t ntc_fallback_comp_between(
+    uint16_t ref_ntc,
+    uint16_t cur_ntc)
+{
+    if (!ntc_adc_valid(ref_ntc)
         || !ntc_adc_valid(cur_ntc)) {
-        return true;
+        return 0;
     }
 
-    const int32_t dv = (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
-    const int32_t dn = (int32_t)cur_ntc - (int32_t)ffc_last_ntc;
-    if (dv_out != nullptr) *dv_out = dv;
-    if (dn_out != nullptr) *dn_out = dn;
+    const int32_t dn = (int32_t)cur_ntc - (int32_t)ref_ntc;
+    int32_t comp = (int32_t)(NTC_FALLBACK_K * (float)dn);
+    if (comp > THERMAL_COMP_LIMIT_ADU) comp = THERMAL_COMP_LIMIT_ADU;
+    if (comp < -THERMAL_COMP_LIMIT_ADU) comp = -THERMAL_COMP_LIMIT_ADU;
+    return comp;
+}
 
-    const int32_t adv = dv < 0 ? -dv : dv;
-    if (adv <= FFC_VTEMP_NTC_FREE_ADU) {
-        return true;
+static inline int32_t thermal_runtime_comp_for(uint16_t cur_ntc)
+{
+    if (ffc_ntc_reference_pending && ntc_adc_valid(cur_ntc)) {
+        /* The FFC anchor was accepted while NTC was invalid.  Rebase on the
+         * first recovered sample without replaying an old delta. */
+        ffc_last_ntc = cur_ntc;
+        ffc_ntc_reference_pending = false;
+        return 0;
     }
-
-    const int32_t adn = dn < 0 ? -dn : dn;
-    if (adn <= FFC_NTC_SIGN_DEADBAND_ADU) {
-        return false;
-    }
-
-    if ((dv > 0 && dn > 0) || (dv < 0 && dn < 0)) {
-        return false;
-    }
-
-    return adv <= (FFC_VTEMP_NTC_FREE_ADU
-                   + adn * FFC_VTEMP_NTC_RATIO_MAX);
+    return ntc_fallback_comp_between(ffc_last_ntc, cur_ntc);
 }
 
 static inline uint16_t u16_absdiff(uint16_t a, uint16_t b)
 {
     return (a > b) ? (a - b) : (b - a);
-}
-
-static inline int32_t ntc_warmup_curve_comp_for(uint16_t cur_ntc)
-{
-    if (!ntc_adc_valid(boot_ntc) || !ntc_adc_valid(cur_ntc)) {
-        return 0;
-    }
-
-    /* The board NTC lags the shutter/lens during cold start.  The latest
-     * trend shows scene keeps falling even after NTC has started moving, so
-     * this curve exits only after a larger body-temperature rise or a long
-     * timeout, then the normal K_NTC path owns the residual drift. */
-    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    const uint32_t start_ms = boot_ntc_ms ? boot_ntc_ms : now_ms;
-    const uint32_t elapsed_ms = now_ms - start_ms;
-    if (elapsed_ms >= NTC_WARMUP_FADE_END_MS) {
-        return 0;
-    }
-
-    uint32_t mag = ((uint32_t)NTC_WARMUP_CURVE_COMP_ADU * elapsed_ms)
-                   / (elapsed_ms + NTC_WARMUP_CURVE_TAU_MS);
-
-    if (elapsed_ms > NTC_WARMUP_FADE_START_MS) {
-        mag = mag * (NTC_WARMUP_FADE_END_MS - elapsed_ms)
-              / (NTC_WARMUP_FADE_END_MS - NTC_WARMUP_FADE_START_MS);
-    }
-
-    const uint16_t boot_delta = u16_absdiff(cur_ntc, boot_ntc);
-    if (boot_delta > NTC_WARMUP_NTC_FADE_START_ADU) {
-        if (boot_delta >= NTC_WARMUP_NTC_FADE_END_ADU) {
-            return 0;
-        }
-        mag = mag * (uint32_t)(NTC_WARMUP_NTC_FADE_END_ADU - boot_delta)
-              / (uint32_t)(NTC_WARMUP_NTC_FADE_END_ADU
-                           - NTC_WARMUP_NTC_FADE_START_ADU);
-    }
-
-    return -(int32_t)mag;
-}
-
-static inline float ntc_normal_comp_k_for(uint16_t cur_ntc)
-{
-    float k = K_NTC_COMP_STATIC;
-    if (ntc_adc_valid(boot_ntc)) {
-        const uint16_t boot_delta = u16_absdiff(cur_ntc, boot_ntc);
-        if (boot_delta >= NTC_WARMUP_NTC_FADE_END_ADU) {
-            k = K_NTC_COMP_LATE_STATIC;
-        } else if (boot_delta > NTC_WARMUP_NTC_FADE_START_ADU) {
-            const float w = (float)(boot_delta - NTC_WARMUP_NTC_FADE_START_ADU)
-                            * (1.0f / (float)(NTC_WARMUP_NTC_FADE_END_ADU
-                                               - NTC_WARMUP_NTC_FADE_START_ADU));
-            k += (K_NTC_COMP_LATE_STATIC - K_NTC_COMP_STATIC) * w;
-        }
-    }
-    return k;
-}
-
-static inline int32_t ntc_normal_comp_between(uint16_t ref_ntc, uint16_t cur_ntc)
-{
-    if (!ntc_adc_valid(ref_ntc) || !ntc_adc_valid(cur_ntc)) {
-        return 0;
-    }
-
-    const int32_t dn = (int32_t)cur_ntc - (int32_t)ref_ntc;
-    return (int32_t)(ntc_normal_comp_k_for(cur_ntc) * (float)dn);
-}
-
-static inline int32_t ntc_normal_comp_for(uint16_t cur_ntc)
-{
-    return ntc_normal_comp_between(ffc_last_ntc, cur_ntc);
-}
-
-static inline int32_t ntc_anchor_comp_for(uint16_t cur_ntc)
-{
-    if (ntc_adc_valid(boot_ntc)) {
-        return ntc_normal_comp_between(boot_ntc, cur_ntc);
-    }
-    return ntc_normal_comp_for(cur_ntc);
-}
-
-static inline int32_t ntc_frame_comp_for(uint16_t cur_ntc)
-{
-    int32_t comp = ntc_normal_comp_for(cur_ntc);
-    comp += ntc_warmup_curve_comp_for(cur_ntc);
-    return comp;
 }
 
 static inline int32_t i32_abs(int32_t v)
@@ -985,6 +833,8 @@ static inline int16_t clip_i16_i32(int32_t v)
     }
     return (int16_t)v;
 }
+
+static inline __attribute__((always_inline)) uint16_t gray14_to_bin(uint16_t g);
 
 static int16_t temp_x10_from_corrected_adu(int32_t adu, int32_t eff_anchor)
 {
@@ -1010,6 +860,103 @@ static int16_t temp_x10_from_corrected_adu(int32_t adu, int32_t eff_anchor)
         return INT16_MAX;
     }
     return (int16_t)x10;
+}
+
+static void ffc_continuity_capture_reference(const uint8_t* raw)
+{
+    size_t sample = 0;
+    const int cx = SENSOR_W / 2;
+    const int cy = SENSOR_H / 2;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const uint16_t pixel = (uint16_t)((cy + dy) * SENSOR_W + cx + dx);
+            ffc_continuity_center[sample].pixel_index = pixel;
+            ffc_continuity_center[sample].raw_adu =
+                gray14_to_bin(be16_to_u14(&raw[(size_t)pixel * 2u]));
+            sample++;
+        }
+    }
+
+    sample = 0;
+    for (uint32_t row = 0; row < FFC_CONTINUITY_FIELD_ROWS; ++row) {
+        const uint32_t y = ((2u * row + 1u) * SENSOR_H)
+                           / (2u * FFC_CONTINUITY_FIELD_ROWS);
+        for (uint32_t col = 0; col < FFC_CONTINUITY_FIELD_COLS; ++col) {
+            const uint32_t x = ((2u * col + 1u) * SENSOR_W)
+                               / (2u * FFC_CONTINUITY_FIELD_COLS);
+            const uint16_t pixel = (uint16_t)(y * SENSOR_W + x);
+            ffc_continuity_field[sample].pixel_index = pixel;
+            ffc_continuity_field[sample].raw_adu =
+                gray14_to_bin(be16_to_u14(&raw[(size_t)pixel * 2u]));
+            sample++;
+        }
+    }
+    ffc_continuity_reference_valid = true;
+}
+
+static int32_t ffc_continuity_corrected_mean(
+    const struct FfcContinuitySample* samples,
+    size_t sample_count,
+    const uint16_t* background,
+    const uint32_t* candidate_background,
+    int32_t background_mean)
+{
+    float sum = 0.0f;
+    for (size_t i = 0; i < sample_count; ++i) {
+        const uint16_t pixel = samples[i].pixel_index;
+        const uint16_t background_adu = candidate_background != nullptr
+            ? (uint16_t)candidate_background[pixel]
+            : background[pixel];
+        sum += flash_gain[pixel]
+               * ((float)samples[i].raw_adu - (float)background_adu)
+               + (float)background_mean;
+    }
+    return (int32_t)roundf(sum / (float)sample_count);
+}
+
+static bool ffc_first_continuity_predict(
+    const uint32_t* candidate_background,
+    int32_t candidate_mean,
+    int32_t old_eff_anchor,
+    int32_t new_eff_anchor,
+    int16_t* center_jump_x10,
+    int16_t* field_jump_x10)
+{
+    if (!ffc_continuity_reference_valid || calibg == nullptr
+        || caligain == nullptr || flash_gain == nullptr
+        || ram_mean_diff <= 0.0f || ram_temp_anchor == 0) {
+        return false;
+    }
+
+    const int32_t old_center_adu = ffc_continuity_corrected_mean(
+        ffc_continuity_center, FFC_CONTINUITY_CENTER_SAMPLES,
+        calibg, nullptr, g_calib_mean);
+    const int32_t new_center_adu = ffc_continuity_corrected_mean(
+        ffc_continuity_center, FFC_CONTINUITY_CENTER_SAMPLES,
+        nullptr, candidate_background, candidate_mean);
+    const int32_t old_field_adu = ffc_continuity_corrected_mean(
+        ffc_continuity_field, FFC_CONTINUITY_FIELD_SAMPLES,
+        calibg, nullptr, g_calib_mean);
+    const int32_t new_field_adu = ffc_continuity_corrected_mean(
+        ffc_continuity_field, FFC_CONTINUITY_FIELD_SAMPLES,
+        nullptr, candidate_background, candidate_mean);
+
+    const int16_t old_center_x10 =
+        temp_x10_from_corrected_adu(old_center_adu, old_eff_anchor);
+    const int16_t new_center_x10 =
+        temp_x10_from_corrected_adu(new_center_adu, new_eff_anchor);
+    const int16_t old_field_x10 =
+        temp_x10_from_corrected_adu(old_field_adu, old_eff_anchor);
+    const int16_t new_field_x10 =
+        temp_x10_from_corrected_adu(new_field_adu, new_eff_anchor);
+    if (old_center_x10 == INT16_MAX || new_center_x10 == INT16_MAX
+        || old_field_x10 == INT16_MAX || new_field_x10 == INT16_MAX) {
+        return false;
+    }
+
+    *center_jump_x10 = (int16_t)(new_center_x10 - old_center_x10);
+    *field_jump_x10 = (int16_t)(new_field_x10 - old_field_x10);
+    return true;
 }
 
 static uint16_t center_roi_mean_u14(const uint16_t* img, int radius)
@@ -1177,11 +1124,16 @@ static inline void ntc_tick(void)
     if ((tick & (fast ? 0x03u : 0x07u)) != 0) return;
 
     const uint16_t v = ntc_read_avg(4);
-    if (!ntc_adc_valid(v)) return;
+    if (!ntc_adc_valid(v)) {
+        /* Fail the compensation input open without stopping acquisition.
+         * Preserve the EMA state so one later valid sample can recover
+         * smoothly, but publish an invalid current value immediately. */
+        g_cur_ntc_adc = 0;
+        return;
+    }
 
     if (!ntc_adc_valid(boot_ntc)) {
         boot_ntc = v;
-        boot_ntc_ms = now_ms;
     }
 
     uint32_t smooth = g_ntc_smooth_x256;
@@ -2633,6 +2585,13 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
                   "every raw frame must preserve u14 alignment");
     raw14_alias_t* const raw14 = (raw14_alias_t*)raw;
 
+    if (calib != nullptr && calig != nullptr && ram_mean_diff > 0.0f
+        && ram_temp_anchor != 0) {
+        ffc_continuity_capture_reference(raw);
+    } else {
+        ffc_continuity_reference_valid = false;
+    }
+
     uint16_t low = 0, high = 0;
     bool debad = false;
 
@@ -2737,13 +2696,12 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
      * Bolometer ADU ∝ scene radiance ∝ T_K^4 (Stefan-Boltzmann), so two-point
      * interpolation must be done in T^4 space, not linear-in-°C, otherwise a
      * 0°C / 50°C calibration under-reads midrange by several degrees. */
-    /* VTEMP feeds the static K_V·ΔVTEMP between-FFC compensation;
-     * NTC feeds the K_N·ΔNTC shutter/body-thermal-lag compensation. */
+    /* VTEMP is diagnostic-only. Board NTC feeds the bounded fallback; an
+     * invalid NTC sample fails compensation open. */
     const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
     const uint16_t cur_ntc   = g_cur_ntc_adc;
 
-    /* Update VTEMP EMA smoother — used by K_V to avoid amplifying
-     * frame-to-frame ADC jitter into visible scene swing. */
+    /* Update VTEMP EMA smoother for diagnostics only. */
     if (g_vtemp_smooth_x256 == 0) {
         g_vtemp_smooth_x256 = (uint32_t)cur_vtemp << 8;
     } else {
@@ -2751,42 +2709,15 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             (g_vtemp_smooth_x256 * 31 + ((uint32_t)cur_vtemp << 8)) >> 5;
     }
     const uint16_t smooth_vtemp = (uint16_t)(g_vtemp_smooth_x256 >> 8);
-
     int16_t t_lo_x10 = INT16_MAX;
     int16_t t_hi_x10 = INT16_MAX;
     float t_lo_c_f = 0.0f, t_hi_c_f = 0.0f;
     bool temp_map_ok = false;
     int32_t eff_anchor = ram_temp_anchor;
+    const int32_t startup_comp_i32 = thermal_startup_comp_for_now();
+    const int32_t ntc_comp_i32 = thermal_runtime_comp_for(cur_ntc);
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        if (thermal_comp_legacy_enabled()) {
-            int32_t comp = 0;
-            const bool ntc_ok =
-                ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc);
-            const int32_t dn = ntc_ok
-                ? (int32_t)cur_ntc - (int32_t)ffc_last_ntc
-                : 0;
-            if (ffc_last_fpa_vtemp != 0) {
-                int32_t dv =
-                    (int32_t)smooth_vtemp - (int32_t)ffc_last_fpa_vtemp;
-                if (ntc_ok) {
-                    const int32_t adn = dn < 0 ? -dn : dn;
-                    const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
-                    if (dv >  dv_ntc_cap) dv =  dv_ntc_cap;
-                    if (dv < -dv_ntc_cap) dv = -dv_ntc_cap;
-                }
-                if (dv >  DV_CLAMP_ADU) dv =  DV_CLAMP_ADU;
-                if (dv < -DV_CLAMP_ADU) dv = -DV_CLAMP_ADU;
-                comp += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv);
-            }
-            if (ntc_ok) {
-                comp += ntc_frame_comp_for(cur_ntc);
-            }
-            if (comp >  K_COMP_MAX_ADU) comp =  K_COMP_MAX_ADU;
-            if (comp < -K_COMP_MAX_ADU) comp = -K_COMP_MAX_ADU;
-            eff_anchor += comp;
-        } else if (thermal_comp_table_enabled()) {
-            eff_anchor += thermal_comp_table_for_now();
-        }
+        eff_anchor += startup_comp_i32 + ntc_comp_i32;
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
         const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
@@ -2859,13 +2790,15 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     const uint32_t range = g_smooth_high - g_smooth_low;
     const uint32_t mult = (254 << 16) / range;
 
-    if (display_enhance) {
+    const bool radiometric_output = dataomode == DOM_NCM;
+    const bool apply_display_enhance = display_enhance && !radiometric_output;
+    if (apply_display_enhance) {
         display_row_destripe_u14(raw14);
         display_col_destripe_u14(raw14);
     }
 
     for (int i = 0, x = 0, y = 0; i < PX_CNT; i++) {
-        const uint16_t v = display_enhance
+        const uint16_t v = apply_display_enhance
                                ? display_detail_boost_u14(raw14, x, y)
                                : raw14[i];
         uint8_t linear_val;
@@ -2890,7 +2823,9 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             y++;
         }
     }
-    display_col_destripe_u8(&out[1]);
+    if (!radiometric_output) {
+        display_col_destripe_u8(&out[1]);
+    }
 
     /* temperature range bytes at [PX_CNT+3..PX_CNT+6]; INT16_MAX = N/A */
     out[PX_CNT + 3] = (uint8_t)((t_lo_x10 >> 8) & 0xFF);
@@ -2937,9 +2872,9 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         boot_delta = u16_absdiff(ntc_snap, boot_ntc_snap);
     }
     const uint16_t warmup_comp =
-        (uint16_t)clip_i16_i32(ntc_warmup_curve_comp_for(ntc_snap));
+        (uint16_t)clip_i16_i32(startup_comp_i32);
     const uint16_t normal_comp =
-        (uint16_t)clip_i16_i32(ntc_normal_comp_for(ntc_snap));
+        (uint16_t)clip_i16_i32(ntc_comp_i32);
     const uint16_t total_comp =
         (uint16_t)clip_i16_i32(eff_anchor - ram_temp_anchor);
     const uint32_t eff_anchor_u = (uint32_t)eff_anchor;
@@ -4074,7 +4009,7 @@ static void ncm_adc16_frame_cancel(void)
 }
 
 static void ffc_run(uint16_t cur_fpa_vtemp);
-static bool ffc_should_trigger(uint16_t cur_fpa_vtemp);
+static bool ffc_should_trigger(void);
 static bool ffc_post_guard_accept(const uint8_t* raw, uint32_t frame_epoch);
 
 void __time_critical_func(core1_rawbuf_consumer)()
@@ -4108,7 +4043,6 @@ void __time_critical_func(core1_rawbuf_consumer)()
             g_cur_ntc_adc = v;
             g_ntc_smooth_x256 = ((uint32_t)v) << 8;
             boot_ntc = v;
-            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
             break;
         }
         sleep_ms(2);
@@ -4118,7 +4052,6 @@ void __time_critical_func(core1_rawbuf_consumer)()
         if (ntc_adc_valid(g_cur_ntc_adc)) {
             g_ntc_smooth_x256 = ((uint32_t)g_cur_ntc_adc) << 8;
             boot_ntc = g_cur_ntc_adc;
-            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
         }
     }
 
@@ -4132,6 +4065,12 @@ void __time_critical_func(core1_rawbuf_consumer)()
             rawbuf_state[idx] = RAWBUF_READING;
             __dmb();
             const uint32_t frame_epoch = rawbuf_epoch[idx];
+            const uint16_t frame_vtemp =
+                be16_to_u14(&rawbuf[idx][RAWBUF_OFS_VTEMP]);
+            if (frame_vtemp > 0 && frame_vtemp <= 0x3fffu) {
+                g_last_complete_vtemp = frame_vtemp;
+                g_last_complete_vtemp_valid = true;
+            }
 
             if (ffc_post_guard_accept(rawbuf[idx], frame_epoch)) {
                 int b = txbuf_pick_free();
@@ -4215,16 +4154,10 @@ void __time_critical_func(core1_rawbuf_consumer)()
          * Allow first FFC even without full calibration (calibg == nullptr);
          * ffc_run() will set calibg = ram_calibg for subsequent frames. */
         if (cmode == CM_OFF && (calibg != nullptr || !ffc_done_first)) {
-            const uint16_t cur_fpa =
-                (uint16_t)(((uint16_t)
-                                rawbuf[rawbuf_last_ready < 0
-                                           ? 0
-                                           : rawbuf_last_ready][RAWBUF_OFS_VTEMP]
-                            << 8)
-                           | rawbuf[rawbuf_last_ready < 0 ? 0
-                                                          : rawbuf_last_ready]
-                                   [RAWBUF_OFS_VTEMP + 1]);
-            if (ffc_should_trigger(cur_fpa)) {
+            const uint16_t cur_fpa = g_last_complete_vtemp_valid
+                ? g_last_complete_vtemp : 0;
+            if (ffc_should_trigger()) {
+                g_ffc_state = SIPEED_FFC_STATE_PENDING;
                 ffc_run(cur_fpa);
             }
         }
@@ -4266,30 +4199,34 @@ static void ffc_service_delay_ms(uint32_t delay_ms)
 static inline __attribute__((always_inline)) void shutter_on()
 {
 #if SHUTTER_ENABLE == 1
+    g_shutter_state = SIPEED_SHUTTER_STATE_MOVING;
     gpio_put(IO_SVMS, 1);
     gpio_put(IO_SVM1, 1);
     gpio_put(IO_SVM2, 0);
-#endif
     ffc_service_delay_ms(200);
-#if SHUTTER_ENABLE == 1
     gpio_put(IO_SVMS, 0);
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 0);
+    g_shutter_state = SIPEED_SHUTTER_STATE_CLOSED;
+#else
+    g_shutter_state = SIPEED_SHUTTER_STATE_NOT_PRESENT;
 #endif
 }
 
 static inline __attribute__((always_inline)) void shutter_off()
 {
 #if SHUTTER_ENABLE == 1
+    g_shutter_state = SIPEED_SHUTTER_STATE_MOVING;
     gpio_put(IO_SVMS, 1);
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 1);
-#endif
     ffc_service_delay_ms(200);
-#if SHUTTER_ENABLE == 1
     gpio_put(IO_SVMS, 0);
     gpio_put(IO_SVM1, 0);
     gpio_put(IO_SVM2, 0);
+    g_shutter_state = SIPEED_SHUTTER_STATE_OPEN;
+#else
+    g_shutter_state = SIPEED_SHUTTER_STATE_NOT_PRESENT;
 #endif
 }
 
@@ -4592,6 +4529,22 @@ static void ffc_open_and_resync_scene(void)
  */
 static void ffc_run(uint16_t cur_fpa_vtemp)
 {
+    const uint32_t ffc_start_ms =
+        to_ms_since_boot(get_absolute_time());
+    g_ffc_state = SIPEED_FFC_STATE_ACQUIRING;
+    g_ffc_captured_frames = 0;
+    g_ffc_frame_mean_span_adu = 0;
+    g_ffc_vtemp_span_adu = 0;
+    g_ffc_ntc_span_adu = 0;
+    g_ffc_bg_min_row_mean = 0;
+    g_ffc_bg_max_row_mean = 0;
+    g_ffc_bg_max_row_jump_adu = 0;
+    g_ffc_bg_max_row_jump_line = 0;
+    g_ffc_bg_min_col_mean = 0;
+    g_ffc_bg_max_col_mean = 0;
+    g_ffc_bg_max_col_jump_adu = 0;
+    g_ffc_bg_max_col_jump_column = 0;
+    g_ffc_last_duration_ms = 0;
     println("FFC start");
     led_on();
 
@@ -4610,6 +4563,13 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     uint32_t* const ffc_sum = calib_workspace.ffc_sum;
     memset(ffc_sum, 0, sizeof(calib_workspace.ffc_sum));
     uint32_t ffc_vtemp_sum = 0;
+    uint16_t frame_mean_min = UINT16_MAX;
+    uint16_t frame_mean_max = 0;
+    uint16_t ffc_vtemp_min = UINT16_MAX;
+    uint16_t ffc_vtemp_max = 0;
+    uint16_t ffc_ntc_min = UINT16_MAX;
+    uint16_t ffc_ntc_max = 0;
+    uint16_t ffc_ntc_valid_count = 0;
 
     /* Drop two fully fresh frames after the shutter-close pulse, then sum
      * eight complete shutter frames.  14-bit ADU * 8 fits in 17 bits, so the
@@ -4619,6 +4579,14 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     for (uint32_t pass = 0; pass < capture_frames; pass++) {
         const int idx = ffc_wait_ready_frame(closed_epoch);
         if (idx < 0) {
+            if (g_ffc_captured_frames != 0) {
+                g_ffc_frame_mean_span_adu =
+                    (uint16_t)(frame_mean_max - frame_mean_min);
+                g_ffc_vtemp_span_adu =
+                    (uint16_t)(ffc_vtemp_max - ffc_vtemp_min);
+                g_ffc_ntc_span_adu = ffc_ntc_valid_count > 0
+                    ? (uint16_t)(ffc_ntc_max - ffc_ntc_min) : 0;
+            }
             println("FFC: no frame, abort");
             ffc_record_event(FFC_EVT_ABORT_NO_FRAME,
                              0,
@@ -4633,21 +4601,54 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             ffc_restore_gain_cache(restore_gain_cache);
             ffc_open_and_resync_scene();
             led_off();
+            g_ffc_state = SIPEED_FFC_STATE_FAILED;
+            g_ffc_last_duration_ms =
+                to_ms_since_boot(get_absolute_time()) - ffc_start_ms;
+            ffc_last_ms = to_ms_since_boot(get_absolute_time());
+            ffc_retry_after_ms = ffc_last_ms + FFC_RETRY_COOLDOWN_MS;
             return;
         }
 
         if (pass >= FFC_CLOSED_DISCARD_FRAMES) {
             const uint8_t* const src = rawbuf[idx];
+            uint32_t frame_pixel_sum = 0;
             for (size_t i = 0; i < PX_CNT; i++) {
-                ffc_sum[i] += gray14_to_bin(be16_to_u14(&src[i * 2]));
+                const uint16_t value =
+                    gray14_to_bin(be16_to_u14(&src[i * 2]));
+                ffc_sum[i] += value;
+                frame_pixel_sum += value;
                 if ((i & 0x3FFu) == 0) {
                     ffc_service_usb();
                 }
             }
-            ffc_vtemp_sum += be16_to_u14(&src[RAWBUF_OFS_VTEMP]);
+            const uint16_t frame_mean =
+                (uint16_t)(frame_pixel_sum / PX_CNT);
+            const uint16_t frame_vtemp =
+                be16_to_u14(&src[RAWBUF_OFS_VTEMP]);
+            const uint16_t frame_ntc = ntc_read_avg(4);
+            if (frame_mean < frame_mean_min) frame_mean_min = frame_mean;
+            if (frame_mean > frame_mean_max) frame_mean_max = frame_mean;
+            if (frame_vtemp < ffc_vtemp_min) ffc_vtemp_min = frame_vtemp;
+            if (frame_vtemp > ffc_vtemp_max) ffc_vtemp_max = frame_vtemp;
+            if (ntc_adc_valid(frame_ntc)) {
+                if (frame_ntc < ffc_ntc_min) ffc_ntc_min = frame_ntc;
+                if (frame_ntc > ffc_ntc_max) ffc_ntc_max = frame_ntc;
+                ffc_ntc_valid_count++;
+            }
+            ffc_vtemp_sum += frame_vtemp;
+            g_ffc_captured_frames++;
         }
         ffc_release_frame(idx);
     }
+
+    g_ffc_frame_mean_span_adu =
+        frame_mean_min <= frame_mean_max
+            ? (uint16_t)(frame_mean_max - frame_mean_min) : 0;
+    g_ffc_vtemp_span_adu =
+        ffc_vtemp_min <= ffc_vtemp_max
+            ? (uint16_t)(ffc_vtemp_max - ffc_vtemp_min) : 0;
+    g_ffc_ntc_span_adu = ffc_ntc_valid_count > 0
+        ? (uint16_t)(ffc_ntc_max - ffc_ntc_min) : 0;
 
     /* Convert the direct sums to rounded per-pixel averages in place.  Keep
      * the candidate in the shared workspace until all sanity guards pass, so
@@ -4691,6 +4692,35 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     g_ffc_bg_max_row_jump_line = bg_max_row_jump_line;
     g_ffc_bg_min_row_mean = bg_min_row_mean;
     g_ffc_bg_max_row_mean = bg_max_row_mean;
+
+    uint16_t bg_min_col_mean = UINT16_MAX;
+    uint16_t bg_max_col_mean = 0;
+    uint16_t bg_max_col_jump = 0;
+    uint8_t bg_max_col_jump_column = 0;
+    uint16_t previous_col_mean = 0;
+    for (uint32_t x = 0; x < SENSOR_W; x++) {
+        uint32_t col_sum = 0;
+        for (uint32_t y = 0; y < SENSOR_H; y++) {
+            col_sum += ffc_sum[y * SENSOR_W + x];
+        }
+        const uint16_t col_mean = (uint16_t)(col_sum / SENSOR_H);
+        if (col_mean < bg_min_col_mean) bg_min_col_mean = col_mean;
+        if (col_mean > bg_max_col_mean) bg_max_col_mean = col_mean;
+        if (x != 0) {
+            const uint16_t jump = col_mean > previous_col_mean
+                ? col_mean - previous_col_mean
+                : previous_col_mean - col_mean;
+            if (jump > bg_max_col_jump) {
+                bg_max_col_jump = jump;
+                bg_max_col_jump_column = (uint8_t)x;
+            }
+        }
+        previous_col_mean = col_mean;
+    }
+    g_ffc_bg_max_col_jump_adu = bg_max_col_jump;
+    g_ffc_bg_max_col_jump_column = bg_max_col_jump_column;
+    g_ffc_bg_min_col_mean = bg_min_col_mean;
+    g_ffc_bg_max_col_mean = bg_max_col_mean;
     const int32_t new_calib_mean = (int32_t)(pixel_sum / PX_CNT);
     cur_fpa_vtemp = (uint16_t)(
         (ffc_vtemp_sum + FFC_AVERAGE_FRAMES / 2u) / FFC_AVERAGE_FRAMES);
@@ -4702,49 +4732,18 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         dn_check = (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc;
     }
 
-    /* FFC sanity check: an FFC across a healthy 30 s interval should
-     * produce only modest dG (shutter mean change) and dV (VTEMP change).
-     * Anything large indicates a sensor glitch or a partial-shutter
-     * capture. Reject by leaving calibg/anchor/K-fit untouched and
-     * exiting; the next scheduled FFC will retry. */
+    /* Reject only a gross shutter-frame mean jump.  dV/dN stay diagnostic;
+     * they no longer gate normal operation. */
     if (ffc_done_first && ffc_last_g_calib_mean != 0) {
         dg_check = new_calib_mean - ffc_last_g_calib_mean;
         dv_check = (int32_t)cur_fpa_vtemp - (int32_t)ffc_last_fpa_vtemp;
         const int32_t adg = i32_abs(dg_check);
-        const int32_t adv = i32_abs(dv_check);
-        int32_t dv_ntc = 0, dn_ntc = 0;
-        if (K_ANCHOR_COMP_STATIC != 0.0f
-            && !ffc_vtemp_ntc_plausible(
-                cur_fpa_vtemp, cur_ntc_at_ffc, &dv_ntc, &dn_ntc)) {
-            println("FFC defer: VTEMP/NTC mismatch dv=%ld dn=%ld",
-                    (long)dv_ntc, (long)dn_ntc);
-            ffc_consec_reject = 0;
-            ffc_record_event(FFC_EVT_REJECT_VN,
-                             dg_check,
-                             dv_ntc,
-                             dn_ntc,
-                             ram_temp_anchor,
-                             ram_temp_anchor,
-                             0,
-                             new_calib_mean,
-                             cur_fpa_vtemp,
-                             cur_ntc_at_ffc);
-            ffc_restore_gain_cache(restore_gain_cache);
-            ffc_open_and_resync_scene();
-            led_off();
-            const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-            ffc_last_ms = now_ms;
-            ffc_retry_after_ms = now_ms + FFC_RETRY_COOLDOWN_MS;
-            return;
-        }
-        const bool over_limits = (adg > FFC_REJECT_DG_ADU)
-            || (K_ANCHOR_COMP_STATIC != 0.0f && adv > FFC_REJECT_DV_ADU);
-        if (over_limits) {
+        if (adg > FFC_REJECT_DG_ADU) {
             ffc_consec_reject++;
-            println("FFC reject %u: dg=%ld dv=%ld (limits dg=%d dv=%d)",
+            println("FFC reject %u: dg=%ld dv=%ld (dg limit=%d)",
                     (unsigned)ffc_consec_reject,
                     (long)dg_check, (long)dv_check,
-                    FFC_REJECT_DG_ADU, FFC_REJECT_DV_ADU);
+                    FFC_REJECT_DG_ADU);
             ffc_record_event(FFC_EVT_REJECT_LIMIT,
                              dg_check,
                              dv_check,
@@ -4758,6 +4757,9 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             ffc_restore_gain_cache(restore_gain_cache);
             ffc_open_and_resync_scene();
             led_off();
+            g_ffc_state = SIPEED_FFC_STATE_FAILED;
+            g_ffc_last_duration_ms =
+                to_ms_since_boot(get_absolute_time()) - ffc_start_ms;
             /* Reset the time anchor so the next FFC waits the full
              * stable interval and avoids back-to-back retries. */
             ffc_last_ms = to_ms_since_boot(get_absolute_time());
@@ -4782,44 +4784,12 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      * reference, so displayed T = T_L when actual scene T = T_L. */
     const int32_t anchor_old = ram_temp_anchor;
     int32_t candidate_temp_anchor = ram_temp_anchor;
-    /* eff_anchor_old = the eff_anchor the renderer used in the last
-     * frame before this FFC. Includes BOTH K_V·ΔVTEMP and K_N·ΔNTC
-     * accumulated since the previous FFC. The smoother shift below
-     * uses eff_anchor_old (not bare anchor_old) to keep displayed
-     * scene continuous. */
-    const int32_t smooth_vtemp_at_ffc = (int32_t)(g_vtemp_smooth_x256 >> 8);
-    const int32_t table_comp_at_ffc = thermal_comp_table_for_now();
+    /* eff_anchor_old is the anchor used immediately before this FFC. */
+    const int32_t startup_comp_at_ffc = thermal_startup_comp_for_now();
+    const int32_t fallback_comp_at_ffc =
+        ntc_fallback_comp_between(ffc_last_ntc, cur_ntc_at_ffc);
     int32_t eff_anchor_old = anchor_old;
-    if (thermal_comp_legacy_enabled()) {
-        int32_t comp_pre = 0;
-        const bool ntc_ok_pre =
-            ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc);
-        const int32_t dn_pre = ntc_ok_pre
-            ? (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc
-            : 0;
-        if (ffc_last_fpa_vtemp != 0) {
-            int32_t dv_pre =
-                smooth_vtemp_at_ffc - (int32_t)ffc_last_fpa_vtemp;
-            if (ntc_ok_pre) {
-                const int32_t adn = dn_pre < 0 ? -dn_pre : dn_pre;
-                const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
-                if (dv_pre >  dv_ntc_cap) dv_pre =  dv_ntc_cap;
-                if (dv_pre < -dv_ntc_cap) dv_pre = -dv_ntc_cap;
-            }
-            if (dv_pre >  DV_CLAMP_ADU) dv_pre =  DV_CLAMP_ADU;
-            if (dv_pre < -DV_CLAMP_ADU) dv_pre = -DV_CLAMP_ADU;
-            comp_pre += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_pre);
-        }
-        if (ntc_ok_pre) {
-            comp_pre += ntc_frame_comp_for(cur_ntc_at_ffc);
-            dn_check = dn_pre;
-        }
-        if (comp_pre >  K_COMP_MAX_ADU) comp_pre =  K_COMP_MAX_ADU;
-        if (comp_pre < -K_COMP_MAX_ADU) comp_pre = -K_COMP_MAX_ADU;
-        eff_anchor_old += comp_pre;
-    } else if (thermal_comp_table_enabled()) {
-        eff_anchor_old += table_comp_at_ffc;
-    }
+    eff_anchor_old += startup_comp_at_ffc + fallback_comp_at_ffc;
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
         for (size_t i = 0; i < PX_CNT; i++) {
@@ -4828,61 +4798,68 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         }
         candidate_temp_anchor =
             (int32_t)roundf(fsum / (float)PX_CNT + (float)new_calib_mean);
-
-        if (thermal_comp_legacy_enabled()) {
-            /* Persist cumulative K_N body-warmup compensation into the
-             * freshly recomputed shutter anchor.  The base anchor below is
-             * derived from the current shutter frame and does not remember
-             * compensation that was applied before this FFC. */
-            int32_t comp_acc = 0;
-            const bool ntc_ok_acc =
-                ntc_adc_valid(ffc_last_ntc) && ntc_adc_valid(cur_ntc_at_ffc);
-            const bool ntc_anchor_ok_acc =
-                ntc_adc_valid(cur_ntc_at_ffc)
-                && (ntc_adc_valid(boot_ntc) || ntc_ok_acc);
-            const int32_t dn_acc = ntc_ok_acc
-                ? (int32_t)cur_ntc_at_ffc - (int32_t)ffc_last_ntc
-                : 0;
-            if (ffc_last_fpa_vtemp != 0) {
-                int32_t dv_acc =
-                    smooth_vtemp_at_ffc - (int32_t)ffc_last_fpa_vtemp;
-                if (ntc_ok_acc) {
-                    const int32_t adn = dn_acc < 0 ? -dn_acc : dn_acc;
-                    const int32_t dv_ntc_cap = adn * DV_DN_RATIO_MAX;
-                    if (dv_acc >  dv_ntc_cap) dv_acc =  dv_ntc_cap;
-                    if (dv_acc < -dv_ntc_cap) dv_acc = -dv_ntc_cap;
-                }
-                if (dv_acc >  DV_CLAMP_ADU) dv_acc =  DV_CLAMP_ADU;
-                if (dv_acc < -DV_CLAMP_ADU) dv_acc = -DV_CLAMP_ADU;
-                comp_acc += (int32_t)(K_ANCHOR_COMP_STATIC * (float)dv_acc);
-            }
-            if (ntc_anchor_ok_acc) {
-                comp_acc += ntc_anchor_comp_for(cur_ntc_at_ffc);
-                if (ntc_ok_acc) {
-                    dn_check = dn_acc;
-                }
-            }
-            if (comp_acc >  K_COMP_MAX_ADU) comp_acc =  K_COMP_MAX_ADU;
-            if (comp_acc < -K_COMP_MAX_ADU) comp_acc = -K_COMP_MAX_ADU;
-            candidate_temp_anchor += comp_acc;
-            println("FFC anchor+K: base=%ld comp=%ld final=%ld ntc=%u",
-                    (long)(candidate_temp_anchor - comp_acc), (long)comp_acc,
-                    (long)candidate_temp_anchor, cur_ntc_at_ffc);
-        }
+    }
+    if (fallback_comp_at_ffc != 0) {
+        /* The stable relative fallback resets its references at FFC, so carry
+         * the accumulated correction even if the base anchor was unchanged. */
+        candidate_temp_anchor += fallback_comp_at_ffc;
+        println("FFC anchor+stable: base=%ld comp=%ld final=%ld ntc=%u",
+                (long)(candidate_temp_anchor - fallback_comp_at_ffc),
+                (long)fallback_comp_at_ffc,
+                (long)candidate_temp_anchor, cur_ntc_at_ffc);
     }
 
     /* Carry the percentile smoother across FFC by shifting with Δeff_anchor.
-     * Using eff_anchor_old (not bare anchor_old) accounts for the K·ΔVTEMP
-     * compensation already applied to the renderer; otherwise every FFC
-     * introduces a momentary scene-reading offset of K·ΔVTEMP/mean_diff. */
+     * Using eff_anchor_old accounts for the NTC compensation already applied
+     * to the renderer. */
+    int32_t eff_anchor_new = candidate_temp_anchor + startup_comp_at_ffc;
+
     int16_t predicted_jump_x10 = 0;
-    if (ffc_done_first && g_smooth_low != 0 && g_smooth_high != 0) {
-        int32_t eff_anchor_new = candidate_temp_anchor;
-        if (thermal_comp_legacy_enabled()) {
-            eff_anchor_new += ntc_warmup_curve_comp_for(cur_ntc_at_ffc);
-        } else if (thermal_comp_table_enabled()) {
-            eff_anchor_new += table_comp_at_ffc;
+    if (!ffc_done_first) {
+        int16_t center_jump_x10 = 0;
+        int16_t field_jump_x10 = 0;
+        if (ffc_first_continuity_predict(ffc_sum,
+                                         new_calib_mean,
+                                         eff_anchor_old,
+                                         eff_anchor_new,
+                                         &center_jump_x10,
+                                         &field_jump_x10)) {
+            predicted_jump_x10 =
+                i32_abs(center_jump_x10) >= i32_abs(field_jump_x10)
+                    ? center_jump_x10
+                    : field_jump_x10;
+            if (i32_abs(predicted_jump_x10)
+                > FFC_FIRST_CONTINUITY_MAX_JUMP_X10) {
+                println("FFC reject first continuity: center=%d field=%d x0.1C limit=%d",
+                        (int)center_jump_x10,
+                        (int)field_jump_x10,
+                        FFC_FIRST_CONTINUITY_MAX_JUMP_X10);
+                ffc_consec_reject++;
+                ffc_record_event(FFC_EVT_REJECT_JUMP,
+                                 dg_check,
+                                 dv_check,
+                                 dn_check,
+                                 eff_anchor_old,
+                                 eff_anchor_new,
+                                 predicted_jump_x10,
+                                 new_calib_mean,
+                                 cur_fpa_vtemp,
+                                 cur_ntc_at_ffc);
+                ffc_restore_gain_cache(restore_gain_cache);
+                ffc_open_and_resync_scene();
+                led_off();
+                g_ffc_state = SIPEED_FFC_STATE_FAILED;
+                g_ffc_last_duration_ms =
+                    to_ms_since_boot(get_absolute_time()) - ffc_start_ms;
+                ffc_last_ms = to_ms_since_boot(get_absolute_time());
+                ffc_retry_after_ms =
+                    ffc_last_ms + FFC_RETRY_COOLDOWN_MS;
+                return;
+            }
         }
+    }
+
+    if (ffc_done_first && g_smooth_low != 0 && g_smooth_high != 0) {
         const int32_t scene_mid_adu =
             ((int32_t)g_smooth_low + (int32_t)g_smooth_high) >> 1;
         const int16_t old_mid_x10 =
@@ -4899,41 +4876,32 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
             predicted_jump_x10 = (int16_t)jump_tmp;
             const int32_t abs_jump_x10 = i32_abs(predicted_jump_x10);
             if (abs_jump_x10 > FFC_SOFT_JUMP_X10) {
-                const bool hard_jump =
-                    abs_jump_x10 > FFC_HARD_JUMP_X10;
-                const bool still_probing =
-                    ffc_consec_reject < FFC_RECOVER_AFTER_JUMP_REJECTS;
-                if (hard_jump || still_probing) {
-                    println("FFC reject jump: old=%d new=%d jump=%d x0.1C soft=%d hard=%d rej=%u",
-                            (int)old_mid_x10,
-                            (int)new_mid_x10,
-                            (int)predicted_jump_x10,
-                            FFC_SOFT_JUMP_X10,
-                            FFC_HARD_JUMP_X10,
-                            (unsigned)ffc_consec_reject + 1u);
-                    ffc_consec_reject++;
-                    ffc_record_event(FFC_EVT_REJECT_JUMP,
-                                     dg_check,
-                                     dv_check,
-                                     dn_check,
-                                     eff_anchor_old,
-                                     eff_anchor_new,
-                                     predicted_jump_x10,
-                                     new_calib_mean,
-                                     cur_fpa_vtemp,
-                                     cur_ntc_at_ffc);
-                    ffc_restore_gain_cache(restore_gain_cache);
-                    ffc_open_and_resync_scene();
-                    led_off();
-                    ffc_last_ms = to_ms_since_boot(get_absolute_time());
-                    ffc_retry_after_ms = ffc_last_ms + FFC_RETRY_COOLDOWN_MS;
-                    return;
-                }
-                println("FFC recover jump accept: old=%d new=%d jump=%d x0.1C rej=%u",
+                println("FFC reject jump: old=%d new=%d jump=%d x0.1C soft=%d rej=%u",
                         (int)old_mid_x10,
                         (int)new_mid_x10,
                         (int)predicted_jump_x10,
-                        (unsigned)ffc_consec_reject);
+                        FFC_SOFT_JUMP_X10,
+                        (unsigned)ffc_consec_reject + 1u);
+                ffc_consec_reject++;
+                ffc_record_event(FFC_EVT_REJECT_JUMP,
+                                 dg_check,
+                                 dv_check,
+                                 dn_check,
+                                 eff_anchor_old,
+                                 eff_anchor_new,
+                                 predicted_jump_x10,
+                                 new_calib_mean,
+                                 cur_fpa_vtemp,
+                                 cur_ntc_at_ffc);
+                ffc_restore_gain_cache(restore_gain_cache);
+                ffc_open_and_resync_scene();
+                led_off();
+                g_ffc_state = SIPEED_FFC_STATE_FAILED;
+                g_ffc_last_duration_ms =
+                    to_ms_since_boot(get_absolute_time()) - ffc_start_ms;
+                ffc_last_ms = to_ms_since_boot(get_absolute_time());
+                ffc_retry_after_ms = ffc_last_ms + FFC_RETRY_COOLDOWN_MS;
+                return;
             }
         }
         const int32_t delta = eff_anchor_new - eff_anchor_old;
@@ -4948,6 +4916,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         g_smooth_high = 0;
     }
 
+    g_ffc_state = SIPEED_FFC_STATE_APPLYING;
     ffc_consec_reject = 0;
 
     /* All guards passed — commit the averaged shutter candidate and anchor. */
@@ -4970,36 +4939,42 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
                      cur_fpa_vtemp,
                      cur_ntc_at_ffc);
 
-    /* update FFC bookkeeping. ffc_last_fpa_vtemp stores the SMOOTHED VTEMP
-     * so that K_V·ΔV in subsequent frames is consistent (smooth − smooth).
-     * The trigger and sanity check still compare raw cur vs this stored
-     * smoothed value — close enough since they're separated by ≥30 s. */
+    /* VTEMP stays available for diagnostics; it is not a compensation input. */
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
     ffc_retry_after_ms = 0;
-    ffc_last_fpa_vtemp = (uint16_t)smooth_vtemp_at_ffc;
-    ffc_last_ntc = cur_ntc_at_ffc;
+    ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    if (ntc_adc_valid(cur_ntc_at_ffc)) {
+        ffc_last_ntc = cur_ntc_at_ffc;
+        ffc_ntc_reference_pending = false;
+    } else {
+        ffc_last_ntc = 0;
+        ffc_ntc_reference_pending = true;
+    }
     ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
     ffc_done_first = true;
 
     ffc_open_and_resync_scene();
+    g_ffc_state = SIPEED_FFC_STATE_IDLE;
+    g_ffc_last_duration_ms =
+        to_ms_since_boot(get_absolute_time()) - ffc_start_ms;
     led_off();
     println("FFC done, calib_mean=%ld", (long)g_calib_mean);
 }
 
-static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
+static bool ffc_should_trigger(void)
 {
     const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-
-    if (!ffc_done_first) {
-        return (now_ms >= FFC_INTERVAL_FIRST_MS);
-    }
 
     if (ffc_retry_after_ms != 0) {
         if ((int32_t)(now_ms - ffc_retry_after_ms) < 0) {
             return false;
         }
         ffc_retry_after_ms = 0;
+    }
+
+    if (!ffc_done_first) {
+        return (now_ms >= FFC_INTERVAL_FIRST_MS);
     }
 
     /* Select target interval based on which FFC we're waiting for.
@@ -5019,46 +4994,8 @@ static bool ffc_should_trigger(uint16_t cur_fpa_vtemp)
             break;
     }
 
-    /* Post-warmup thermal-settled gate: if VTEMP raw is far from its EMA
-     * smoothed value, FPA is mid-transient (e.g. external thermal shock).
-     * Defer FFC entirely until smoother catches up — committing now would
-     * bake an enormous K_V·ΔV into ram_temp_anchor and shift the scene
-     * reading permanently. The first three warmup FFCs still lock cold-start
-     * calibration quickly; from the fourth attempt onward, require the signals
-     * to be settled before firing the shutter. */
-    if (ffc_count >= 3) {
-        const int32_t smooth = (int32_t)(g_vtemp_smooth_x256 >> 8);
-        int32_t vdiff = (int32_t)cur_fpa_vtemp - smooth;
-        if (vdiff < 0) vdiff = -vdiff;
-        if (K_ANCHOR_COMP_STATIC != 0.0f && vdiff > FFC_VTEMP_SETTLED_ADU) {
-            return false;
-        }
-        if (K_ANCHOR_COMP_STATIC != 0.0f
-            && !ffc_vtemp_ntc_plausible(
-                cur_fpa_vtemp, g_cur_ntc_adc, nullptr, nullptr)) {
-            return false;
-        }
-    }
-
     const uint32_t elapsed = now_ms - ffc_last_ms;
-    if (elapsed >= target_interval) {
-        return true;
-    }
-
-    if (elapsed < FFC_MIN_ELAPSED_MS) {
-        return false;
-    }
-
-    /* This sensor revision has shown large VTEMP register jumps while NTC and
-     * the scene remain continuous.  Keep VTEMP in diagnostics, but do not let
-     * it machine-gun the shutter between the periodic FFC deadlines. */
-    if (!FFC_VTEMP_TRIGGER_ENABLE) {
-        return false;
-    }
-    const uint16_t delta = (cur_fpa_vtemp > ffc_last_fpa_vtemp)
-        ? (cur_fpa_vtemp - ffc_last_fpa_vtemp)
-        : (ffc_last_fpa_vtemp - cur_fpa_vtemp);
-    return (delta >= FFC_VTEMP_DELTA_ADU);
+    return elapsed >= target_interval;
 }
 
 int __time_critical_func(spi_init_40MHz4)()
@@ -5139,7 +5076,14 @@ int __time_critical_func(spi_init_40MHz4)()
     println("CLEAR_CALI_ON_BOOT: calibration flash erased.");
 #endif
 
-    if (flash_header->has_data == FLASH_HAS_DATA_F) {
+    /* Select a complete V1 calibration transaction before copying tables into
+     * RAM. Legacy single-slot data remains supported; NCM uploads publish an
+     * alternate selector only after all payload readback checks pass. */
+    thermal_calibration_v1_boot_select();
+    thermal_ntc_model_boot_load();
+
+    if (thermal_calibration_v1_boot_has_calibration()
+        && flash_header->has_data == FLASH_HAS_DATA_F) {
         memcpy(ram_badpts, flash_badpt, MAX_BADPT * sizeof(struct BadPt));
         calibadpt = ram_badpts;
         memcpy(ram_calibg, flash_imgbg, sizeof(ram_calibg));

@@ -1,7 +1,6 @@
 ---
 name: review
 description: Review the current working tree before finishing a task, focusing on over-engineering, unrelated changes, risks, and missing validation.
-disable-model-invocation: true
 ---
 
 # Review Skill
