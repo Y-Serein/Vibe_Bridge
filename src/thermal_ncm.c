@@ -52,6 +52,13 @@ extern volatile uint8_t g_thermal_startup_model_active;
 extern volatile uint16_t g_thermal_startup_model_ntc_threshold_adu;
 extern volatile int16_t g_thermal_startup_model_amplitude_adu;
 extern volatile uint16_t g_thermal_startup_model_tau_ds;
+extern volatile uint8_t g_thermal_row_ref_model_valid;
+extern volatile uint8_t g_thermal_row_ref_model_active;
+extern volatile uint8_t g_thermal_row_ref_sample_valid;
+extern volatile uint16_t g_thermal_row_ref_model_reference_adu;
+extern volatile int16_t g_thermal_row_ref_model_k_q8;
+extern volatile uint16_t g_thermal_row_ref_model_limit_adu;
+extern volatile int16_t g_thermal_row_ref_comp_adu;
 extern volatile uint32_t g_capture_packet_heads;
 extern volatile uint32_t g_capture_packet_mids;
 extern volatile uint32_t g_capture_packet_tails;
@@ -76,6 +83,9 @@ extern volatile uint16_t g_capture_last_frame_uniform_max_run;
 extern uint8_t g_capture_raw_diag[];
 extern int8_t g_capture_row_phase[];
 extern uint16_t g_capture_row_ref_diag[];
+extern volatile uint16_t g_thermal_row_ref_mean_adu;
+extern volatile uint16_t g_thermal_row_ref_span_adu;
+extern volatile uint16_t g_thermal_shutter_mean_adu;
 
 #define INIT_IP4(a, b, c, d) { PP_HTONL(LWIP_MAKEU32(a, b, c, d)) }
 #define HTTP_CLIENT_COUNT 4
@@ -137,6 +147,9 @@ struct thermal_diagnostics_snapshot {
     int16_t total_comp_adu;
     int32_t effective_anchor_adu;
     uint16_t smooth_vtemp_adu;
+    uint16_t row_ref_mean_adu;
+    uint16_t row_ref_span_adu;
+    uint16_t shutter_mean_adu;
     int16_t center_raw_x10;
     int16_t center_roi_x10;
     uint16_t center_raw_adu;
@@ -163,6 +176,13 @@ struct thermal_diagnostics_snapshot {
     uint16_t thermal_startup_model_ntc_threshold_adu;
     int16_t thermal_startup_model_amplitude_adu;
     uint16_t thermal_startup_model_tau_ds;
+    uint8_t thermal_row_ref_model_valid;
+    uint8_t thermal_row_ref_model_active;
+    uint8_t thermal_row_ref_sample_valid;
+    uint16_t thermal_row_ref_model_reference_adu;
+    int16_t thermal_row_ref_model_k_q8;
+    uint16_t thermal_row_ref_model_limit_adu;
+    int16_t thermal_row_ref_comp_adu;
 };
 
 static struct thermal_diagnostics_snapshot diagnostics_snapshot;
@@ -962,6 +982,7 @@ static void prepare_response(struct http_client* client)
             diagnostics.nuc_count = ffc_count;
             diagnostics.ffc_state = g_ffc_state;
             diagnostics.shutter_state = g_shutter_state;
+            diagnostics.shutter_mean_adu = g_thermal_shutter_mean_adu;
             diagnostics.ffc_captured_frames = g_ffc_captured_frames;
             diagnostics.ffc_frame_mean_span_adu =
                 g_ffc_frame_mean_span_adu;
@@ -997,6 +1018,14 @@ static void prepare_response(struct http_client* client)
                 g_thermal_startup_model_amplitude_adu;
             diagnostics.thermal_startup_model_tau_ds =
                 g_thermal_startup_model_tau_ds;
+            diagnostics.thermal_row_ref_model_valid =
+                g_thermal_row_ref_model_valid;
+            diagnostics.thermal_row_ref_model_reference_adu =
+                g_thermal_row_ref_model_reference_adu;
+            diagnostics.thermal_row_ref_model_k_q8 =
+                g_thermal_row_ref_model_k_q8;
+            diagnostics.thermal_row_ref_model_limit_adu =
+                g_thermal_row_ref_model_limit_adu;
             const int body_len = snprintf(
                 client->request, sizeof(client->request),
                 "{\"valid\":true,\"version\":1,\"frame_number\":%lu,"
@@ -1011,7 +1040,9 @@ static void prepare_response(struct http_client* client)
                 "\"boot_ntc_adu\":%u,\"boot_ntc_delta_adu\":%u,"
                 "\"warmup_comp_adu\":%d,\"normal_comp_adu\":%d,"
                 "\"total_comp_adu\":%d,\"effective_anchor_adu\":%ld,"
-                "\"smooth_vtemp_adu\":%u,\"center_raw_x10\":%d,"
+                "\"smooth_vtemp_adu\":%u,\"row_ref_mean_adu\":%u,"
+                "\"row_ref_span_adu\":%u,\"shutter_mean_adu\":%u,"
+                "\"center_raw_x10\":%d,"
                 "\"center_roi_x10\":%d,\"center_raw_adu\":%u,"
                 "\"center_roi_adu\":%u,\"ffc_frames\":%u,"
                 "\"ffc_frame_mean_span_adu\":%u,"
@@ -1029,7 +1060,14 @@ static void prepare_response(struct http_client* client)
                 "\"thermal_startup_model_active\":%u,"
                 "\"thermal_startup_model_ntc_threshold_adu\":%u,"
                 "\"thermal_startup_model_amplitude_adu\":%d,"
-                "\"thermal_startup_model_tau_ds\":%u}\n",
+                "\"thermal_startup_model_tau_ds\":%u,"
+                "\"thermal_row_ref_model_valid\":%u,"
+                "\"thermal_row_ref_model_active\":%u,"
+                "\"thermal_row_ref_sample_valid\":%u,"
+                "\"thermal_row_ref_model_reference_adu\":%u,"
+                "\"thermal_row_ref_model_k_q8\":%d,"
+                "\"thermal_row_ref_model_limit_adu\":%u,"
+                "\"thermal_row_ref_comp_adu\":%d}\n",
                 (unsigned long)diagnostics.frame_number,
                 (unsigned long)diagnostics.timestamp_ms,
                 (unsigned)diagnostics.vtemp_adu,
@@ -1054,6 +1092,9 @@ static void prepare_response(struct http_client* client)
                 (int)diagnostics.total_comp_adu,
                 (long)diagnostics.effective_anchor_adu,
                 (unsigned)diagnostics.smooth_vtemp_adu,
+                (unsigned)diagnostics.row_ref_mean_adu,
+                (unsigned)diagnostics.row_ref_span_adu,
+                (unsigned)diagnostics.shutter_mean_adu,
                 (int)diagnostics.center_raw_x10,
                 (int)diagnostics.center_roi_x10,
                 (unsigned)diagnostics.center_raw_adu,
@@ -1079,7 +1120,14 @@ static void prepare_response(struct http_client* client)
                 (unsigned)diagnostics.thermal_startup_model_active,
                 (unsigned)diagnostics.thermal_startup_model_ntc_threshold_adu,
                 (int)diagnostics.thermal_startup_model_amplitude_adu,
-                (unsigned)diagnostics.thermal_startup_model_tau_ds);
+                (unsigned)diagnostics.thermal_startup_model_tau_ds,
+                (unsigned)diagnostics.thermal_row_ref_model_valid,
+                (unsigned)diagnostics.thermal_row_ref_model_active,
+                (unsigned)diagnostics.thermal_row_ref_sample_valid,
+                (unsigned)diagnostics.thermal_row_ref_model_reference_adu,
+                (int)diagnostics.thermal_row_ref_model_k_q8,
+                (unsigned)diagnostics.thermal_row_ref_model_limit_adu,
+                (int)diagnostics.thermal_row_ref_comp_adu);
             client->flash_data = (const uint8_t*)client->request;
             client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
         } else {
@@ -2078,6 +2126,9 @@ void thermal_ncm_note_frame(uint8_t token, const uint8_t* frame,
             read_be_i32(&frame[THERMAL_FRAME_IMAGE_BYTES + 41]),
         .smooth_vtemp_adu =
             read_be16(&frame[THERMAL_FRAME_IMAGE_BYTES + 45]),
+        .row_ref_mean_adu = g_thermal_row_ref_mean_adu,
+        .row_ref_span_adu = g_thermal_row_ref_span_adu,
+        .shutter_mean_adu = g_thermal_shutter_mean_adu,
         .center_raw_x10 =
             read_be_i16(&frame[THERMAL_FRAME_IMAGE_BYTES + 47]),
         .center_roi_x10 =
@@ -2111,6 +2162,15 @@ void thermal_ncm_note_frame(uint8_t token, const uint8_t* frame,
         .thermal_startup_model_amplitude_adu =
             g_thermal_startup_model_amplitude_adu,
         .thermal_startup_model_tau_ds = g_thermal_startup_model_tau_ds,
+        .thermal_row_ref_model_valid = g_thermal_row_ref_model_valid,
+        .thermal_row_ref_model_active = g_thermal_row_ref_model_active,
+        .thermal_row_ref_sample_valid = g_thermal_row_ref_sample_valid,
+        .thermal_row_ref_model_reference_adu =
+            g_thermal_row_ref_model_reference_adu,
+        .thermal_row_ref_model_k_q8 = g_thermal_row_ref_model_k_q8,
+        .thermal_row_ref_model_limit_adu =
+            g_thermal_row_ref_model_limit_adu,
+        .thermal_row_ref_comp_adu = g_thermal_row_ref_comp_adu,
     };
     memcpy(&diagnostics.mean_diff, &mean_diff_bits, sizeof(mean_diff_bits));
     diagnostics_snapshot = diagnostics;

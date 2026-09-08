@@ -163,6 +163,16 @@ static bool calibration_ntc_model_fields_valid(
         && limit_adu == 0u) {
         return true;
     }
+    if (tag == THERMAL_CALIBRATION_V1_ROW_REF_MODEL_TAG) {
+        return reference_adu >= THERMAL_CALIBRATION_V1_ROW_REF_MIN_ADU
+               && reference_adu <= THERMAL_CALIBRATION_V1_ROW_REF_MAX_ADU
+               && k_q8 > 0
+               && (uint16_t)k_q8
+                      <= THERMAL_CALIBRATION_V1_ROW_REF_K_Q8_MAX
+               && limit_adu > 0u
+               && limit_adu
+                      <= THERMAL_CALIBRATION_V1_ROW_REF_LIMIT_MAX;
+    }
     if (!calibration_ntc_adu_valid(reference_adu)) return false;
     if (tag == THERMAL_CALIBRATION_V1_STARTUP_MODEL_TAG) {
         const int32_t abs_amplitude =
@@ -896,5 +906,25 @@ bool thermal_calibration_v1_startup_model(
         flash_header->thermal_ntc_reference_adu;
     model->amplitude_adu = flash_header->thermal_ntc_k_q8;
     model->tau_ds = flash_header->thermal_ntc_limit_adu;
+    return true;
+}
+
+bool thermal_calibration_v1_row_ref_model(
+    struct thermal_calibration_v1_row_ref_model* model)
+{
+    if (!model || !calibration.boot_has_calibration || !flash_header
+        || flash_header->thermal_ntc_tag
+               != THERMAL_CALIBRATION_V1_ROW_REF_MODEL_TAG
+        || !calibration_ntc_model_fields_valid(
+            flash_header->thermal_ntc_tag,
+            flash_header->thermal_ntc_reference_adu,
+            flash_header->thermal_ntc_k_q8,
+            flash_header->thermal_ntc_limit_adu)) {
+        return false;
+    }
+    model->tag = flash_header->thermal_ntc_tag;
+    model->reference_adu = flash_header->thermal_ntc_reference_adu;
+    model->k_q8 = flash_header->thermal_ntc_k_q8;
+    model->limit_adu = flash_header->thermal_ntc_limit_adu;
     return true;
 }

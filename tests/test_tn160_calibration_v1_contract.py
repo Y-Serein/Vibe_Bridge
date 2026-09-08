@@ -126,6 +126,24 @@ class CalibrationV1ContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.run_validation(manifest, payloads)
 
+    def test_valid_row_reference_model_extension_is_accepted(self):
+        model = (MODULE.ROW_REF_MODEL_TAG, 4948, 256, 600)
+        manifest, payloads = make_valid_tnc1(model)
+        self.assertEqual(self.run_validation(manifest, payloads), manifest)
+
+    def test_invalid_row_reference_slope_is_rejected(self):
+        model = (MODULE.ROW_REF_MODEL_TAG, 4948, 0, 600)
+        manifest, payloads = make_valid_tnc1(model)
+        with self.assertRaises(AssertionError):
+            self.run_validation(manifest, payloads)
+
+    def test_invalid_row_reference_reference_is_rejected(self):
+        model = (MODULE.ROW_REF_MODEL_TAG,
+                 MODULE.ROW_REF_REFERENCE_MAX + 1, 256, 600)
+        manifest, payloads = make_valid_tnc1(model)
+        with self.assertRaises(AssertionError):
+            self.run_validation(manifest, payloads)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,8 @@
 
 /* Optional tagged eight-byte extension inside TNC1 header bytes 52..59.
  * All-zero bytes retain the base V1 meaning.  Legacy "TN" remains readable
- * but inactive; "TC" carries the signed per-device cold-start transient. */
+ * but inactive; "TC" is the retired startup-time model; "RR" carries the
+ * per-device row-reference dynamic-anchor model. */
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_TAG       0x4e54u /* "TN" */
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_K_Q8_MAX  8192
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_LIMIT_MAX 1500u
@@ -30,6 +31,11 @@
 #define THERMAL_CALIBRATION_V1_STARTUP_AMPLITUDE_MAX 600
 #define THERMAL_CALIBRATION_V1_STARTUP_TAU_DS_MIN  50u
 #define THERMAL_CALIBRATION_V1_STARTUP_TAU_DS_MAX  600u
+#define THERMAL_CALIBRATION_V1_ROW_REF_MODEL_TAG    0x5252u /* "RR" */
+#define THERMAL_CALIBRATION_V1_ROW_REF_MIN_ADU      512u
+#define THERMAL_CALIBRATION_V1_ROW_REF_MAX_ADU      15872u
+#define THERMAL_CALIBRATION_V1_ROW_REF_K_Q8_MAX     512u
+#define THERMAL_CALIBRATION_V1_ROW_REF_LIMIT_MAX    1500u
 
 struct __attribute__((packed)) thermal_calibration_v1_ntc_model {
     uint16_t tag;
@@ -52,6 +58,16 @@ struct __attribute__((packed)) thermal_calibration_v1_startup_model {
 
 static_assert(sizeof(struct thermal_calibration_v1_startup_model) == 8,
               "startup model extension must fit TNC1 reserved bytes");
+
+struct __attribute__((packed)) thermal_calibration_v1_row_ref_model {
+    uint16_t tag;
+    uint16_t reference_adu;
+    int16_t k_q8;
+    uint16_t limit_adu;
+};
+
+static_assert(sizeof(struct thermal_calibration_v1_row_ref_model) == 8,
+              "row-reference model extension must fit TNC1 reserved bytes");
 
 enum thermal_calibration_v1_result {
     THERMAL_CALIBRATION_V1_OK = 0,
@@ -131,5 +147,7 @@ bool thermal_calibration_v1_ntc_model(
     struct thermal_calibration_v1_ntc_model* model);
 bool thermal_calibration_v1_startup_model(
     struct thermal_calibration_v1_startup_model* model);
+bool thermal_calibration_v1_row_ref_model(
+    struct thermal_calibration_v1_row_ref_model* model);
 
 #endif

@@ -26,6 +26,11 @@ STARTUP_MODEL_TAG = 0x4354
 STARTUP_AMPLITUDE_MAX = 600
 STARTUP_TAU_DS_MIN = 50
 STARTUP_TAU_DS_MAX = 600
+ROW_REF_MODEL_TAG = 0x5252
+ROW_REF_REFERENCE_MIN = 512
+ROW_REF_REFERENCE_MAX = 15872
+ROW_REF_K_Q8_MAX = 512
+ROW_REF_LIMIT_MAX = 1500
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -58,6 +63,14 @@ def validate_ntc_model_header(header):
         assert STARTUP_TAU_DS_MIN <= limit_adu <= STARTUP_TAU_DS_MAX, \
             f"invalid startup tau: {limit_adu}"
         return "cold_start"
+    if tag == ROW_REF_MODEL_TAG:
+        assert ROW_REF_REFERENCE_MIN <= reference_adu <= ROW_REF_REFERENCE_MAX, \
+            f"invalid row-reference model reference: {reference_adu}"
+        assert 0 < k_q8 <= ROW_REF_K_Q8_MAX, \
+            f"invalid row-reference model slope: {k_q8}"
+        assert 0 < limit_adu <= ROW_REF_LIMIT_MAX, \
+            f"invalid row-reference model limit: {limit_adu}"
+        return "row_reference"
     assert tag == NTC_MODEL_TAG, f"invalid NTC model tag: 0x{tag:04x}"
     assert 8 < reference_adu < 4088, \
         f"invalid NTC model reference: {reference_adu}"
@@ -99,6 +112,40 @@ def validate_startup_model_diagnostics(diagnostics):
     assert abs(amplitude) <= STARTUP_AMPLITUDE_MAX
     assert STARTUP_TAU_DS_MIN <= tau_ds <= STARTUP_TAU_DS_MAX
     assert not active or diagnostics["warmup_comp_adu"] != 0
+    return active
+
+
+def validate_thermal_state_diagnostics(diagnostics):
+    row_ref_mean_adu = diagnostics["row_ref_mean_adu"]
+    row_ref_span_adu = diagnostics["row_ref_span_adu"]
+    shutter_mean_adu = diagnostics["shutter_mean_adu"]
+    assert 0 <= row_ref_mean_adu <= 0x3FFF
+    assert 0 <= row_ref_span_adu <= 0x3FFF
+    assert 0 <= shutter_mean_adu <= 0x3FFF
+    return row_ref_mean_adu > 0 and shutter_mean_adu > 0
+
+
+def validate_row_ref_model_diagnostics(diagnostics):
+    valid = bool(diagnostics["thermal_row_ref_model_valid"])
+    active = bool(diagnostics["thermal_row_ref_model_active"])
+    sample_valid = bool(diagnostics["thermal_row_ref_sample_valid"])
+    reference_adu = diagnostics["thermal_row_ref_model_reference_adu"]
+    k_q8 = diagnostics["thermal_row_ref_model_k_q8"]
+    limit_adu = diagnostics["thermal_row_ref_model_limit_adu"]
+    comp_adu = diagnostics["thermal_row_ref_comp_adu"]
+    if not valid:
+        assert not active and not sample_valid
+        assert (reference_adu, k_q8, limit_adu, comp_adu) == (0, 0, 0, 0)
+        return False
+    assert ROW_REF_REFERENCE_MIN <= reference_adu <= ROW_REF_REFERENCE_MAX
+    assert 0 < k_q8 <= ROW_REF_K_Q8_MAX
+    assert 0 < limit_adu <= ROW_REF_LIMIT_MAX
+    assert abs(comp_adu) <= limit_adu
+    assert not sample_valid or active
+    if active:
+        assert diagnostics["thermal_startup_model_active"] == 0
+        assert diagnostics.get("thermal_ntc_model_active", False) is False
+        assert diagnostics["normal_comp_adu"] == comp_adu
     return active
 
 
@@ -276,6 +323,8 @@ def main():
     get_json(base, "/api/v1/measurement")
     get_json(base, "/api/v1/thermal")
     diagnostics = get_json(base, "/api/v1/diagnostics")
+    validate_thermal_state_diagnostics(diagnostics)
+    validate_row_ref_model_diagnostics(diagnostics)
     validate_ntc_model_diagnostics(diagnostics)
     validate_startup_model_diagnostics(diagnostics)
     get_json(base, "/api/v1/ota/status")

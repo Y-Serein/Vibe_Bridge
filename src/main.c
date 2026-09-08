@@ -192,6 +192,9 @@ volatile bool g_capture_raw_diag_frozen = false;
 int8_t g_capture_row_phase[SENSOR_H];
 static uint16_t rawbuf_row_ref[RAWBUFCNT][SENSOR_H];
 uint16_t g_capture_row_ref_diag[SENSOR_H];
+volatile uint16_t g_thermal_row_ref_mean_adu = 0;
+volatile uint16_t g_thermal_row_ref_span_adu = 0;
+volatile uint16_t g_thermal_shutter_mean_adu = 0;
 
 enum adc16_snapshot_state {
     ADC16_SNAPSHOT_IDLE = 0,
@@ -286,6 +289,35 @@ static inline __attribute__((always_inline)) int rawbuf_find_free(void)
         }
     }
     return -1;
+}
+
+static inline __attribute__((always_inline)) void
+thermal_publish_row_reference_state(int buf_idx)
+{
+    uint32_t sum = 0;
+    uint16_t min_adu = UINT16_MAX;
+    uint16_t max_adu = 0;
+
+    for (size_t y = 0; y < SENSOR_H; ++y) {
+        const uint16_t value = rawbuf_row_ref[buf_idx][y];
+        sum += value;
+        if (value < min_adu) {
+            min_adu = value;
+        }
+        if (value > max_adu) {
+            max_adu = value;
+        }
+    }
+
+    g_thermal_row_ref_mean_adu =
+        (uint16_t)((sum + SENSOR_H / 2u) / SENSOR_H);
+    g_thermal_row_ref_span_adu = (uint16_t)(max_adu - min_adu);
+}
+
+static inline void thermal_publish_shutter_mean(int32_t mean_adu)
+{
+    g_thermal_shutter_mean_adu =
+        mean_adu >= 0 && mean_adu <= 0x3fff ? (uint16_t)mean_adu : 0;
 }
 
 static inline __attribute__((always_inline)) void rawbuf_copy_line(
@@ -588,13 +620,21 @@ volatile uint8_t g_thermal_startup_model_active = 0;
 volatile uint16_t g_thermal_startup_model_ntc_threshold_adu = 0;
 volatile int16_t g_thermal_startup_model_amplitude_adu = 0;
 volatile uint16_t g_thermal_startup_model_tau_ds = 0;
+volatile uint8_t g_thermal_row_ref_model_valid = 0;
+volatile uint8_t g_thermal_row_ref_model_active = 0;
+volatile uint8_t g_thermal_row_ref_sample_valid = 0;
+volatile uint16_t g_thermal_row_ref_model_reference_adu = 0;
+volatile int16_t g_thermal_row_ref_model_k_q8 = 0;
+volatile uint16_t g_thermal_row_ref_model_limit_adu = 0;
+volatile int16_t g_thermal_row_ref_comp_adu = 0;
+static int32_t g_thermal_row_ref_last_comp_adu = 0;
+static bool g_thermal_row_ref_last_comp_valid = false;
 
-/* The stored TNC1 model remains diagnostic-only.  The current bounded
- * fallback uses board NTC only: this hardware's VTEMP has repeatable raw
- * jumps that must never enter the temperature anchor.  Relative NTC
- * compensation is baked into the next FFC anchor to avoid a sawtooth. */
+/* RR is the preferred state model.  Legacy/no-model calibrations retain the
+ * bounded NTC fallback; VTEMP remains diagnostic-only. */
 #define NTC_FALLBACK_K          (-0.20f)
 #define THERMAL_COMP_LIMIT_ADU  1500
+#define THERMAL_ROW_REF_SPAN_MAX_ADU   2048u
 #define FFC_RETRY_COOLDOWN_MS       15000u
 /* A candidate predicting more than 5 °C of output discontinuity is never
  * committed merely because earlier candidates were also rejected.  Keeping
@@ -735,6 +775,15 @@ static void thermal_ntc_model_boot_load(void)
     g_thermal_startup_model_ntc_threshold_adu = 0;
     g_thermal_startup_model_amplitude_adu = 0;
     g_thermal_startup_model_tau_ds = 0;
+    g_thermal_row_ref_model_valid = 0;
+    g_thermal_row_ref_model_active = 0;
+    g_thermal_row_ref_sample_valid = 0;
+    g_thermal_row_ref_model_reference_adu = 0;
+    g_thermal_row_ref_model_k_q8 = 0;
+    g_thermal_row_ref_model_limit_adu = 0;
+    g_thermal_row_ref_comp_adu = 0;
+    g_thermal_row_ref_last_comp_adu = 0;
+    g_thermal_row_ref_last_comp_valid = false;
 
     struct thermal_calibration_v1_ntc_model model;
     if (thermal_calibration_v1_ntc_model(&model)) {
@@ -761,6 +810,60 @@ static void thermal_ntc_model_boot_load(void)
                 (unsigned)g_thermal_startup_model_tau_ds);
     }
 
+    struct thermal_calibration_v1_row_ref_model row_ref;
+    if (thermal_calibration_v1_row_ref_model(&row_ref)) {
+        g_thermal_row_ref_model_reference_adu = row_ref.reference_adu;
+        g_thermal_row_ref_model_k_q8 = row_ref.k_q8;
+        g_thermal_row_ref_model_limit_adu = row_ref.limit_adu;
+        g_thermal_row_ref_model_valid = 1;
+        println("Row-reference model loaded: ref=%u k_q8=%d limit=%u",
+                (unsigned)g_thermal_row_ref_model_reference_adu,
+                (int)g_thermal_row_ref_model_k_q8,
+                (unsigned)g_thermal_row_ref_model_limit_adu);
+    }
+
+}
+
+static inline int32_t thermal_row_ref_comp_for_current(void)
+{
+    g_thermal_row_ref_sample_valid = 0;
+    if (!g_thermal_row_ref_model_valid) {
+        g_thermal_row_ref_model_active = 0;
+        g_thermal_row_ref_comp_adu = 0;
+        g_thermal_row_ref_last_comp_valid = false;
+        return 0;
+    }
+
+    const uint16_t mean_adu = g_thermal_row_ref_mean_adu;
+    const uint16_t span_adu = g_thermal_row_ref_span_adu;
+    if (mean_adu >= THERMAL_CALIBRATION_V1_ROW_REF_MIN_ADU
+        && mean_adu <= THERMAL_CALIBRATION_V1_ROW_REF_MAX_ADU
+        && span_adu > 0u && span_adu <= THERMAL_ROW_REF_SPAN_MAX_ADU) {
+        const int32_t delta =
+            (int32_t)mean_adu
+            - (int32_t)g_thermal_row_ref_model_reference_adu;
+        const int32_t scaled =
+            delta * (int32_t)g_thermal_row_ref_model_k_q8;
+        int32_t comp = scaled >= 0
+                           ? (scaled + 128) >> 8
+                           : -(((-scaled) + 128) >> 8);
+        const int32_t limit = g_thermal_row_ref_model_limit_adu;
+        if (comp > limit) comp = limit;
+        if (comp < -limit) comp = -limit;
+        g_thermal_row_ref_last_comp_adu = comp;
+        g_thermal_row_ref_last_comp_valid = true;
+        g_thermal_row_ref_sample_valid = 1;
+    }
+
+    if (!g_thermal_row_ref_last_comp_valid) {
+        g_thermal_row_ref_model_active = 0;
+        g_thermal_row_ref_comp_adu = 0;
+        return 0;
+    }
+    g_thermal_row_ref_model_active = 1;
+    g_thermal_row_ref_comp_adu =
+        (int16_t)g_thermal_row_ref_last_comp_adu;
+    return g_thermal_row_ref_last_comp_adu;
 }
 
 static inline int32_t thermal_startup_comp_for_now(void)
@@ -2601,6 +2704,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
             sum += calib[i];
         }
         g_calib_mean = (int32_t)(sum / px_cnt);
+        thermal_publish_shutter_mean(g_calib_mean);
         g_last_calib = calib;
     }
 
@@ -2714,10 +2818,17 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     float t_lo_c_f = 0.0f, t_hi_c_f = 0.0f;
     bool temp_map_ok = false;
     int32_t eff_anchor = ram_temp_anchor;
-    const int32_t startup_comp_i32 = thermal_startup_comp_for_now();
-    const int32_t ntc_comp_i32 = thermal_runtime_comp_for(cur_ntc);
+    int32_t startup_comp_i32 = 0;
+    int32_t normal_comp_i32 = 0;
+    if (g_thermal_row_ref_model_valid) {
+        g_thermal_startup_model_active = 0;
+        normal_comp_i32 = thermal_row_ref_comp_for_current();
+    } else {
+        startup_comp_i32 = thermal_startup_comp_for_now();
+        normal_comp_i32 = thermal_runtime_comp_for(cur_ntc);
+    }
     if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        eff_anchor += startup_comp_i32 + ntc_comp_i32;
+        eff_anchor += startup_comp_i32 + normal_comp_i32;
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
         const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
@@ -2874,7 +2985,7 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     const uint16_t warmup_comp =
         (uint16_t)clip_i16_i32(startup_comp_i32);
     const uint16_t normal_comp =
-        (uint16_t)clip_i16_i32(ntc_comp_i32);
+        (uint16_t)clip_i16_i32(normal_comp_i32);
     const uint16_t total_comp =
         (uint16_t)clip_i16_i32(eff_anchor - ram_temp_anchor);
     const uint32_t eff_anchor_u = (uint32_t)eff_anchor;
@@ -4076,6 +4187,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
                 int b = txbuf_pick_free();
                 if (b >= 0) {
                     tx_state[b] = TXBUF_FILLING;
+                    thermal_publish_row_reference_state(idx);
                     g_capture_last_frame_uniform_rows =
                         rawbuf_uniform_rows[idx];
                     g_capture_last_frame_uniform_max_run =
@@ -4785,11 +4897,18 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     const int32_t anchor_old = ram_temp_anchor;
     int32_t candidate_temp_anchor = ram_temp_anchor;
     /* eff_anchor_old is the anchor used immediately before this FFC. */
-    const int32_t startup_comp_at_ffc = thermal_startup_comp_for_now();
+    const bool row_ref_model_active = g_thermal_row_ref_model_valid;
+    const int32_t startup_comp_at_ffc =
+        row_ref_model_active ? 0 : thermal_startup_comp_for_now();
     const int32_t fallback_comp_at_ffc =
-        ntc_fallback_comp_between(ffc_last_ntc, cur_ntc_at_ffc);
+        row_ref_model_active
+            ? 0
+            : ntc_fallback_comp_between(ffc_last_ntc, cur_ntc_at_ffc);
+    const int32_t row_ref_comp_at_ffc =
+        row_ref_model_active ? thermal_row_ref_comp_for_current() : 0;
     int32_t eff_anchor_old = anchor_old;
-    eff_anchor_old += startup_comp_at_ffc + fallback_comp_at_ffc;
+    eff_anchor_old += startup_comp_at_ffc + fallback_comp_at_ffc
+                      + row_ref_comp_at_ffc;
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
         for (size_t i = 0; i < PX_CNT; i++) {
@@ -4812,7 +4931,8 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     /* Carry the percentile smoother across FFC by shifting with Δeff_anchor.
      * Using eff_anchor_old accounts for the NTC compensation already applied
      * to the renderer. */
-    int32_t eff_anchor_new = candidate_temp_anchor + startup_comp_at_ffc;
+    int32_t eff_anchor_new = candidate_temp_anchor + startup_comp_at_ffc
+                             + row_ref_comp_at_ffc;
 
     int16_t predicted_jump_x10 = 0;
     if (!ffc_done_first) {
@@ -4925,6 +5045,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     }
     calibg = ram_calibg;
     g_calib_mean = new_calib_mean;
+    thermal_publish_shutter_mean(g_calib_mean);
     g_last_calib = nullptr; /* triggers recompute on next frame */
     ram_temp_anchor = candidate_temp_anchor;
     ffc_restore_gain_cache(restore_gain_cache);

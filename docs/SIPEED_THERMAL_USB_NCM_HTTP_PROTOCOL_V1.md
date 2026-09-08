@@ -995,10 +995,10 @@ calibration.format=tn160-calibration-v1 的固件。
 | 40 | 4 | gain CRC32 |
 | 44 | 4 | bad point CRC32 |
 | 48 | 4 | 三段 payload 串联后的 CRC32 |
-| 52 | 2 | 可选模型 tag：基础 V1 为 0；旧 NTC 模型为 `0x4e54`（`TN`）；冷启动模型为 `0x4354`（`TC`） |
-| 54 | 2 | `TN`：`ntc_reference_adu`；`TC`：`cold_ntc_threshold_adu`；两者范围均为 `9..4087` |
-| 56 | 2 | little-endian int16；`TN`：`ntc_k_q8`，范围 `-8192..8192`；`TC`：`startup_amplitude_adu`，范围 `-600..600`；0 表示该机无需启动幅度修正 |
-| 58 | 2 | `TN`：`ntc_limit_adu`，范围 `1..1500`；`TC`：`startup_tau_ds`，0.1 秒单位，范围 `50..600`（5～60 秒） |
+| 52 | 2 | 可选模型 tag：基础 V1 为 0；旧 NTC 模型为 `0x4e54`（`TN`）；旧冷启动模型为 `0x4354`（`TC`）；行参考模型为 `0x5252`（`RR`） |
+| 54 | 2 | `TN`：`ntc_reference_adu`；`TC`：`cold_ntc_threshold_adu`，范围均为 `9..4087`；`RR`：`row_ref_reference_adu`，范围 `512..15872` |
+| 56 | 2 | little-endian int16；`TN`：`ntc_k_q8`，范围 `-8192..8192`；`TC`：`startup_amplitude_adu`，范围 `-600..600`；`RR`：正数 `row_ref_k_q8`，范围 `1..512` |
+| 58 | 2 | `TN`：`ntc_limit_adu`，范围 `1..1500`；`TC`：`startup_tau_ds`，0.1 秒单位，范围 `50..600`；`RR`：`row_ref_limit_adu`，范围 `1..1500` |
 | 60 | 4 | bytes 0..59 的 CRC32 |
 | 64 | 38400 | img_bg，160×120 个 little-endian uint16 |
 | 38464 | 76800 | gain，160×120 个 little-endian IEEE-754 float |
@@ -1006,18 +1006,20 @@ calibration.format=tn160-calibration-v1 的固件。
 
 模型扩展必须为全零，或按 tag 满足对应的全部字段约束；不接受半初始化参数。旧
 `TN` 参数继续支持写入和回读，但不参与运行，`thermal_ntc_model_active` 固定为
-`false`。`TC` 是当前正式的逐机冷启动模型：只有本次启动捕获的 `boot_ntc_adu`
-严格大于 `cold_ntc_threshold_adu` 时，运行时才给有效 anchor 加上
-`startup_amplitude_adu × exp(-elapsed_ms / (startup_tau_ds × 100))`；幅度是有符号
-anchor ADU，经过 `6τ` 后归零。该绝对时间项不会写入 FFC 基础 anchor，避免 FFC
-后重复补偿。`/api/v1/diagnostics` 的 `thermal_startup_model_valid/active` 及
-`thermal_startup_model_ntc_threshold_adu/amplitude_adu/tau_ds` 用于写后核对。
+`false`。`TC` 仅为旧包兼容保留。`RR` 是当前逐机状态模型：每个通过场景帧门禁的
+完整帧计算120行参考的均值与跨度；当均值位于 `512..15872` 且跨度位于
+`1..2048` 时，运行时计算
+`row_ref_comp = clamp((row_ref_mean-row_ref_reference)×row_ref_k_q8/256,
+±row_ref_limit)`，并使用 `effective_anchor=base_anchor+row_ref_comp`。异常行参考不
+产生新控制量；已经取得过有效样本时保持最后一个有效补偿，否则 fail-open 到基础
+anchor。
 
-基础 V1、旧 `TN` 和新 `TC` 均同时保留小幅板载 NTC fallback：相对上次有效 FFC
-计算 `-0.20×ΔNTC`，限幅 `±1500 ADU`，并在下一次 FFC 把累计相对修正写入新
-anchor。VTEMP 只保留为诊断字段，不参与逐帧补偿、模型门控或 FFC anchor。NTC
-无效时相对 fallback 为零；冷启动模型无效或未通过门控时其时间项为零，设备仍继续
-出图。
+`RR` 有效时不叠加旧 `TC` 时间项或 NTC fallback，也不在 FFC 后重置参考点；FFC
+连续性预测的旧、新 anchor 使用同一个当前行参考补偿。无 `RR` 的基础 V1、`TN`、
+`TC` 包保持原有兼容行为及 `-0.20×ΔNTC` fallback。VTEMP 只保留为诊断字段，不
+参与逐帧补偿、模型门控或 FFC anchor。`/api/v1/diagnostics` 通过
+`thermal_row_ref_model_valid/active`、`thermal_row_ref_sample_valid`、模型参数及
+`thermal_row_ref_comp_adu` 提供写后和运行状态核对。
 
 设备必须拒绝长度、magic、固定尺寸、header CRC、段 CRC 或 payload CRC 不正确的包；
 还必须拒绝非法扩展模型、超出传感器 ADU 范围、非有限/不合理 gain、越界或
