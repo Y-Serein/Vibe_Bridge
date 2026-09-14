@@ -1,5 +1,77 @@
 # 产品迭代日志
 
+## 2026-09-14 — 保留 NTC 均值并加入有界 FFC 全局漂移候选（待用户构建）
+
+- 目标/用户现象：固定目标下 V1-only 与 V1+NTC 均存在设备自身热漂移；最新日志显示 NTC 可抵消部分漂移，剩余误差与已接受 FFC 的全局 `dg` 累积相关。
+- 关键实现：保留 `K_Q8=290`；新增 `ffc_shutter_drift_adu`，仅累计已接受 FFC 的 `dg`，按 `256/256` 转成 anchor 补偿并限幅 ±600 ADU；FFC 连续性检查使用更新前后同一候选快照，拒绝/失败 FFC 不改变该项；不启用 B gain、不改变协议和 Flash。
+- 验证结果：Python 全量测试 65 项通过；`main.c` 与 `thermal_drift_model.c` 在 `THERMAL_DRIFT_RUNTIME_ENABLE=0/1` 两种路径下 ARM `-fsyntax-only` 通过；`git diff --check` 通过。
+- 当前状态：源码已修改，未运行 CMake 正式构建、未生成 UF2、未烧录、未上板。
+- 风险/未验证平台：该系数来自当前固定目标日志的离线残差回归，是第一版有界候选；若真机绝对温度或 FFC 跳变不满足预期，应回退到仅 V1+NTC，不继续盲调系数。
+
+## 2026-09-14 — 增加第二级 NTC / V1-only A/B 编译开关（待用户构建）
+
+- 目标/用户现象：在保持 `K_Q8=290` 不变、暂不启用 B 的前提下，比较当前 V1+NTC 与 V1-only，定位最新日志中的大幅温漂来源。
+- 关键实现：新增 CMake 选项 `THERMAL_DRIFT_RUNTIME_ENABLE`，默认 `ON`；关闭时运行时同时停用第二级 NTC 均值和第三级逐机 B，回退到 V1-only，不改变 Flash、USB/NCM、HTTP 或模型数据格式。
+- 验证结果：Python 全量测试 65 项通过；`thermal_drift_model.c` 在开关 `1/0` 两种预处理路径下均通过 ARM `-fsyntax-only`；`git diff --check` 通过。
+- 当前状态：源码已修改，未运行 CMake 正式构建、未生成 UF2、未烧录、未上板。
+- 风险/未验证平台：需要用户分别构建并记录 `ON`/`OFF` UF2 身份，在同一设备和目标下做 A/B；OFF 变体仅用于诊断，不是最终产品默认配置。
+
+## 2026-09-11 — 修复 B 模型回读归因并加入清除 B 回退操作（待用户构建/上板）
+
+- 目标/用户现象：B 写入日志可能显示 `model readback verification failed`，但设备仍保留有效旧 B；用户需要在 B 效果不佳时主动退回第二层均值保底。
+- 关键实现：模型 Flash 擦写完成后显式刷新 RP2350 XIP cache，并在同一非活动槽执行一次有界重写/回读重试；Scope 在 POST 或模型 GET 异常时先回读当前模型内容和 state，区分“新写入失败但旧 B 保留”和“B 失败、V1+均值保底”。新增 `POST /api/v1/calibration/v1/thermal-model/clear`，以 `flags=0x0002` 的 CRC/generation tombstone 停用逐机模型，不擦除基础 V1；Scope Context 新增“清除B补偿”，成功后确认 `valid=false, per_device=false, active=true, mean_active=true`。
+- 验证结果：ARM 5 个源文件 `-fsyntax-only` 通过；Scope 3 个源文件和状态机头 Qt/MinGW `-fsyntax-only` 通过；Python 全量测试 64 项通过；两仓库 `git diff --check` 和 plugin JSON 校验通过。
+- 当前状态：源码和 Scope 组件未提交、未生成新 UF2、未烧录；当前设备之前的 generation 3 B 模型仍有效，尚未用新固件验证 cache 修复或清除操作。
+- 风险/未验证平台：真实 Flash 写入/掉电回退、B 清除后的均值状态、Windows Release 组件加载、多平台 NCM、0°C/50°C/冷启动/热 RST 仍未验证；清除按钮只应在确认不需要当前 B 时使用。
+
+## 2026-09-11 — 基础 V1 后启用四台均值保底并统一 T160DM2 契约（待用户构建/上板）
+
+- 目标/用户确认：基础两点标定完成后必须有可用保底；逐机 B 流程是可选补偿层，不能阻断 V1 温准或在失败时擦除原有效标定。
+- 关键实现：基础 V1 写入、重启和全量回读后，固件以保存的 `base_ntc_adu` 驱动编译期四台均值 `K_Q8=290`；无有效逐机包时状态为 `active=1, mean_active=1, per_device=0`。逐机 `T160DM2` 仅保存 B 端相对均值的 anchor/gain 残差，绑定当前 V1 `calibration_id`；写入/回读失败保留 V1+均值，NTC/V1 参考无效退回纯 V1。协议文档、README 和只读验证器已同步到 T160DM2 字段与输出。
+- 验证结果：`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'` 通过（62 项）；ARM Release 参数下 5 个固件源 `-fsyntax-only` 通过；`python3 -m py_compile scripts/prepare_thermal_drift_model.py scripts/validate_thermal_protocol_v1.py` 通过；两仓库 `git diff --check` 通过。
+- 当前状态：源码、Scope 组件、脚本和文档未提交；未运行 CMake/Qt 正式构建、UF2、Scope Release、烧录或真机 HTTP/黑体验证。
+- 风险/未验证平台：四台均值目前是保底候选，不是量产 PASS；需先验证一台设备 V1 回读后的均值状态，再验证 B 成功/失败两条路径及 0°C、50°C、常温、冷启动、热 RST 和 NCM 兼容性。
+
+## 2026-09-10 — 接入逐机 L(N)/H(N) anchor+gain 正式候选（待用户构建/上板）
+
+- 目标/用户现象：时间+boot-relative NTC 与 RR 都只能把单条固定 50°C 轨迹拉准；V5 两热状态的 0→50°C 响应跨度约从 `1392` 变到 `1521 ADU`（约 `+9.25%`），证明只改 anchor 会破坏低温和常温温准。
+- 关键实现：`binary_calib_frame()` 仅在 64-byte `T160DM2` 包 CRC、Flash 记录 CRC 和当前 V1 `calibration_id` 全部匹配时，按绝对 NTC 同时应用均值保底、逐机 `anchor_comp_adu` 与 `gain_scale_q16`；无逐机包但 V1 基准 NTC 有效时仍运行均值层，NTC 无效时保持 V1-only，超出学习区间时钳位并上报。FFC 前后使用同一模型快照，动态项不写入基础 anchor。模型生成器先将低/高采样分别减去自身 FFC anchor 再计算跨度，并拒绝混合 V1 及相同 NTC 下超过 0.5°C 的持续升/降温路径差异；有效 NTC 区间限制在两个完整低/高配对状态之间，不能用更宽的高温单轨迹冒充 gain 覆盖。RR、TN、TC、启动时间和 VTEMP 只保留诊断。
+- 验证结果：Release 既有 ARM 参数下对 `main.c`、`thermal_calibration_v1.c`、`thermal_drift_model.c`、`thermal_ncm.c`、`thermal_ota.c` 执行 `-fsyntax-only` 通过；全量 Python 测试 64 项通过；温漂 Skill `quick_validate.py` 通过；`git diff --check` 通过。未运行 CMake 构建、未生成新 UF2、未烧录、未上板。
+- 当前状态：源码和离线门禁完成，未提交、未发布；等待用户手动构建后，用当前设备同一 V1 的两个 0°C 热状态和固定 50°C 轨迹生成逐机参数，再做独立 0°C/已知常温/50°C 验证。
+- 风险/未验证平台：当前 V1 尚无可信成对 L(N)/H(N) 参数，不能上传其他设备 V5 的模型。相同 NTC 的冷/热路径、瞬时 NTC 无效降级、模型 Flash 写入/断电恢复、冷启动/热 RST、Windows/Linux/Android/iOS NCM 均未真机验证；任何失败不得退回调时间常数或 RR。
+
+## 2026-09-10 — 接入当前 V1 的启动时间 + boot-relative NTC fallback（待用户构建/上板）
+
+- 目标/用户现象：V1-only 最新记录从约 62°C持续漂到约 41°C；RR 版固定 50°C约 49.5°C但手掌/环境仍约 14～21°C，不能继续作为默认控制。
+- 关键实现：关闭 RR 运行时控制；仅对当前 V1 指纹（`mean_diff≈1078.487`、anchor `4250..4300`）接入 `A·exp(-t/τ)+bias+K_NTC·(NTC-boot_NTC)`，参数为 `A=334 ADU、τ=12 s、bias=155 ADU、K_NTC=1.234`，总限幅 `±600 ADU`。FFC 前后使用同一补偿快照，避免重复累计；其他 V1 保持不补偿。
+- 验证结果：ARM `-fsyntax-only` 通过；全量 Python 测试 54 项通过；最新 9 月 9 日固定高温 CSV 离线回放 3～164 s 约 49～50°C；未构建、未烧录、未上板。
+- 当前状态：源码候选完成，等待用户手动构建和 50°C/0°C/手掌/环境实测；不能宣称已解决全量程温准。
+- 风险/未验证平台：参数由当前设备固定高温轨迹拟合，尚未证明跨设备或低温绝对准确；若低温仍错误，下一步必须联合拟合 anchor+gain，不继续调这组常数。
+
+## 2026-09-09 — 撤掉单条 50°C 轨迹 RR 运行时控制（待用户构建/上板）
+
+- 目标/用户现象：最新记录显示固定 50°C约 49.5°C，但换手掌/环境后仍约 14～21°C；确认上一版只是把单条 50°C训练轨迹拉准，不能作为全量程模型。
+- 关键实现：关闭 `THERMAL_ROW_REF_RUNTIME_ENABLE`，恢复 `A_eff=A_FFC`、`D_eff=D_V1`；继续保留 row-reference/RR 参数和采样字段用于诊断，正式 RR 参数不再参与当前测温输出。
+- 验证结果：ARM `-fsyntax-only` 通过；未构建、未生成 UF2、未烧录、未上板。
+- 当前状态：V1-only 回退候选，等待用户手动构建及真机确认；下一步使用低温+高温配对数据联合拟合动态 anchor 与 gain。
+- 风险/未验证平台：50°C上一版动态改善会消失；这是有意回退，避免继续输出高温准、低温错的假成功。联合模型尚未接入。
+
+## 2026-09-09 — 修正 RR 启动偏置并加入场景不变量门控（待用户构建/上板）
+
+- 目标/用户现象：上一版 `Δrow_ref` 从开机第一帧累计，9 月 9 日固定 50°C 数据在第一次 FFC 后已带入约 `+553 ADU`，显示约 40°C；需要保留约 1 分钟启动收敛窗口，不能再次把绝对温准搬偏。
+- 关键实现：前 60 秒严格使用 V1；仅对当前 V1 指纹（`mean_diff≈1078.487`、FFC anchor 4250～4300）绑定已有 `row_ref` 参考 `4987 ADU`、`K=1`、限幅 `±600 ADU`。运行时使用 `center_roi_adu-row_ref_mean_adu` 作为场景不变量：变化超过 32 ADU 时冻结，连续 8 帧变化不超过 6 ADU 后无跳变重绑；不修改 V1 `mean_diff`、FFC 候选 anchor、USB/NCM 或 Flash 布局。
+- 验证结果：ARM Release 参数下 `main.c`、`thermal_calibration_v1.c`、`thermal_drift_model.c`、`thermal_ncm.c`、`thermal_ota.c` 执行 `-fsyntax-only` 通过；全量 Python 测试 54 项通过；固定 50°C 日志离线回放 60～280 s 中位 `49.945°C`、P5～P95 `49.283～50.312°C`；v6 场景切换回放低温段中位 `-0.682°C`、环境段中位 `28.405°C`；`git diff --check` 通过。
+- 当前状态：源码已修改，未构建、未生成 UF2、未烧录、未上板；离线回放不能替代真实黑体验证。
+- 风险/未验证平台：当前 RR 参数只绑定 9 月 9 日这份 V1 指纹；其他无正式 RR 参数的设备保持 V1-only。低温和环境回放没有同步真值，只能证明未再次发生补偿饱和搬移，不能宣称已达到量产温准。需用户冷启动固定 50°C、0°C 和环境实测。
+
+## 2026-09-09 — V1 绝对温准 + 受场景门控的 row-reference 动态 anchor（待用户构建/上板）
+
+- 目标/用户现象：在不增加每台设备 4 分钟 `0°C→50°C→0°C` 额外采集的前提下，同时保留 V1 绝对温准并改善启动后动态温漂；此前 L(N)/H(N) 逐机模型尚无真机证据，且部分日志出现补偿失控。
+- 关键实现：默认 `binary_calib_frame()` 保持 V1 `ram_temp_anchor`/`ram_mean_diff` 不变，仅叠加运行时累计 `Δrow_ref`；固定 `K=256/256=1.0`、限幅 `±600 ADU`。`row_ref_span > 900 ADU` 或参考无效时冻结最后动态补偿，恢复后重新绑定 row-reference 基线；FFC 连续性两侧使用同一动态快照，但不将动态项写回持久 FFC anchor。未验证的 L(N)/H(N) 控制路径不再参与默认测温。
+- 验证结果：ARM Release 参数下对 `main.c`、`thermal_calibration_v1.c`、`thermal_drift_model.c`、`thermal_ncm.c`、`thermal_ota.c` 执行 `-fsyntax-only` 通过；相关 Python 契约/模型测试 51 项通过；`git diff --check` 通过。未运行固件构建、UF2、烧录或真机验证。
+- 当前状态：源码候选完成，等待用户手动构建和固定 50°C/0°C/场景切换验证；未提交、未发布。
+- 风险/未验证平台：row-reference 已被证明能稳定固定 50°C，但其原始值与场景辐射耦合；`900 ADU` 门限和冻结/重绑定策略尚未在多板、热机 RST、缓慢场景变化下验证。若 0°C 绝对温准被搬移或场景切换仍误补，应回退到 V1-only 并停止继续调 `K`/限幅。
+
 ## 2026-09-08 — 行参考驱动的逐机动态 anchor（50°C通过、跨温区失败）
 
 - 目标/用户现象：固定50°C黑体冷启动359.5秒内，设备在6秒约58.7°C、末段约40.5°C，6秒后峰峰值约19.2°C；继续调整固定上电时间模型无法表达当前真实热状态。

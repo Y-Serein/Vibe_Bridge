@@ -77,6 +77,45 @@
         "区分代码路径兼容与Type-C热环境实测",
         "给出一次代表板回归而非每板重复长测"
       ]
+    },
+    {
+      "id": 7,
+      "prompt": "B流程到底在解决什么？基础V1完成后才开始采集，启动前一分钟温漂可能已经过去了。请先不要改代码，说明B的物理含义、它不能解决什么，以及当前180秒门槛是否等于启动温漂验证。",
+      "expected_output": "明确区分较晚热状态的逐机anchor/gain残差与启动前一分钟时间瞬态；说明180秒只是NTC状态可观测性门槛，不是已证实的物理时间常数；不能把per_device=1当成启动温漂已解决。",
+      "files": [],
+      "expectations": [
+        "直接说明B补偿的是零点平移和0°C→50°C响应跨度残差",
+        "明确说明当前B时序错过启动首分钟，不能宣称解决启动温漂",
+        "解释180秒和NTC跨度条件的可辨识性用途",
+        "区分模型有效/写入成功与温漂效果通过",
+        "不给未经确认的时序或固件改动"
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Scope显示model readback verification failed，但我curl看到valid=1、active=1、mean_active=1、per_device=1。请判断发生了什么，并给出不会误伤V1+均值的修复方案。",
+      "expected_output": "指出错误可能发生在新事务回读而不是当前运行状态；先回读packet/manifest/state区分新B、旧B和均值保底；RP2350 FLASH_OP后刷新XIP cache并有界重试，Scope不能只显示笼统失败。",
+      "files": [],
+      "expectations": [
+        "不把一次错误字符串直接等同于当前无模型",
+        "检查V1 calibration_id与B calibration_id绑定",
+        "保留双槽旧有效记录作为回退",
+        "提出XIP cache flush和一次有界重写/回读",
+        "说明未上板前不能宣称修复完成"
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "B模型写进去后效果不好，我要一个清除B补偿选项，回到第二层模型。请设计接口和状态，不要擦掉基础V1。",
+      "expected_output": "使用既有tn160-thermal-ncm组件增加清除操作；通过更高generation的CRC tombstone停用B，成功状态为valid=0、per_device=0、active=1、mean_active=1；失败时旧B仍保留。",
+      "files": [],
+      "expectations": [
+        "不新增平行组件或计算按钮",
+        "清除操作不擦除V1和均值层",
+        "说明tombstone、generation、双槽和断电回退",
+        "清除后必须读取state确认第二层确实生效",
+        "区分协议/静态验证与真机Flash验证"
+      ]
     }
   ]
 }

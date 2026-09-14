@@ -275,6 +275,16 @@ thermal_ota_core0_flash_service(void)
         core0_flash_result = BOOTROM_ERROR_INVALID_ARG;
     }
 
+    /* FLASH_OP is the RP2350 low-level API and does not provide the
+     * flash_range_* wrapper's post-operation cache contract.  The model and
+     * calibration selectors are verified through XIP immediately after this
+     * rendezvous, so explicitly invalidate cached lines before publishing the
+     * result to Core1. */
+    if (core0_flash_result == BOOTROM_OK
+        && (kind == OTA_FLASH_ERASE || kind == OTA_FLASH_PROGRAM)) {
+        flash_flush_cache();
+    }
+
     watchdog_hw->scratch[3] = (uint32_t)core0_flash_result;
     ota_diag_set(OTA_DIAG_FLASH_DONE, offset);
     g_thermal_ota_core0_flash_state = OTA_CORE0_FLASH_DONE;
@@ -337,6 +347,25 @@ bool thermal_ota_calibration_flash_program(uint32_t relative_offset,
                                            const uint8_t* page)
 {
     return thermal_calibration_v1_active() && page
+           && relative_offset + FLASH_PAGE_SIZE <= FLASH_CALIBRATION_DATA_SIZE
+           && relative_offset % FLASH_PAGE_SIZE == 0u
+           && ota_flash_program(FLASH_TARGET_OFFSET + relative_offset, page);
+}
+
+bool thermal_ota_model_flash_erase(uint32_t relative_offset)
+{
+    return !ota.active && !ota.install_pending
+           && !thermal_calibration_v1_active()
+           && relative_offset < FLASH_CALIBRATION_DATA_SIZE
+           && relative_offset % FLASH_SECTOR_SIZE == 0u
+           && ota_flash_erase(FLASH_TARGET_OFFSET + relative_offset);
+}
+
+bool thermal_ota_model_flash_program(uint32_t relative_offset,
+                                     const uint8_t* page)
+{
+    return !ota.active && !ota.install_pending
+           && !thermal_calibration_v1_active() && page
            && relative_offset + FLASH_PAGE_SIZE <= FLASH_CALIBRATION_DATA_SIZE
            && relative_offset % FLASH_PAGE_SIZE == 0u
            && ota_flash_program(FLASH_TARGET_OFFSET + relative_offset, page);

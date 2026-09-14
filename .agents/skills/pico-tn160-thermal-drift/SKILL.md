@@ -1,15 +1,88 @@
 ---
 name: pico-tn160-thermal-drift
-description: Diagnose and close pico_tn160/TN160/PT160 thermal drift, startup path dependence, cross-board transfer, and absolute-temperature errors using blackbody/ice-point paired PNG+CSV, FFC/NUC events, raw ADU, anchor, mean_diff, NTC, VTEMP, OFF/TABLE/STATE/adaptive models, and Type-C UVC versus UART/MaixCam2 paths. Use whenever the user mentions cold/hot start, RST, temperature drift, 50°C high/low, ice-point error, FFC spikes, NTC jumping, STATE/PWL saturation, MaixCam2 trend logs, K_cold/K_shutter, changing boards, or asks for a firmware test. Always apply the evidence-and-test-value gate before changing thermal compensation or FFC parameters.
+description: Diagnose and close pico_tn160/TN160/PT160 thermal drift, startup path dependence, cross-board transfer, and absolute-temperature errors using blackbody/ice-point paired PNG+CSV, FFC/NUC events, raw ADU, anchor, mean_diff, NTC, VTEMP, OFF/TABLE/STATE/adaptive models, and Type-C UVC versus UART/MaixCam2 paths. Use this skill whenever the user mentions cold/hot start, RST, temperature drift, 50°C high/low, B compensation, T160DM2, clearing a thermal model, model readback/Flash/XIP errors, ice-point error, FFC spikes, NTC jumping, STATE/PWL saturation, MaixCam2 trend logs, K_cold/K_shutter, changing boards, Scope TN160 production calibration, or asks for a firmware test. Always apply the evidence-and-test-value gate before changing thermal compensation or FFC parameters, and preserve a verified V1 plus rollback fallback.
 ---
 
 # pico_tn160 thermal drift
 
 Drive the thermal path toward stability, accuracy, and cross-board transfer without regressing UVC, FFC, calibration storage, or MaixCam2. Hardware feedback is primary evidence. User hardware time is expensive: do not ask for a firmware test unless the candidate has a numerical prediction and a result that can falsify it.
 
-## Current project override — 2026-09-07 architecture reset
+## Current product override — 2026-09-14 three-layer candidate and rollback contract
 
-This section supersedes the older startup-time and generic relative-NTC guidance below. Use `HANDOFF.md` for the exact live files and measurements.
+This section supersedes every older “current override” below if there is any
+conflict. The old entries remain as failure evidence only. Read `HANDOFF.md`
+and `C_context/MEMORY.md` for live source/data identity before making a change.
+
+### Product goal and non-negotiable control semantics
+
+- The goal is **both** absolute 0–50°C accuracy and dynamic stability. A fixed
+  50°C curve, training replay, valid CRC, successful build or active flag is not
+  a product pass by itself.
+- The current controller is explicitly three layers:
+
+  ```text
+  V1 baseline → four-board mean NTC anchor → optional per-device B residual
+  ```
+
+- The four-board mean is the safety fallback, compiled as `K_Q8=290`
+  (`1.1328125 ADU/NTC`) and clamped to ±600 ADU. After V1 write, reboot and
+  full readback, valid `base_ntc_adu` enables `mean_active=1` even without B.
+- The 64-byte `T160DM2` record is bound to the exact V1 `calibration_id` and
+  adds one B endpoint for anchor and one for 0–50°C response gain. It corrects
+  a later thermal-state residual; it is **not** a proven first-minute startup
+  time model. Do not describe it as solving startup drift without an on/off
+  cold-start measurement.
+- Missing, invalid, V1-mismatched or NTC-unavailable B leaves `V1+mean` when
+  the V1 base NTC is valid; invalid V1/base NTC falls back to pure V1. Outside
+  the B interval clamp to the nearest endpoint and report the clamp.
+- FFC continuity uses one model snapshot on both sides; no dynamic correction
+  is persisted into the FFC base anchor.
+
+### Per-device record, clear tombstone and production inputs
+
+- `T160DM2` fields are `calibration_id`, `base_ntc_adu`, `learned_ntc_adu`, one
+  `anchor_residual_adu`, one `gain_residual_q16`, mean contract, limits and CRC.
+  Do not restore the retired five-free-node format.
+- Low/high samples crossing FFC must be aligned before gain fitting:
+
+  ```text
+  D(N) = [H(N) - A_FFC_high(N)] - [L(N) - A_FFC_low(N)]
+  ```
+
+  Raw cross-FFC `H-L` is not gain. A single 50°C trace can observe only `H(N)`
+  and cannot create a complete B gain model.
+- B write uses two rotating Flash sectors. After RP2350 `FLASH_OP`, explicitly
+  flush XIP cache, verify record CRC/generation/full bytes, and retry the same
+  inactive slot at most once. Never erase the active fallback first.
+- Clearing B uses `POST /api/v1/calibration/v1/thermal-model/clear` with
+  `clear-v2` and a higher-generation `flags=0x0002` tombstone. Success must
+  read back `valid=0, per_device=0, active=1, mean_active=1`; V1 is untouched.
+- If a B POST or GET fails, read packet/manifest/state before deciding whether
+  the new write failed, an old B remains active, or only V1+mean is running.
+
+### Evidence gate, validation and stop condition
+
+- Before changing the controller, classify the error: absolute error, continuous
+  drift, persistent FFC change, transient FFC, startup-window miss,
+  target movement, or state/clamp miss. Unknown room/hand scenes are not
+  absolute-temperature evidence.
+- Reject mixed V1 `mean_diff` identities. If warming and cooling at the same
+  NTC differ by more than the 50°C equivalent of 0.5°C at three common codes,
+  stop the one-state model and request a second physical observable.
+- Minimal qualification: fixed 50°C cold start for 180 s, fixed 0°C for 30 s,
+  known normal-temperature target, and B on/off comparison. Require final 8 s
+  endpoint error <=1°C, 50°C start-to-end <=0.5°C, P5–P95 <=1.5°C and no
+  unexplained sustained clamp.
+- The user owns firmware builds, UF2 creation, flashing and hardware tests.
+  Do not run them without precise current-turn authorization. Preserve Scope
+  UI, USB/NCM, Flash layout, GPIO/PIO/DMA and FFC contracts unless separately
+  approved.
+
+## Historical 2026-09-07 architecture reset (superseded where conflicting)
+
+This is retained failure evidence. Where it conflicts with the 2026-09-09
+L(N)/H(N) controller, follow the newer section. Use `HANDOFF.md` for live
+files and measurements.
 
 - Retire the current `TC(0x4354)` control law `A*exp(-uptime/tau)` and its one-shot `boot_ntc > threshold` gate. Real data showed `startup_model_valid=1` but `active=0` for the entire run because training boot NTC was about 2027, the generated gate was 1963, and test boot NTC was 1861. Do not repair this by changing the gate, amplitude, or tau.
 - The product assumption approved for the next candidate is per-device `error=f(current_ntc)`: compensation is evaluated every frame from the current NTC and is independent of cold start, warm start, RST, and uptime. Keep that assumption explicitly falsifiable; do not silently add startup classification.
@@ -24,10 +97,11 @@ This section supersedes the older startup-time and generic relative-NTC guidance
 - Qualify with one device held out from its own fit: fixed 50C learning, then cold power-on and hot RST. Pass only if >=6 s P-P <=1.5C, endpoint change <=0.5C, and steady 50C error <=1C. If any gate fails, stop the single-NTC linear model instead of tuning constants; require a second measured state that can distinguish the residual.
 - Before editing, provide a state table covering optional-learning skip/failure, button enablement, package fields, interval/clamp behavior, FFC interaction, diagnostics, write/readback, and rollback. User-visible behavior and any protocol change require explicit confirmation.
 
-## Current project override — 2026-08-06 session close
+## Historical 2026-08-06 session close (superseded where conflicting)
 
-This override takes precedence over the historical four-state V2 guidance below. Read
-`HANDOFF.md` and `C_context/MEMORY.md` first; they record the live artifact identity.
+This remains evidence for the V2 and old relative-NTC failures. Read
+`HANDOFF.md` and `C_context/MEMORY.md` first; the 2026-09-09 controller takes
+precedence where the historical wording differs.
 
 - The four-temperature Flash V2 map route is retired: its CRC-valid activation
   broke real-device imaging, and V1 calibration did not repair it. Do not

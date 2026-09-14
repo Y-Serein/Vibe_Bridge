@@ -45,12 +45,16 @@ REQUIRED_FIELDS = (
     "thermal_row_ref_model_k_q8",
     "thermal_row_ref_model_limit_adu",
     "thermal_row_ref_comp_adu",
+    "thermal_drift_model_active",
+    "thermal_drift_model_ntc_clamped",
+    "thermal_drift_model_gain_scale_q16",
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--label", choices=("cold", "hot_rst"), default="cold")
+    parser.add_argument("--label", default="cold",
+                        help="output label, e.g. high_trace, state_a_low, state_b_low")
     parser.add_argument("--duration", type=int, default=360)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     return parser.parse_args()
@@ -104,6 +108,12 @@ def make_row(diagnostics, elapsed_seconds):
             diagnostics["thermal_row_ref_model_limit_adu"],
         "thermal_row_ref_comp_adu":
             diagnostics["thermal_row_ref_comp_adu"],
+        "thermal_drift_model_active":
+            diagnostics["thermal_drift_model_active"],
+        "thermal_drift_model_ntc_clamped":
+            diagnostics["thermal_drift_model_ntc_clamped"],
+        "thermal_drift_model_gain_scale_q16":
+            diagnostics["thermal_drift_model_gain_scale_q16"],
     }
 
 

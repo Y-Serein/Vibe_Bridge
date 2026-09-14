@@ -1,69 +1,80 @@
 # HANDOFF.md
 
-最后更新：2026-08-21 11:38 CST
-当前分支：`test-2026-06-09`
-当前任务：将产品基线切换为 USB NCM/HTTP-only；构建完成，等待真实设备与 USB 标定写入协议闭环。
+最后更新：2026-09-14 09:20 CST
+当前分支：`test-2026-06-09`；HEAD `1093d1e`；固件和 Scope 工作树均有大量未提交改动，禁止 reset/restore/clean。
+当前任务：保留 TN160 三级温漂模型，完成 B 模型 Flash 回读修复和“清除B补偿”回退到第二层；源码/静态验证完成，等待用户手动构建、烧录和真机闭环。
 
 ## 当前在做什么
 
-- 目标：产品只保留 CDC-NCM + HTTP。预览、原始 ADC16 产测、网络设置和 OTA 均走 USB；不再使用 UART、USB CDC 或 UVC 作为产品入口。
-- 状态：当前源码采用 `origin/feature/unified-thermal-protocol-v1` 的 NCM 基线（远端提交 `c8c1779`），当前分支此前可回退 checkpoint 为 `6c1c418`。
-- 误差：源码和构建证明 NCM-only 配置成立，但本次 UF2 尚未重新上板验证 Windows、Linux、Android/iOS 枚举、DHCP、HTTP、OTA 或反复拔插；不能把远端分支的历史实测直接写成本次实测。
-- 控制动作：启用 `CFG_TUD_NCM=1`、关闭 Video/CDC，默认 `dataomode=DOM_NCM`；引入 NCM 描述符、HTTP v1、DHCP/DNS、网页、ADC16/temp8 帧与 OTA；Flash 改为 2 MiB、活动镜像/OTA 镜像各 768 KiB。
-- 反馈：标准 `build.sh` 生成 `pico_tn160.elf.uf2`，SHA-256 为 `dade5cd83465ff17fbe4ac7a037a22fe3517bd7ff804bc246a9c4366208783d7`，代码段 284316 B，低于 768 KiB 槽限制。
-- 修正：本地 Pico SDK 的 `lib/lwip` 为空，`build.sh` 现要求完整 lwIP，或由 `PICO_LWIP_PATH` 显式提供；缺失时退出 2，不自动联网下载。SDK 挂载盘把 TinyUSB 源文件标为可执行时，CMake 现在只在 build-local overlay 中恢复普通源文件权限，再应用 NCM 补丁。
+- 当前控制结构：`基础 V1 → 四台均值保底 → 可选逐机 B 残差`。均值固定 `K_Q8=290`（`1.1328125 ADU/NTC`）；NTC/V1 参考无效时退回纯 V1。
+- B 只修正较晚热状态相对 V1+均值的全局 anchor 残差和 0°C→50°C 全局响应跨度残差；它不是启动前一分钟的时间模型。当前 B 流程在 V1 写后才采集，是否解决启动首分钟温漂仍未证明。
+- 用户最新旧固件真机状态：V1 `generation=5`，B `generation=3`，共同 `calibration_id=558161692`；B 状态 `valid=1, active=1, mean_active=1, per_device=1`，`base_ntc=1934`、`learned_ntc=1669`、总 anchor `-399 ADU`、gain delta `3663 Q16`。
+- 最新源码修复 RP2350 模型 Flash 写后立即 XIP 回读窗口：擦写后显式 `flash_flush_cache()`，校验失败时只对同一非活动槽再写一次。旧有效槽在新记录验证前保持可用。
+- Scope 遇到 B POST/GET 异常时先回读模型内容和 `/thermal-model/state`，区分“新包其实已写入”“旧 B 仍运行”“仅 V1+均值运行”，不再把一次事务错误直接等同于当前无模型。
+- 新增 `POST /api/v1/calibration/v1/thermal-model/clear` 和 Scope Context“清除B补偿”。固件提交更高 generation、`flags=0x0002` 的 CRC tombstone；成功后必须为 `valid=0, active=1, mean_active=1, per_device=0`，不擦除 V1。
+- 正确训练数据根目录是 `/home/slam/Sipeed/docs/pcio_tn160/logs`；此前使用仓库 `docs/logs` 的结论已撤回。四台均值来自 v1/v2/v4/v5，异常 v3 排除。
 
 ## 已经试过的方案和结果（含失败的）
 
-1. 将 `origin/feature/unified-thermal-protocol-v1` 解压到 `/tmp` 后构建：初次失败，原因是本地 SDK 的 `lib/lwip` 空目录，缺少 `lwip/err.h`；不是 NCM 源码编译错误。
-2. 使用 Pico SDK 2.2.0 固定的 lwIP 提交 `77dcd25a72509eb83f72b033d219b1d40cd8eb95` 作为临时构建依赖：隔离和标准 `build.sh` 构建都成功。
-3. 检查 USB 配置：`CFG_TUD_VIDEO=0`、`CFG_TUD_CDC=0`、`CFG_TUD_NCM=1`；USB PID 为 `0x4203`，描述符为 CDC-NCM，默认 Core1 数据输出为 `DOM_NCM`。
-4. 检查旧主机串口路径：源码仍有历史 UART/UVC 测试和兼容函数，但 NCM 正式入口没有初始化或轮询主机 UART，TinyUSB 也不暴露 CDC/UVC class。
-5. 检查标定接口：`GET /frame.adc16` 已可通过 USB 读取校正前 ADC；当前分支没有“通过 HTTP 写入新的双点标定数据到 Flash”的 endpoint。协议文档中的 calibration manifest/data 是只读契约，不能误报为标定写入已完成。
+1. 时间 `TC=A×exp(-t/τ)`、boot-relative NTC、VTEMP、TABLE、旧相对 NTC：均有真机失败证据，禁止继续微调或恢复。
+2. RR 行参考能把固定 50°C 拉稳，但与场景 ADU 约 0.997 相关；换手掌/环境和 0°C 后严重错误，已退出默认控制。
+3. 五个自由 NTC/Anchor/Gain 节点被用户否定并撤销；当前 `T160DM2` 只有均值层和一个 B 残差端点。
+4. 当前 B 模型在旧固件写入时曾报 `model readback verification failed`，但 curl 证明 generation 3 旧/当前有效模型仍运行；错误根因候选是底层 `FLASH_OP` 后未明确刷新 XIP cache，最新源码已修但未上板。
+5. 当前五步 Scope 流程为 `0°C → 50°C（自动计算/写V1）→ 保持50°C → 回0°C → 写B`。它能辨识较晚热状态的 anchor/gain 残差，但错过启动首分钟；保留现状，不宣称已解决启动温漂。
 
 ## 下一步计划（3-5条actionable)
 
-1. 在可回退测试板上烧录当前 UF2，确认 Windows、Linux、Android/iOS 都枚举为 NCM，并通过 DHCP 访问 `http://192.168.17.1/`。
-2. 在已连接设备上运行 `python3 scripts/validate_thermal_protocol_v1.py http://192.168.17.1`，核对 `/api/v1/device`、`/frame.temp8` 和 `/frame.adc16` 的 metadata/长度/CRC。
-3. 在非生产板验证网络段设置、OTA 上传、校准区域 CRC 保持和多次拔插恢复；OTA/Flash 布局为高风险，未验证前不得用于量产烧录。
-4. 冻结 USB 标定写入协议（输入形式、双点温度、身份/防误写、CRC、掉电事务、回读验证）后，再实现 HTTP 标定写入；不要恢复旧串口命令作为替代。
-5. NCM 多平台实测全部通过后，再决定是否删除遗留的 UART/UVC 测试代码；当前不为清理而重构。
+1. 用户手动构建固件和 Scope；确认构建/启动/UI 正常。仅出现 `module "YSereinSwarm" is not installed` 的构建期警告且程序正常时可忽略；若启动实际失败则必须处理。
+2. 烧录新 UF2 后连接当前设备，先读 V1 manifest、B manifest/state，确认 `calibration_id` 和模型身份；不要立即重做采集。
+3. 使用已保存本轮 B 包重写一次；预期不再出现 `model readback verification failed`。若仍失败，保留完整 Scope 日志和写前/写后 manifest/state，不重复盲写。
+4. 点击“清除B补偿”，确认 `valid=0, active=1, mean_active=1, per_device=0`；断电重启后再次确认 tombstone 持久生效且 V1 ID 未变。
+5. 在同一设备、同一目标、同一启动条件下比较 B 开启/清除后的 0°C、50°C、已知常温和冷启动前 60 秒；据数据决定保留 B，或重新设计“连接即记录”的启动可观测流程。
 
 ## 关键文件路径（相对路径，一行一个）
 
 ```text
-CMakeLists.txt
-build.sh
-pico_flash_region_custom.ld
+AGENTS.md
+HANDOFF.md
+C_context/MEMORY.md
+.agents/skills/pico-tn160-thermal-drift/SKILL.md
 src/main.c
-src/sdk.h
-src/tusb_config.h
-src/usb_descriptors.c
+src/thermal_calibration_v1.c
+src/thermal_calibration_v1.h
+src/thermal_drift_model.c
+src/thermal_drift_model.h
 src/thermal_ncm.c
-src/thermal_ncm.h
 src/thermal_ota.c
 src/thermal_ota.h
-src/lwipopts.h
-src/web/index.html
-cmake/tinyusb-0.18-ncm-ios26.patch
+scripts/prepare_thermal_drift_model.py
 scripts/validate_thermal_protocol_v1.py
+tests/test_tn160_thermal_drift_model.py
+tests/test_tn160_protocol_metadata.py
 docs/SIPEED_THERMAL_USB_NCM_HTTP_PROTOCOL_V1.md
+docs/design/tn160_thermal_drift_model_v1.md
 docs/PRODUCT_ITERATION_LOG.md
-README.md
+../../Project/yserein-scope/src/plugins/tn160_ncm/ProductionCalibrationPage.cpp
+../../Project/yserein-scope/src/plugins/tn160_ncm/ProductionCalibrationPage.h
+../../Project/yserein-scope/src/plugins/tn160_ncm/Tn160NcmTransport.cpp
+../../Project/yserein-scope/src/plugins/tn160_ncm/Tn160NcmTransport.h
+../../Project/yserein-scope/src/plugins/tn160_ncm/Tn160ProductionWorkflow.h
+../../Project/yserein-scope/src/plugins/tn160_ncm/Tn160Plugin.cpp
+../../Project/yserein-scope/src/plugins/tn160_ncm/plugin.json
 ```
 
 ## 当前验证状态
 
-- 已运行：隔离 CMake 构建，`PICO_LWIP_PATH` 指向 lwIP `77dcd25...`；结果通过。
-- 已运行：`PICO_LWIP_PATH=/tmp/pico_tn160_lwip_2_2_1 bash /home/slam/Sipeed/pico_tn160/build.sh`；结果通过，生成 ELF 与 UF2。
-- 已运行：`python3 -m py_compile scripts/validate_thermal_protocol_v1.py` 和 `--help`；结果通过。
-- 已运行：不设 `PICO_LWIP_PATH` 的 `build.sh`；结果按预期以退出码 2 报告缺少 lwIP，不产生新构建。
-- 未上板验证：当前 UF2 未连接真实 TN160；未实测 NCM 枚举、HTTP 流、OTA、Flash 迁移、网络设置或任何主机平台。
+- 已运行 pico_tn160 ARM Release 参数下 `main.c`、`thermal_calibration_v1.c`、`thermal_drift_model.c`、`thermal_ncm.c`、`thermal_ota.c` 的 `-fsyntax-only`；5/5 通过。
+- 已运行 `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'`；64 项通过。
+- 已运行 Scope `ProductionCalibrationPage.cpp`、`Tn160NcmTransport.cpp`、`Tn160Plugin.cpp` 的 Windows Qt 6.11.1/MinGW 13.1.0 `-fsyntax-only -Wall -Wextra -Wpedantic`；通过。单独检查状态机头仅有 `#pragma once in main file`，可忽略。
+- 已运行两仓库 `git diff --check`、Scope plugin JSON 校验；通过。
+- 未运行最新源码的正式 CMake 构建、UF2 生成、Scope Release、烧录、真实 B 重写、B 清除、掉电恢复和多平台 NCM 回归；现有 build/UF2 是旧产物。
+- 用户手动构建：`cd /home/slam/dev/pico_tn160 && source ../env.sh && cmake --build --preset pico2-release --parallel "$(nproc)"`。
+- 用户手动 Scope 构建：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Serein_Y\Project\yserein-scope\tools\windows_user_action.ps1"`。
 
 ## 还没搞清楚的问题
 
-1. 当前硬件上实际 Flash 容量是否全部为 2 MiB，以及已有校准数据在新布局下是否保持可读，必须在可回退板验证。
-2. NCM 远端分支虽称已完成多平台测试，但相关具体设备、操作系统版本和回归记录尚未在本 session 重放；本次仅完成构建验证。
-3. USB 标定写入的公开协议尚未定义：不能在没有身份、CRC、掉电恢复和回读语义的情况下直接开放 Flash 写入。
-4. 临时 lwIP 路径只用于本 session 构建；正式开发环境应初始化 Pico SDK 的 lwIP submodule 或设置持久的 `PICO_LWIP_PATH`。
-5. 当前 OTA 仅校验长度、CRC 和 RP2350 向量范围，`/api/v1/device` 明确声明 `rollback:false`；尚未实现签名、型号/硬件匹配或掉电回滚，不能用于量产升级。
+1. XIP cache flush + 单次重写是否彻底消除当前板的模型回读错误，尚无新固件真机证据。
+2. 当前有效 generation 3 B 是报错事务实际写成的新包，还是报错前已有包；缺少该次写前 generation/包哈希，无法追溯。
+3. B 对较晚热状态的 anchor/gain 是否有可感知收益，以及是否损害 0°C/常温，尚未做同条件 B on/off 对照。
+4. 主要温漂若集中在启动前一分钟，当前 V1 写后 B 采集时序是否值得保留为量产步骤仍未决；连接即记录只能先辨识固定场景的组合漂移，不能凭单条轨迹独立得到完整 gain。
+5. `docs/` 被 ignore，设计文档虽存在但普通 `git add -A` 不会纳入；未来提交必须显式处理。Scope 工作树还包含大量用户修改和已删除 tests，禁止顺手恢复或提交。

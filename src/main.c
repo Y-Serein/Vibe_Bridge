@@ -39,6 +39,7 @@
 
 #include "thermal_ncm.h"
 #include "thermal_calibration_v1.h"
+#include "thermal_drift_model.h"
 #include "thermal_ota.h"
 #include "usb_descriptors.h"
 
@@ -607,6 +608,11 @@ static const uint16_t* g_last_calib = nullptr;
 /* Reject only an implausible shutter-frame mean jump.  VTEMP is diagnostic
  * only and cannot block periodic FFC or change the temperature anchor. */
 #define FFC_REJECT_DG_ADU       2500
+/* Fixed-target 2026-09-14 replay showed the residual left after the absolute
+ * NTC mean layer tracks accepted FFC dg at approximately 1 ADU/ADU. Keep the
+ * first candidate inspectable and bounded; B/gain remains out of this path. */
+#define FFC_SHUTTER_DRIFT_K_Q8       256
+#define FFC_SHUTTER_DRIFT_LIMIT_ADU  600
 
 /* These are populated once from the selected V1 calibration record.  Keep
  * them public for the NCM diagnostics endpoint, while all runtime writes
@@ -627,15 +633,33 @@ volatile uint16_t g_thermal_row_ref_model_reference_adu = 0;
 volatile int16_t g_thermal_row_ref_model_k_q8 = 0;
 volatile uint16_t g_thermal_row_ref_model_limit_adu = 0;
 volatile int16_t g_thermal_row_ref_comp_adu = 0;
-static int32_t g_thermal_row_ref_last_comp_adu = 0;
-static bool g_thermal_row_ref_last_comp_valid = false;
 
-/* RR is the preferred state model.  Legacy/no-model calibrations retain the
- * bounded NTC fallback; VTEMP remains diagnostic-only. */
-#define NTC_FALLBACK_K          (-0.20f)
-#define THERMAL_COMP_LIMIT_ADU  1500
-#define THERMAL_ROW_REF_SPAN_MAX_ADU   2048u
+/* Legacy NTC, startup and RR metadata remain observable for compatibility.
+ * Only a CRC-valid per-device model bound to the active V1 calibration may
+ * adjust the runtime anchor and response span. */
 #define FFC_RETRY_COOLDOWN_MS       15000u
+#define THERMAL_ROW_REF_ENABLE_MS             60000u
+#define THERMAL_ROW_REF_SCENE_MATCH_ADU       24
+#define THERMAL_ROW_REF_SCENE_CHANGE_ADU      32
+#define THERMAL_ROW_REF_STABLE_DELTA_ADU       6
+#define THERMAL_ROW_REF_STABLE_FRAMES          8u
+#define THERMAL_ROW_REF_COMP_FILTER_SHIFT      2
+#define THERMAL_ROW_REF_SCENE_EMA_SHIFT         6
+#define THERMAL_ROW_REF_COMP_LIMIT_ADU        600
+/* 2026-09-09 V1 fingerprint.  This binds the already-captured reference to
+ * exactly the current test calibration; other V1 records without an RR
+ * extension remain V1-only. */
+#define THERMAL_ROW_REF_CURRENT_MEAN_DIFF 1078.487f
+#define THERMAL_ROW_REF_CURRENT_ANCHOR_MIN     4250
+#define THERMAL_ROW_REF_CURRENT_ANCHOR_MAX     4300
+#define THERMAL_ROW_REF_CURRENT_REFERENCE_ADU  4987u
+#define THERMAL_ROW_REF_CURRENT_K_Q8            256
+#define THERMAL_ROW_REF_CURRENT_LIMIT_ADU       600u
+/* The single-high-trace RR candidate is intentionally disabled for the
+ * current firmware.  Keep its diagnostics and implementation available for
+ * the later joint low/high anchor+gain model, but V1 owns runtime temperature
+ * until that model has real low/high evidence. */
+#define THERMAL_ROW_REF_RUNTIME_ENABLE           0
 /* A candidate predicting more than 5 °C of output discontinuity is never
  * committed merely because earlier candidates were also rejected.  Keeping
  * the last valid FFC is safer than turning repeated bad evidence into trust. */
@@ -654,9 +678,10 @@ static uint32_t ffc_last_ms = 0;
 static uint32_t ffc_retry_after_ms = 0;
 static uint16_t ffc_last_fpa_vtemp = 0;
 static uint16_t ffc_last_ntc = 0;            /* NTC ADC at last FFC */
-static bool ffc_ntc_reference_pending = false;
 static uint16_t boot_ntc = 0;                /* valid NTC ADC captured at power-on */
+static uint32_t boot_ntc_ms = 0;              /* timestamp of first valid NTC */
 static int32_t  ffc_last_g_calib_mean = 0;  /* g_calib_mean at last FFC */
+static int32_t  ffc_shutter_drift_adu = 0;   /* accepted FFC dg accumulator */
 volatile uint16_t ffc_count = 0;             /* number of FFCs run since boot */
 static uint8_t  ffc_consec_reject = 0;        /* consecutive sanity-rejects */
 static bool     ffc_done_first = false;
@@ -735,7 +760,7 @@ static volatile uint32_t g_vtemp_smooth_x256 = 0;
 
 /* NTC sampling. ADC2 = GPIO28 on the current board.  The EMA-smoothed sample
  * is exposed in the diagnostic tail and supplies the startup cold/hot gate. */
-static volatile uint16_t g_cur_ntc_adc = 0;
+volatile uint16_t g_cur_ntc_adc = 0;
 static volatile uint32_t g_ntc_smooth_x256 = 0;
 static volatile uint16_t g_adc_temp_adc = 0;
 static volatile uint16_t g_adc_temp_cs_low16 = 0;
@@ -782,8 +807,6 @@ static void thermal_ntc_model_boot_load(void)
     g_thermal_row_ref_model_k_q8 = 0;
     g_thermal_row_ref_model_limit_adu = 0;
     g_thermal_row_ref_comp_adu = 0;
-    g_thermal_row_ref_last_comp_adu = 0;
-    g_thermal_row_ref_last_comp_valid = false;
 
     struct thermal_calibration_v1_ntc_model model;
     if (thermal_calibration_v1_ntc_model(&model)) {
@@ -816,7 +839,7 @@ static void thermal_ntc_model_boot_load(void)
         g_thermal_row_ref_model_k_q8 = row_ref.k_q8;
         g_thermal_row_ref_model_limit_adu = row_ref.limit_adu;
         g_thermal_row_ref_model_valid = 1;
-        println("Row-reference model loaded: ref=%u k_q8=%d limit=%u",
+        println("Row-reference model stored (inactive): ref=%u k_q8=%d limit=%u",
                 (unsigned)g_thermal_row_ref_model_reference_adu,
                 (int)g_thermal_row_ref_model_k_q8,
                 (unsigned)g_thermal_row_ref_model_limit_adu);
@@ -824,96 +847,198 @@ static void thermal_ntc_model_boot_load(void)
 
 }
 
-static inline int32_t thermal_row_ref_comp_for_current(void)
+/* TC and the global NTC curve remain retired.  RR is now an explicitly
+ * scene-gated residual controller; it never changes V1 mean_diff. */
+static int32_t thermal_row_ref_comp_adu = 0;
+#if THERMAL_ROW_REF_RUNTIME_ENABLE
+static int32_t thermal_row_ref_scene_bias_adu = 0;
+static int32_t thermal_row_ref_scene_ema_x64 = 0;
+static int32_t thermal_row_ref_previous_scene_adu = 0;
+static uint8_t thermal_row_ref_stable_frames = 0;
+static bool thermal_row_ref_initialized = false;
+static bool thermal_row_ref_rebinding = false;
+static bool thermal_row_ref_current_candidate_checked = false;
+static inline int32_t i32_abs(int32_t v);
+
+static inline int32_t thermal_round_shift(int32_t value, unsigned shift)
 {
+    const int32_t round = 1 << (shift - 1u);
+    return value >= 0 ? (value + round) >> shift
+                      : -(((-value) + round) >> shift);
+}
+
+static void thermal_row_ref_reset_runtime(void)
+{
+    thermal_row_ref_comp_adu = 0;
+    thermal_row_ref_scene_bias_adu = 0;
+    thermal_row_ref_scene_ema_x64 = 0;
+    thermal_row_ref_previous_scene_adu = 0;
+    thermal_row_ref_stable_frames = 0;
+    thermal_row_ref_initialized = false;
+    thermal_row_ref_rebinding = false;
+    g_thermal_row_ref_model_active = 0;
     g_thermal_row_ref_sample_valid = 0;
-    if (!g_thermal_row_ref_model_valid) {
-        g_thermal_row_ref_model_active = 0;
-        g_thermal_row_ref_comp_adu = 0;
-        g_thermal_row_ref_last_comp_valid = false;
-        return 0;
-    }
-
-    const uint16_t mean_adu = g_thermal_row_ref_mean_adu;
-    const uint16_t span_adu = g_thermal_row_ref_span_adu;
-    if (mean_adu >= THERMAL_CALIBRATION_V1_ROW_REF_MIN_ADU
-        && mean_adu <= THERMAL_CALIBRATION_V1_ROW_REF_MAX_ADU
-        && span_adu > 0u && span_adu <= THERMAL_ROW_REF_SPAN_MAX_ADU) {
-        const int32_t delta =
-            (int32_t)mean_adu
-            - (int32_t)g_thermal_row_ref_model_reference_adu;
-        const int32_t scaled =
-            delta * (int32_t)g_thermal_row_ref_model_k_q8;
-        int32_t comp = scaled >= 0
-                           ? (scaled + 128) >> 8
-                           : -(((-scaled) + 128) >> 8);
-        const int32_t limit = g_thermal_row_ref_model_limit_adu;
-        if (comp > limit) comp = limit;
-        if (comp < -limit) comp = -limit;
-        g_thermal_row_ref_last_comp_adu = comp;
-        g_thermal_row_ref_last_comp_valid = true;
-        g_thermal_row_ref_sample_valid = 1;
-    }
-
-    if (!g_thermal_row_ref_last_comp_valid) {
-        g_thermal_row_ref_model_active = 0;
-        g_thermal_row_ref_comp_adu = 0;
-        return 0;
-    }
-    g_thermal_row_ref_model_active = 1;
-    g_thermal_row_ref_comp_adu =
-        (int16_t)g_thermal_row_ref_last_comp_adu;
-    return g_thermal_row_ref_last_comp_adu;
+    g_thermal_row_ref_comp_adu = 0;
 }
 
-static inline int32_t thermal_startup_comp_for_now(void)
+static void thermal_row_ref_bind_current_candidate(void)
 {
+    if (g_thermal_row_ref_model_valid
+        || thermal_row_ref_current_candidate_checked
+        || !ffc_done_first || ram_temp_anchor == 0
+        || ram_mean_diff <= 0.0f) {
+        return;
+    }
+    thermal_row_ref_current_candidate_checked = true;
+    if (fabsf(ram_mean_diff - THERMAL_ROW_REF_CURRENT_MEAN_DIFF) > 0.5f
+        || ram_temp_anchor < THERMAL_ROW_REF_CURRENT_ANCHOR_MIN
+        || ram_temp_anchor > THERMAL_ROW_REF_CURRENT_ANCHOR_MAX) {
+        return;
+    }
+
+    g_thermal_row_ref_model_reference_adu =
+        THERMAL_ROW_REF_CURRENT_REFERENCE_ADU;
+    g_thermal_row_ref_model_k_q8 = THERMAL_ROW_REF_CURRENT_K_Q8;
+    g_thermal_row_ref_model_limit_adu = THERMAL_ROW_REF_CURRENT_LIMIT_ADU;
+    g_thermal_row_ref_model_valid = 1;
+    println("RR current V1 candidate bound: ref=%u k_q8=%d limit=%u",
+            (unsigned)g_thermal_row_ref_model_reference_adu,
+            (int)g_thermal_row_ref_model_k_q8,
+            (unsigned)g_thermal_row_ref_model_limit_adu);
+}
+
+static inline int32_t thermal_row_ref_unbounded_comp(uint16_t row_ref_mean_adu)
+{
+    const int32_t delta = (int32_t)row_ref_mean_adu
+                          - (int32_t)g_thermal_row_ref_model_reference_adu;
+    return thermal_round_shift(
+        delta * (int32_t)g_thermal_row_ref_model_k_q8, 8u);
+}
+
+static inline int32_t thermal_row_ref_limit_comp(int32_t comp)
+{
+    int32_t limit = g_thermal_row_ref_model_limit_adu;
+    if (limit > THERMAL_ROW_REF_COMP_LIMIT_ADU) {
+        limit = THERMAL_ROW_REF_COMP_LIMIT_ADU;
+    }
+    if (comp > limit) return limit;
+    if (comp < -limit) return -limit;
+    return comp;
+}
+#endif
+
+static int32_t thermal_scene_row_ref_comp_for(
+    uint16_t row_ref_mean_adu,
+    uint16_t row_ref_span_adu,
+    uint16_t center_roi_adu)
+{
+#if !THERMAL_ROW_REF_RUNTIME_ENABLE
+    (void)row_ref_mean_adu;
+    (void)row_ref_span_adu;
+    (void)center_roi_adu;
     g_thermal_startup_model_active = 0;
-    if (!g_thermal_startup_model_valid || !ntc_adc_valid(boot_ntc)
-        || boot_ntc <= g_thermal_startup_model_ntc_threshold_adu) {
-        return 0;
-    }
-    const uint32_t tau_ms =
-        (uint32_t)g_thermal_startup_model_tau_ds * 100u;
-    if (tau_ms == 0u) return 0;
-    const uint32_t elapsed_ms = to_ms_since_boot(get_absolute_time());
-    if (elapsed_ms >= tau_ms * 6u) return 0;
-    const float weight = expf(-(float)elapsed_ms / (float)tau_ms);
-    int32_t comp = (int32_t)roundf(
-        (float)g_thermal_startup_model_amplitude_adu * weight);
-    if (comp > THERMAL_COMP_LIMIT_ADU) comp = THERMAL_COMP_LIMIT_ADU;
-    if (comp < -THERMAL_COMP_LIMIT_ADU) comp = -THERMAL_COMP_LIMIT_ADU;
-    if (comp == 0) return 0;
-    g_thermal_startup_model_active = 1;
-    return comp;
-}
+    g_thermal_row_ref_model_active = 0;
+    g_thermal_row_ref_sample_valid = 0;
+    g_thermal_row_ref_comp_adu = 0;
+    thermal_row_ref_comp_adu = 0;
+    return 0;
+#else
+    g_thermal_startup_model_active = 0;
+    thermal_row_ref_bind_current_candidate();
 
-static inline int32_t ntc_fallback_comp_between(
-    uint16_t ref_ntc,
-    uint16_t cur_ntc)
-{
-    if (!ntc_adc_valid(ref_ntc)
-        || !ntc_adc_valid(cur_ntc)) {
+    if (!g_thermal_row_ref_model_valid) {
+        thermal_row_ref_reset_runtime();
         return 0;
     }
 
-    const int32_t dn = (int32_t)cur_ntc - (int32_t)ref_ntc;
-    int32_t comp = (int32_t)(NTC_FALLBACK_K * (float)dn);
-    if (comp > THERMAL_COMP_LIMIT_ADU) comp = THERMAL_COMP_LIMIT_ADU;
-    if (comp < -THERMAL_COMP_LIMIT_ADU) comp = -THERMAL_COMP_LIMIT_ADU;
-    return comp;
-}
-
-static inline int32_t thermal_runtime_comp_for(uint16_t cur_ntc)
-{
-    if (ffc_ntc_reference_pending && ntc_adc_valid(cur_ntc)) {
-        /* The FFC anchor was accepted while NTC was invalid.  Rebase on the
-         * first recovered sample without replaying an old delta. */
-        ffc_last_ntc = cur_ntc;
-        ffc_ntc_reference_pending = false;
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (now_ms < THERMAL_ROW_REF_ENABLE_MS) {
+        thermal_row_ref_reset_runtime();
         return 0;
     }
-    return ntc_fallback_comp_between(ffc_last_ntc, cur_ntc);
+
+    const bool sample_valid =
+        row_ref_mean_adu >= THERMAL_CALIBRATION_V1_ROW_REF_MIN_ADU
+        && row_ref_mean_adu <= THERMAL_CALIBRATION_V1_ROW_REF_MAX_ADU
+        && row_ref_span_adu > 0u && row_ref_span_adu <= 0x3fffu
+        && center_roi_adu > 0u && center_roi_adu <= 0x3fffu;
+    g_thermal_row_ref_sample_valid = sample_valid ? 1u : 0u;
+    if (!sample_valid) {
+        /* A transient invalid sample must not erase a previously established
+         * correction.  Hold it until valid evidence returns. */
+        g_thermal_row_ref_model_active =
+            thermal_row_ref_initialized ? 1u : 0u;
+        g_thermal_row_ref_comp_adu =
+            (int16_t)thermal_row_ref_comp_adu;
+        return thermal_row_ref_initialized ? thermal_row_ref_comp_adu : 0;
+    }
+
+    const int32_t scene_signature =
+        (int32_t)center_roi_adu - (int32_t)row_ref_mean_adu;
+    const int32_t unbounded_comp =
+        thermal_row_ref_unbounded_comp(row_ref_mean_adu);
+
+    if (!thermal_row_ref_initialized) {
+        const int32_t expected_high_signature =
+            ram_temp_anchor + (int32_t)roundf(ram_mean_diff)
+            - (int32_t)g_thermal_row_ref_model_reference_adu;
+        const int32_t signature_error =
+            scene_signature - expected_high_signature;
+        /* Only a scene matching the 50 C calibration reference may establish
+         * an absolute RR correction.  Other startup scenes begin at V1-only
+         * and use RR relatively, avoiding a scene-dependent temperature jump. */
+        thermal_row_ref_scene_bias_adu =
+            i32_abs(signature_error) <= THERMAL_ROW_REF_SCENE_MATCH_ADU
+                ? 0 : unbounded_comp;
+        thermal_row_ref_scene_ema_x64 =
+            scene_signature * (1 << THERMAL_ROW_REF_SCENE_EMA_SHIFT);
+        thermal_row_ref_previous_scene_adu = scene_signature;
+        thermal_row_ref_initialized = true;
+    }
+
+    const int32_t scene_ema = thermal_row_ref_scene_ema_x64
+                              >> THERMAL_ROW_REF_SCENE_EMA_SHIFT;
+    if (!thermal_row_ref_rebinding
+        && i32_abs(scene_signature - scene_ema)
+               > THERMAL_ROW_REF_SCENE_CHANGE_ADU) {
+        thermal_row_ref_rebinding = true;
+        thermal_row_ref_stable_frames = 0;
+    }
+
+    if (thermal_row_ref_rebinding) {
+        if (i32_abs(scene_signature - thermal_row_ref_previous_scene_adu)
+            <= THERMAL_ROW_REF_STABLE_DELTA_ADU) {
+            if (thermal_row_ref_stable_frames < UINT8_MAX) {
+                thermal_row_ref_stable_frames++;
+            }
+        } else {
+            thermal_row_ref_stable_frames = 0;
+        }
+        if (thermal_row_ref_stable_frames >= THERMAL_ROW_REF_STABLE_FRAMES) {
+            /* Rebind the scene-dependent part while preserving the exact
+             * current compensation, so a scene switch cannot create a jump. */
+            thermal_row_ref_scene_bias_adu =
+                unbounded_comp - thermal_row_ref_comp_adu;
+            thermal_row_ref_scene_ema_x64 =
+                scene_signature * (1 << THERMAL_ROW_REF_SCENE_EMA_SHIFT);
+            thermal_row_ref_rebinding = false;
+            thermal_row_ref_stable_frames = 0;
+        }
+    } else {
+        const int32_t target = thermal_row_ref_limit_comp(
+            unbounded_comp - thermal_row_ref_scene_bias_adu);
+        thermal_row_ref_comp_adu += thermal_round_shift(
+            target - thermal_row_ref_comp_adu,
+            THERMAL_ROW_REF_COMP_FILTER_SHIFT);
+        thermal_row_ref_scene_ema_x64 +=
+            scene_signature - scene_ema;
+    }
+
+    thermal_row_ref_previous_scene_adu = scene_signature;
+    g_thermal_row_ref_model_active = 1;
+    g_thermal_row_ref_comp_adu = (int16_t)thermal_row_ref_comp_adu;
+    return thermal_row_ref_comp_adu;
+#endif
 }
 
 static inline uint16_t u16_absdiff(uint16_t a, uint16_t b)
@@ -924,6 +1049,18 @@ static inline uint16_t u16_absdiff(uint16_t a, uint16_t b)
 static inline int32_t i32_abs(int32_t v)
 {
     return v < 0 ? -v : v;
+}
+
+static inline int32_t ffc_shutter_drift_comp_adu(int32_t drift_adu)
+{
+    int64_t comp = (int64_t)drift_adu * FFC_SHUTTER_DRIFT_K_Q8;
+    comp = comp >= 0 ? (comp + 128) / 256 : (comp - 128) / 256;
+    if (comp > FFC_SHUTTER_DRIFT_LIMIT_ADU) {
+        comp = FFC_SHUTTER_DRIFT_LIMIT_ADU;
+    } else if (comp < -FFC_SHUTTER_DRIFT_LIMIT_ADU) {
+        comp = -FFC_SHUTTER_DRIFT_LIMIT_ADU;
+    }
+    return (int32_t)comp;
 }
 
 static inline int16_t clip_i16_i32(int32_t v)
@@ -939,9 +1076,10 @@ static inline int16_t clip_i16_i32(int32_t v)
 
 static inline __attribute__((always_inline)) uint16_t gray14_to_bin(uint16_t g);
 
-static int16_t temp_x10_from_corrected_adu(int32_t adu, int32_t eff_anchor)
+static int16_t temp_x10_from_corrected_adu(
+    int32_t adu, int32_t eff_anchor, float mean_diff)
 {
-    if (ram_mean_diff <= 0.0f || ram_temp_anchor == 0) {
+    if (mean_diff <= 0.0f || ram_temp_anchor == 0) {
         return INT16_MAX;
     }
 
@@ -949,7 +1087,7 @@ static int16_t temp_x10_from_corrected_adu(int32_t adu, int32_t eff_anchor)
     const float T_H_K = T_REF_HIGH + 273.15f;
     const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
     const float T_H_K4 = T_H_K * T_H_K * T_H_K * T_H_K;
-    const float f = (float)(adu - eff_anchor) / ram_mean_diff;
+    const float f = (float)(adu - eff_anchor) / mean_diff;
     float k4 = T_L_K4 + f * (T_H_K4 - T_L_K4);
     if (k4 < 1.0f) {
         k4 = 1.0f;
@@ -1022,12 +1160,13 @@ static bool ffc_first_continuity_predict(
     int32_t candidate_mean,
     int32_t old_eff_anchor,
     int32_t new_eff_anchor,
+    float effective_mean_diff,
     int16_t* center_jump_x10,
     int16_t* field_jump_x10)
 {
     if (!ffc_continuity_reference_valid || calibg == nullptr
         || caligain == nullptr || flash_gain == nullptr
-        || ram_mean_diff <= 0.0f || ram_temp_anchor == 0) {
+        || effective_mean_diff <= 0.0f || ram_temp_anchor == 0) {
         return false;
     }
 
@@ -1045,13 +1184,17 @@ static bool ffc_first_continuity_predict(
         nullptr, candidate_background, candidate_mean);
 
     const int16_t old_center_x10 =
-        temp_x10_from_corrected_adu(old_center_adu, old_eff_anchor);
+        temp_x10_from_corrected_adu(old_center_adu, old_eff_anchor,
+                                    effective_mean_diff);
     const int16_t new_center_x10 =
-        temp_x10_from_corrected_adu(new_center_adu, new_eff_anchor);
+        temp_x10_from_corrected_adu(new_center_adu, new_eff_anchor,
+                                    effective_mean_diff);
     const int16_t old_field_x10 =
-        temp_x10_from_corrected_adu(old_field_adu, old_eff_anchor);
+        temp_x10_from_corrected_adu(old_field_adu, old_eff_anchor,
+                                    effective_mean_diff);
     const int16_t new_field_x10 =
-        temp_x10_from_corrected_adu(new_field_adu, new_eff_anchor);
+        temp_x10_from_corrected_adu(new_field_adu, new_eff_anchor,
+                                    effective_mean_diff);
     if (old_center_x10 == INT16_MAX || new_center_x10 == INT16_MAX
         || old_field_x10 == INT16_MAX || new_field_x10 == INT16_MAX) {
         return false;
@@ -1237,6 +1380,7 @@ static inline void ntc_tick(void)
 
     if (!ntc_adc_valid(boot_ntc)) {
         boot_ntc = v;
+        boot_ntc_ms = now_ms;
     }
 
     uint32_t smooth = g_ntc_smooth_x256;
@@ -2800,10 +2944,13 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
      * Bolometer ADU ∝ scene radiance ∝ T_K^4 (Stefan-Boltzmann), so two-point
      * interpolation must be done in T^4 space, not linear-in-°C, otherwise a
      * 0°C / 50°C calibration under-reads midrange by several degrees. */
-    /* VTEMP is diagnostic-only. Board NTC feeds the bounded fallback; an
-     * invalid NTC sample fails compensation open. */
+    const uint32_t center_idx =
+        (uint32_t)(SENSOR_H / 2) * SENSOR_W + (uint32_t)(SENSOR_W / 2);
+    const uint16_t center_raw_adu = raw14[center_idx];
+    const uint16_t center_roi_adu = center_roi_mean_u14(raw14, 2);
+    /* VTEMP and RR remain diagnostic-only.  Absolute NTC is the sole runtime
+     * input to a V1-bound per-device anchor+gain model. */
     const uint16_t cur_vtemp = be16_to_u14(&raw[RAWBUF_OFS_VTEMP]);
-    const uint16_t cur_ntc   = g_cur_ntc_adc;
 
     /* Update VTEMP EMA smoother for diagnostics only. */
     if (g_vtemp_smooth_x256 == 0) {
@@ -2820,21 +2967,30 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     int32_t eff_anchor = ram_temp_anchor;
     int32_t startup_comp_i32 = 0;
     int32_t normal_comp_i32 = 0;
-    if (g_thermal_row_ref_model_valid) {
-        g_thermal_startup_model_active = 0;
-        normal_comp_i32 = thermal_row_ref_comp_for_current();
-    } else {
-        startup_comp_i32 = thermal_startup_comp_for_now();
-        normal_comp_i32 = thermal_runtime_comp_for(cur_ntc);
+    const struct thermal_drift_model_runtime drift_model =
+        thermal_drift_model_evaluate(g_cur_ntc_adc);
+    /* RR, TC and VTEMP stay diagnostic-only.  A matching per-device model
+     * adjusts both the absolute low endpoint and the 0-to-50 C response. */
+    (void)thermal_scene_row_ref_comp_for(g_thermal_row_ref_mean_adu,
+                                         g_thermal_row_ref_span_adu,
+                                         center_roi_adu);
+    float effective_mean_diff = ram_mean_diff;
+    if (drift_model.active) {
+        normal_comp_i32 = drift_model.anchor_comp_adu
+                          + ffc_shutter_drift_comp_adu(
+                                ffc_shutter_drift_adu);
+        eff_anchor += normal_comp_i32;
+        effective_mean_diff *=
+            (float)drift_model.gain_scale_q16 / 65536.0f;
     }
-    if (ram_mean_diff > 0.0f && ram_temp_anchor != 0 && calib != nullptr) {
-        eff_anchor += startup_comp_i32 + normal_comp_i32;
+    if (effective_mean_diff > 0.0f && ram_temp_anchor != 0
+        && calib != nullptr) {
         const float T_L_K = ram_t_ref_low + 273.15f;
         const float T_H_K = T_REF_HIGH + 273.15f;
         const float T_L_K4 = T_L_K * T_L_K * T_L_K * T_L_K;
         const float T_H_K4 = T_H_K * T_H_K * T_H_K * T_H_K;
         const float dK4 = T_H_K4 - T_L_K4;
-        const float inv_md = 1.0f / ram_mean_diff;
+        const float inv_md = 1.0f / effective_mean_diff;
         const float f_lo =
             (float)((int32_t)g_smooth_low - eff_anchor) * inv_md;
         const float f_hi =
@@ -2850,21 +3006,21 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         temp_map_ok = true;
     }
 
-    const uint32_t center_idx =
-        (uint32_t)(SENSOR_H / 2) * SENSOR_W + (uint32_t)(SENSOR_W / 2);
-    const uint16_t center_raw_adu = raw14[center_idx];
-    const uint16_t center_roi_adu = center_roi_mean_u14(raw14, 2);
     const int16_t center_raw_x10 =
-        temp_map_ok ? temp_x10_from_corrected_adu(center_raw_adu, eff_anchor)
+        temp_map_ok ? temp_x10_from_corrected_adu(center_raw_adu, eff_anchor,
+                                                   effective_mean_diff)
                     : INT16_MAX;
     const int16_t center_roi_x10 =
-        temp_map_ok ? temp_x10_from_corrected_adu(center_roi_adu, eff_anchor)
+        temp_map_ok ? temp_x10_from_corrected_adu(center_roi_adu, eff_anchor,
+                                                   effective_mean_diff)
                     : INT16_MAX;
     const int16_t scene_min_x10 =
-        temp_map_ok ? temp_x10_from_corrected_adu(scene_min_adu, eff_anchor)
+        temp_map_ok ? temp_x10_from_corrected_adu(scene_min_adu, eff_anchor,
+                                                   effective_mean_diff)
                     : INT16_MAX;
     const int16_t scene_max_x10 =
-        temp_map_ok ? temp_x10_from_corrected_adu(scene_max_adu, eff_anchor)
+        temp_map_ok ? temp_x10_from_corrected_adu(scene_max_adu, eff_anchor,
+                                                   effective_mean_diff)
                     : INT16_MAX;
 
     /* Per-frame temperature-linear LUT: map the ADU-linear intensity 0..254
@@ -4154,6 +4310,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
             g_cur_ntc_adc = v;
             g_ntc_smooth_x256 = ((uint32_t)v) << 8;
             boot_ntc = v;
+            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
             break;
         }
         sleep_ms(2);
@@ -4163,6 +4320,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
         if (ntc_adc_valid(g_cur_ntc_adc)) {
             g_ntc_smooth_x256 = ((uint32_t)g_cur_ntc_adc) << 8;
             boot_ntc = g_cur_ntc_adc;
+            boot_ntc_ms = to_ms_since_boot(get_absolute_time());
         }
     }
 
@@ -4896,19 +5054,29 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
      * reference, so displayed T = T_L when actual scene T = T_L. */
     const int32_t anchor_old = ram_temp_anchor;
     int32_t candidate_temp_anchor = ram_temp_anchor;
-    /* eff_anchor_old is the anchor used immediately before this FFC. */
-    const bool row_ref_model_active = g_thermal_row_ref_model_valid;
-    const int32_t startup_comp_at_ffc =
-        row_ref_model_active ? 0 : thermal_startup_comp_for_now();
-    const int32_t fallback_comp_at_ffc =
-        row_ref_model_active
-            ? 0
-            : ntc_fallback_comp_between(ffc_last_ntc, cur_ntc_at_ffc);
-    const int32_t row_ref_comp_at_ffc =
-        row_ref_model_active ? thermal_row_ref_comp_for_current() : 0;
-    int32_t eff_anchor_old = anchor_old;
-    eff_anchor_old += startup_comp_at_ffc + fallback_comp_at_ffc
-                      + row_ref_comp_at_ffc;
+    /* Snapshot one absolute-NTC model state on both sides of the FFC handoff.
+     * The model is never persisted into the base anchor, so FFC cannot apply
+     * the same global correction twice. */
+    const struct thermal_drift_model_runtime drift_model_at_ffc =
+        thermal_drift_model_evaluate(cur_ntc_at_ffc);
+    const int32_t model_anchor_comp_at_ffc =
+        drift_model_at_ffc.active
+            ? drift_model_at_ffc.anchor_comp_adu : 0;
+    const int32_t shutter_drift_comp_old =
+        ffc_shutter_drift_comp_adu(ffc_shutter_drift_adu);
+    int32_t next_shutter_drift_adu = ffc_shutter_drift_adu;
+    if (ffc_done_first) {
+        next_shutter_drift_adu += dg_check;
+    }
+    const int32_t shutter_drift_comp_new =
+        ffc_shutter_drift_comp_adu(next_shutter_drift_adu);
+    float effective_mean_diff_at_ffc = ram_mean_diff;
+    if (drift_model_at_ffc.active) {
+        effective_mean_diff_at_ffc *=
+            (float)drift_model_at_ffc.gain_scale_q16 / 65536.0f;
+    }
+    int32_t eff_anchor_old = anchor_old + model_anchor_comp_at_ffc
+                             + shutter_drift_comp_old;
     if (caligain != nullptr && ram_l_ref_mean > 0) {
         float fsum = 0.0f;
         for (size_t i = 0; i < PX_CNT; i++) {
@@ -4918,21 +5086,12 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         candidate_temp_anchor =
             (int32_t)roundf(fsum / (float)PX_CNT + (float)new_calib_mean);
     }
-    if (fallback_comp_at_ffc != 0) {
-        /* The stable relative fallback resets its references at FFC, so carry
-         * the accumulated correction even if the base anchor was unchanged. */
-        candidate_temp_anchor += fallback_comp_at_ffc;
-        println("FFC anchor+stable: base=%ld comp=%ld final=%ld ntc=%u",
-                (long)(candidate_temp_anchor - fallback_comp_at_ffc),
-                (long)fallback_comp_at_ffc,
-                (long)candidate_temp_anchor, cur_ntc_at_ffc);
-    }
-
     /* Carry the percentile smoother across FFC by shifting with Δeff_anchor.
      * Using eff_anchor_old accounts for the NTC compensation already applied
      * to the renderer. */
-    int32_t eff_anchor_new = candidate_temp_anchor + startup_comp_at_ffc
-                             + row_ref_comp_at_ffc;
+    const int32_t eff_anchor_new =
+        candidate_temp_anchor + model_anchor_comp_at_ffc
+        + shutter_drift_comp_new;
 
     int16_t predicted_jump_x10 = 0;
     if (!ffc_done_first) {
@@ -4942,6 +5101,7 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
                                          new_calib_mean,
                                          eff_anchor_old,
                                          eff_anchor_new,
+                                         effective_mean_diff_at_ffc,
                                          &center_jump_x10,
                                          &field_jump_x10)) {
             predicted_jump_x10 =
@@ -4983,9 +5143,11 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
         const int32_t scene_mid_adu =
             ((int32_t)g_smooth_low + (int32_t)g_smooth_high) >> 1;
         const int16_t old_mid_x10 =
-            temp_x10_from_corrected_adu(scene_mid_adu, eff_anchor_old);
+            temp_x10_from_corrected_adu(scene_mid_adu, eff_anchor_old,
+                                        effective_mean_diff_at_ffc);
         const int16_t new_mid_x10 =
-            temp_x10_from_corrected_adu(scene_mid_adu, eff_anchor_new);
+            temp_x10_from_corrected_adu(scene_mid_adu, eff_anchor_new,
+                                        effective_mean_diff_at_ffc);
         if (old_mid_x10 != INT16_MAX && new_mid_x10 != INT16_MAX) {
             int32_t jump_tmp = (int32_t)new_mid_x10 - (int32_t)old_mid_x10;
             if (jump_tmp < INT16_MIN) {
@@ -5048,13 +5210,14 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     thermal_publish_shutter_mean(g_calib_mean);
     g_last_calib = nullptr; /* triggers recompute on next frame */
     ram_temp_anchor = candidate_temp_anchor;
+    ffc_shutter_drift_adu = next_shutter_drift_adu;
     ffc_restore_gain_cache(restore_gain_cache);
     ffc_record_event(FFC_EVT_ACCEPT,
                      dg_check,
                      dv_check,
                      dn_check,
                      eff_anchor_old,
-                     ram_temp_anchor,
+                     eff_anchor_new,
                      predicted_jump_x10,
                      new_calib_mean,
                      cur_fpa_vtemp,
@@ -5064,12 +5227,12 @@ static void ffc_run(uint16_t cur_fpa_vtemp)
     ffc_last_ms = to_ms_since_boot(get_absolute_time());
     ffc_retry_after_ms = 0;
     ffc_last_fpa_vtemp = cur_fpa_vtemp;
+    /* Keep RR state continuous across FFC.  The first verified open frame is
+     * checked by the scene-invariant gate before RR is allowed to move. */
     if (ntc_adc_valid(cur_ntc_at_ffc)) {
         ffc_last_ntc = cur_ntc_at_ffc;
-        ffc_ntc_reference_pending = false;
     } else {
         ffc_last_ntc = 0;
-        ffc_ntc_reference_pending = true;
     }
     ffc_last_g_calib_mean = g_calib_mean;
     ffc_count++;
@@ -5199,8 +5362,9 @@ int __time_critical_func(spi_init_40MHz4)()
 
     /* Select a complete V1 calibration transaction before copying tables into
      * RAM. Legacy single-slot data remains supported; NCM uploads publish an
-     * alternate selector only after all payload readback checks pass. */
+    * alternate selector only after all payload readback checks pass. */
     thermal_calibration_v1_boot_select();
+    thermal_drift_model_boot_load();
     thermal_ntc_model_boot_load();
 
     if (thermal_calibration_v1_boot_has_calibration()

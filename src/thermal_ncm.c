@@ -22,6 +22,7 @@
 
 #include "init.h"
 #include "thermal_calibration_v1.h"
+#include "thermal_drift_model.h"
 #include "thermal_ota.h"
 #include "web_assets.h"
 
@@ -211,6 +212,7 @@ enum response_kind {
     RESPONSE_FRAME_ADC16,
     RESPONSE_OTA_UPLOAD,
     RESPONSE_CALIBRATION_UPLOAD,
+    RESPONSE_DRIFT_MODEL_UPLOAD,
     RESPONSE_NETWORK_UPDATE,
 };
 
@@ -239,6 +241,9 @@ struct http_client {
     bool calibration_owner;
     bool calibration_complete;
     uint8_t calibration_header[THERMAL_CALIBRATION_V1_HEADER_BYTES];
+    uint8_t drift_model_body[THERMAL_DRIFT_MODEL_BYTES];
+    uint8_t drift_model_expected;
+    uint8_t drift_model_received;
     uint8_t config_body[32];
     uint8_t config_expected;
     uint8_t config_received;
@@ -678,6 +683,10 @@ static void board_serial_string(char* out, size_t bytes)
     pico_get_unique_board_id_string(out, bytes);
 }
 
+static void thermal_drift_model_prepare_result(
+    struct http_client* client, enum thermal_drift_model_result result,
+    bool cleared);
+
 static void prepare_response(struct http_client* client)
 {
     const bool is_head = strncmp(client->request, "HEAD ", 5) == 0;
@@ -724,6 +733,78 @@ static void prepare_response(struct http_client* client)
             client->body_sent = 0;
             return;
         }
+    } else if (strncmp(client->request, "POST ", 5) == 0
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/thermal-model/clear")) {
+        uint32_t content_length = 0;
+        enum thermal_drift_model_result result = THERMAL_DRIFT_MODEL_BAD_SIZE;
+        if (!network_reboot_at_ms
+            && request_header_value_starts_with(
+                   client->request, "X-Sipeed-Request", "1")
+            && request_header_value_starts_with(
+                   client->request, "X-Sipeed-Thermal-Model-Confirm",
+                   "clear-v2")
+            && request_header_value_starts_with(
+                   client->request, "Content-Type",
+                   "application/vnd.sipeed.tn160-thermal-drift-model-v2")
+            && request_content_length(client->request, &content_length)
+            && content_length == 0u) {
+            result = thermal_drift_model_clear();
+        } else if (network_reboot_at_ms) {
+            result = THERMAL_DRIFT_MODEL_BUSY;
+        }
+        if (result == THERMAL_DRIFT_MODEL_OK) {
+            thermal_drift_model_prepare_result(client, result, true);
+            return;
+        }
+        status = result == THERMAL_DRIFT_MODEL_BUSY
+                     ? "409 Conflict" : "400 Bad Request";
+        type = "application/json; charset=utf-8";
+        const int body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"ok\":false,\"error\":\"%s\"}\n",
+            thermal_drift_model_result_string(result));
+        client->flash_data = (const uint8_t*)client->request;
+        client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (strncmp(client->request, "POST ", 5) == 0
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/thermal-model")) {
+        uint32_t content_length = 0;
+        enum thermal_drift_model_result result =
+            THERMAL_DRIFT_MODEL_BAD_SIZE;
+        if (network_reboot_at_ms) {
+            result = THERMAL_DRIFT_MODEL_BUSY;
+        } else if (request_header_value_starts_with(
+                       client->request, "X-Sipeed-Request", "1")
+                   && request_header_value_starts_with(
+                       client->request,
+                       "X-Sipeed-Thermal-Model-Confirm", "write-v2")
+                   && request_header_value_starts_with(
+                       client->request, "Content-Type",
+                       "application/vnd.sipeed.tn160-thermal-drift-model-v2")
+                   && request_content_length(client->request, &content_length)
+                   && content_length == THERMAL_DRIFT_MODEL_BYTES) {
+            result = THERMAL_DRIFT_MODEL_OK;
+        }
+        if (result == THERMAL_DRIFT_MODEL_OK) {
+            client->response = RESPONSE_DRIFT_MODEL_UPLOAD;
+            client->drift_model_expected = (uint8_t)content_length;
+            client->drift_model_received = 0;
+            client->header_used = 0;
+            client->header_sent = 0;
+            client->body_length = 0;
+            client->body_sent = 0;
+            return;
+        }
+        status = result == THERMAL_DRIFT_MODEL_BUSY
+                     ? "409 Conflict" : "400 Bad Request";
+        type = "application/json; charset=utf-8";
+        const int body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"ok\":false,\"error\":\"%s\"}\n",
+            thermal_drift_model_result_string(result));
+        client->flash_data = (const uint8_t*)client->request;
+        client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
     } else if (strncmp(client->request, "POST ", 5) == 0
                && (request_has_path(client->request,
                                     "/api/v1/calibration/v1/complete")
@@ -833,15 +914,95 @@ static void prepare_response(struct http_client* client)
             "{\"id\":\"adc16\",\"width\":160,\"height\":120,\"stride_bytes\":320,\"bits_per_pixel\":16,\"effective_bits\":14,\"temperature_encoding\":\"none\",\"metadata\":\"sipeed-thermal-meta-v1\",\"frame\":\"/frame.adc16\"},"
             "{\"id\":\"temp8\",\"width\":160,\"height\":120,\"stride_bytes\":160,\"bits_per_pixel\":8,\"temperature_encoding\":\"linear\",\"metadata\":\"sipeed-thermal-meta-v1\",\"frame\":\"/frame.temp8\",\"stream\":\"/stream.temp8\"}],"
             "\"calibration\":{\"supported\":true,\"format\":\"tn160-calibration-v1\",\"packet_bytes\":%u,\"upload\":\"/api/v1/calibration/v1\",\"manifest\":\"/api/v1/calibration/v1/manifest\",\"data_prefix\":\"/api/v1/calibration/v1/data/\"},"
+            "\"thermal_drift_model\":{\"supported\":true,\"format\":\"tn160-thermal-drift-model-v2\",\"packet_bytes\":%u,\"mean_k_q8\":%d,\"upload\":\"/api/v1/calibration/v1/thermal-model\",\"clear\":\"/api/v1/calibration/v1/thermal-model/clear\",\"manifest\":\"/api/v1/calibration/v1/thermal-model/manifest\",\"state\":\"/api/v1/calibration/v1/thermal-model/state\"},"
             "\"ota\":{\"supported\":true,\"format\":\"t160-bin\",\"max_bytes\":%lu,\"rollback\":false,\"upload\":\"/api/v1/ota\",\"status\":\"/api/v1/ota/status\"}}\n",
             serial, PICO_TN160_VERSION, thermal_ota_build_id(),
             (unsigned)network_segment,
             (unsigned)network_segment,
             THERMAL_NCM_FIXED_PRODUCT_ADDRESS ? "false" : "true",
             (unsigned)THERMAL_CALIBRATION_V1_PACKET_BYTES,
+            (unsigned)THERMAL_DRIFT_MODEL_BYTES,
+            (int)THERMAL_DRIFT_MEAN_K_Q8,
             (unsigned long)thermal_ota_max_image_bytes());
         client->flash_data = (const uint8_t*)client->request;
         client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (is_read
+               && request_has_path(
+                   client->request,
+                   "/api/v1/calibration/v1/thermal-model/state")) {
+        type = "application/json; charset=utf-8";
+        const int body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"valid\":%u,\"active\":%u,\"mean_active\":%u,"
+            "\"per_device\":%u,"
+            "\"ntc_clamped\":%u,\"base_ntc_adu\":%u,"
+            "\"ntc_min_adu\":%u,\"ntc_max_adu\":%u,"
+            "\"mean_k_q8\":%d,\"mean_limit_adu\":%u,"
+            "\"mean_anchor_comp_adu\":%d,"
+            "\"device_anchor_residual_adu\":%d,"
+            "\"anchor_comp_adu\":%d,\"gain_delta_q16\":%d,"
+            "\"gain_scale_q16\":%ld}\n",
+            (unsigned)g_thermal_drift_model_valid,
+            (unsigned)g_thermal_drift_model_active,
+            (unsigned)g_thermal_drift_model_mean_active,
+            (unsigned)g_thermal_drift_model_per_device,
+            (unsigned)g_thermal_drift_model_ntc_clamped,
+            (unsigned)g_thermal_drift_model_base_ntc_adu,
+            (unsigned)g_thermal_drift_model_ntc_min_adu,
+            (unsigned)g_thermal_drift_model_ntc_max_adu,
+            (int)g_thermal_drift_model_mean_k_q8,
+            (unsigned)THERMAL_DRIFT_MEAN_LIMIT_ADU,
+            (int)g_thermal_drift_model_mean_anchor_comp_adu,
+            (int)g_thermal_drift_model_device_anchor_residual_adu,
+            (int)g_thermal_drift_model_anchor_comp_adu,
+            (int)g_thermal_drift_model_gain_delta_q16,
+            (long)g_thermal_drift_model_gain_scale_q16);
+        client->flash_data = (const uint8_t*)client->request;
+        client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (is_read
+               && request_has_path(
+                   client->request,
+                   "/api/v1/calibration/v1/thermal-model/manifest")) {
+        type = "application/json; charset=utf-8";
+        struct thermal_drift_model_manifest manifest;
+        thermal_drift_model_manifest(&manifest);
+        const int body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"valid\":%s,\"format\":\"tn160-thermal-drift-model-v2\","
+            "\"mean_fallback_available\":%s,\"per_device\":%s,"
+            "\"generation\":%lu,"
+            "\"calibration_id\":%lu,\"packet_bytes\":%u,"
+            "\"base_ntc_adu\":%u,\"learned_ntc_adu\":%u,"
+            "\"mean_k_q8\":%d,"
+            "\"packet_crc32\":\"%08lx\","
+            "\"data\":\"/api/v1/calibration/v1/thermal-model\"}\n",
+            manifest.valid ? "true" : "false",
+            manifest.mean_fallback_available ? "true" : "false",
+            manifest.per_device ? "true" : "false",
+            (unsigned long)manifest.generation,
+            (unsigned long)manifest.calibration_id,
+            (unsigned)THERMAL_DRIFT_MODEL_BYTES,
+            (unsigned)manifest.base_ntc_adu,
+            (unsigned)manifest.learned_ntc_adu,
+            (int)manifest.mean_k_q8,
+            (unsigned long)manifest.packet_crc32);
+        client->flash_data = (const uint8_t*)client->request;
+        client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    } else if (is_read
+               && request_has_path(client->request,
+                                   "/api/v1/calibration/v1/thermal-model")) {
+        type = "application/vnd.sipeed.tn160-thermal-drift-model-v2";
+        if (thermal_drift_model_packet(client->drift_model_body)) {
+            client->flash_data = client->drift_model_body;
+            client->body_length = THERMAL_DRIFT_MODEL_BYTES;
+        } else {
+            status = "404 Not Found";
+            type = "application/json; charset=utf-8";
+            static const char missing[] =
+                "{\"valid\":false,\"error\":\"no model for active calibration\"}\n";
+            client->flash_data = (const uint8_t*)missing;
+            client->body_length = sizeof(missing) - 1u;
+        }
     } else if (is_read
                && request_has_path(client->request,
                                    "/api/v1/calibration/v1/manifest")) {
@@ -1067,7 +1228,10 @@ static void prepare_response(struct http_client* client)
                 "\"thermal_row_ref_model_reference_adu\":%u,"
                 "\"thermal_row_ref_model_k_q8\":%d,"
                 "\"thermal_row_ref_model_limit_adu\":%u,"
-                "\"thermal_row_ref_comp_adu\":%d}\n",
+                "\"thermal_row_ref_comp_adu\":%d,"
+                "\"thermal_drift_model_active\":%u,"
+                "\"thermal_drift_model_ntc_clamped\":%u,"
+                "\"thermal_drift_model_gain_scale_q16\":%ld}\n",
                 (unsigned long)diagnostics.frame_number,
                 (unsigned long)diagnostics.timestamp_ms,
                 (unsigned)diagnostics.vtemp_adu,
@@ -1127,7 +1291,10 @@ static void prepare_response(struct http_client* client)
                 (unsigned)diagnostics.thermal_row_ref_model_reference_adu,
                 (int)diagnostics.thermal_row_ref_model_k_q8,
                 (unsigned)diagnostics.thermal_row_ref_model_limit_adu,
-                (int)diagnostics.thermal_row_ref_comp_adu);
+                (int)diagnostics.thermal_row_ref_comp_adu,
+                (unsigned)g_thermal_drift_model_active,
+                (unsigned)g_thermal_drift_model_ntc_clamped,
+                (long)g_thermal_drift_model_gain_scale_q16);
             client->flash_data = (const uint8_t*)client->request;
             client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
         } else {
@@ -1576,6 +1743,50 @@ static void calibration_prepare_result(
     }
 }
 
+static void thermal_drift_model_prepare_result(
+    struct http_client* client, enum thermal_drift_model_result result,
+    bool cleared)
+{
+    client->response = RESPONSE_FLASH;
+    client->body_sent = 0;
+    const bool ok = result == THERMAL_DRIFT_MODEL_OK;
+    int body_len;
+    if (ok) {
+        struct thermal_drift_model_manifest manifest;
+        thermal_drift_model_manifest(&manifest);
+        body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"accepted\":true,\"format\":\"tn160-thermal-drift-model-v2\","
+            "\"generation\":%lu,\"calibration_id\":%lu,"
+            "\"packet_crc32\":\"%08lx\",\"state\":\"%s\","
+            "\"per_device\":%s,"
+            "\"rebooting\":false}\n",
+            (unsigned long)manifest.generation,
+            (unsigned long)manifest.calibration_id,
+            (unsigned long)manifest.packet_crc32,
+            cleared ? "cleared" : "verified",
+            manifest.per_device ? "true" : "false");
+    } else {
+        body_len = snprintf(
+            client->request, sizeof(client->request),
+            "{\"ok\":false,\"error\":\"%s\"}\n",
+            thermal_drift_model_result_string(result));
+    }
+    client->flash_data = (const uint8_t*)client->request;
+    client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
+    const int header_len = snprintf(
+        client->header, sizeof(client->header),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n",
+        ok ? "200 OK" : "500 Internal Server Error",
+        (unsigned long)client->body_length);
+    client->header_used = (uint16_t)(header_len > 0 ? header_len : 0);
+    client->header_sent = 0;
+}
+
 static void network_prepare_result(struct http_client* client)
 {
 #if THERMAL_NCM_FIXED_PRODUCT_ADDRESS
@@ -1771,6 +1982,7 @@ static err_t http_poll(void* arg, struct tcp_pcb* pcb)
     struct http_client* client = (struct http_client*)arg;
     if (client->response == RESPONSE_OTA_UPLOAD
         || client->response == RESPONSE_CALIBRATION_UPLOAD
+        || client->response == RESPONSE_DRIFT_MODEL_UPLOAD
         || client->response == RESPONSE_NETWORK_UPDATE) return ERR_OK;
     if (client->request_done) return client_send(client);
     client_abort(client);
@@ -1877,6 +2089,30 @@ static err_t http_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err
                 if (!take) break;
                 continue;
             }
+            if (client->response == RESPONSE_DRIFT_MODEL_UPLOAD) {
+                const uint8_t remaining =
+                    client->drift_model_expected
+                    - client->drift_model_received;
+                uint16_t take = (uint16_t)(part->len - i);
+                if (take > remaining) take = remaining;
+                if (take) {
+                    memcpy(client->drift_model_body
+                               + client->drift_model_received,
+                           data + i, take);
+                    client->drift_model_received += (uint8_t)take;
+                    i += take;
+                }
+                if (client->drift_model_received
+                    == client->drift_model_expected) {
+                    const enum thermal_drift_model_result result =
+                        thermal_drift_model_write(client->drift_model_body,
+                                                   client->drift_model_expected);
+                    thermal_drift_model_prepare_result(client, result, false);
+                    break;
+                }
+                if (!take) break;
+                continue;
+            }
             if (client->response != RESPONSE_OTA_UPLOAD) break;
             const uint32_t remaining =
                 client->ota_expected - client->ota_received;
@@ -1912,6 +2148,7 @@ static err_t http_recv(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err
     pbuf_free(p);
     if (client->request_done && client->response != RESPONSE_OTA_UPLOAD
         && client->response != RESPONSE_CALIBRATION_UPLOAD
+        && client->response != RESPONSE_DRIFT_MODEL_UPLOAD
         && client->response != RESPONSE_NETWORK_UPDATE) {
         if (client->response == RESPONSE_NONE) prepare_response(client);
         return client_send(client);

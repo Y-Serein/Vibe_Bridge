@@ -2,6 +2,7 @@ import importlib.util
 import struct
 import sys
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -186,6 +187,92 @@ class RowReferenceModelDiagnosticsTests(unittest.TestCase):
         diagnostics["thermal_startup_model_active"] = 1
         with self.assertRaises(AssertionError):
             MODULE.validate_row_ref_model_diagnostics(diagnostics)
+
+
+class ThermalDriftModelDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def diagnostics(valid=1, active=1, mean_active=1, per_device=1,
+                    clamped=0, mean_anchor=-300, device_anchor=-42,
+                    gain_delta=0, gain_scale=65536):
+        return {
+            "valid": valid,
+            "active": active,
+            "mean_active": mean_active,
+            "per_device": per_device,
+            "ntc_clamped": clamped,
+            "base_ntc_adu": 1800 if active else 0,
+            "ntc_min_adu": 1650 if valid else 0,
+            "ntc_max_adu": 1980 if valid else 0,
+            "mean_k_q8": 290,
+            "mean_limit_adu": 600,
+            "mean_anchor_comp_adu": mean_anchor if active else 0,
+            "device_anchor_residual_adu": device_anchor if per_device else 0,
+            "anchor_comp_adu": mean_anchor + device_anchor if active else 0,
+            "gain_delta_q16": gain_delta,
+            "gain_scale_q16": gain_scale,
+        }
+
+    def test_no_record_uses_batch_mean_fallback(self):
+        self.assertTrue(MODULE.validate_thermal_drift_model_diagnostics(
+            self.diagnostics(valid=0, active=1, per_device=0,
+                             device_anchor=0)
+        ))
+
+    def test_invalid_ntc_falls_back_to_v1_only(self):
+        self.assertFalse(MODULE.validate_thermal_drift_model_diagnostics(
+            self.diagnostics(valid=0, active=0, mean_active=0,
+                             per_device=0)
+        ))
+
+    def test_active_model_requires_mean_layer(self):
+        with self.assertRaises(AssertionError):
+            MODULE.validate_thermal_drift_model_diagnostics(
+                self.diagnostics(valid=0, active=1, mean_active=0,
+                                 per_device=0)
+            )
+
+    def test_anchor_limit_is_enforced(self):
+        with self.assertRaises(AssertionError):
+            MODULE.validate_thermal_drift_model_diagnostics(
+                self.diagnostics(mean_anchor=600, device_anchor=201)
+            )
+
+    def test_gain_scale_matches_reported_delta(self):
+        with self.assertRaises(AssertionError):
+            MODULE.validate_thermal_drift_model_diagnostics(
+                self.diagnostics(gain_delta=100, gain_scale=65536)
+            )
+
+    def test_inactive_model_has_neutral_state(self):
+        self.assertFalse(MODULE.validate_thermal_drift_model_diagnostics(
+            self.diagnostics(valid=0, active=0, mean_active=0,
+                             per_device=0, gain_scale=65536)
+        ))
+
+
+class ThermalDriftModelPacketTests(unittest.TestCase):
+    @staticmethod
+    def packet(calibration_id=0x12345678):
+        prefix = struct.pack(
+            "<8sHHIHHhhHhHH28s",
+            b"T160DM2\0", 2, 64, calibration_id, 1800, 1650,
+            -40, 5000, 1, 290, 600, 800, b"\0" * 28,
+        )
+        return prefix + struct.pack("<I", zlib.crc32(prefix))
+
+    def test_valid_packet_is_accepted(self):
+        packet = self.packet()
+        decoded = MODULE.validate_thermal_drift_model_packet(
+            packet, 0x12345678
+        )
+        self.assertEqual(decoded["learned_ntc"], 1650)
+        self.assertEqual(decoded["anchor_residual"], -40)
+
+    def test_packet_rejects_wrong_calibration_id(self):
+        with self.assertRaises(AssertionError):
+            MODULE.validate_thermal_drift_model_packet(
+                self.packet(), 0x12345679
+            )
 
 
 if __name__ == "__main__":

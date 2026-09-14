@@ -18,6 +18,12 @@ option(
     OFF
 )
 
+option(
+    THERMAL_DRIFT_RUNTIME_ENABLE
+    "Enable runtime NTC mean and optional per-device thermal drift compensation"
+    ON
+)
+
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -190,6 +196,7 @@ add_executable(
     src/sdk.c
     src/main.c
     src/thermal_calibration_v1.c
+    src/thermal_drift_model.c
     src/thermal_ncm.c
     src/thermal_ota.c
     src/cmap/turbo.c
@@ -227,6 +234,7 @@ target_compile_definitions(
     PICO_STACK_SIZE=2048
     PICO_CORE1_STACK_SIZE=4096
     THERMAL_NCM_MODE=1
+    THERMAL_DRIFT_RUNTIME_ENABLE=$<BOOL:${THERMAL_DRIFT_RUNTIME_ENABLE}>
     PICO_TN160_VERSION=\"${PROJECT_VERSION}\"
 )
 

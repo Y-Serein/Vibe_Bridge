@@ -9,6 +9,8 @@
 #include "sdk.h"
 #include "thermal_ota.h"
 
+extern volatile uint16_t g_cur_ntc_adc;
+
 /* V1 reserves the first 8 KiB for headers. The legacy header occupies the
  * first 64 bytes of selector 0; selector 1 was previously unused.  New
  * records keep FlashDataInfo first, so selector 0 remains readable by an old
@@ -25,6 +27,8 @@
 #define CALIBRATION_NEW_RECORD_MARKER  0xa5u
 #define CALIBRATION_GAIN_MIN           0.2f
 #define CALIBRATION_GAIN_MAX           4.0f
+#define CALIBRATION_BASE_NTC_MAGIC0     0x4eu /* 'N' */
+#define CALIBRATION_BASE_NTC_MAGIC1     0x42u /* 'B' */
 
 enum calibration_slot {
     CALIBRATION_SLOT_NONE = 0,
@@ -154,6 +158,30 @@ static void write_le_float(uint8_t* data, float value)
 static bool calibration_ntc_adu_valid(uint16_t value)
 {
     return value > 8u && value < 4088u;
+}
+
+static void calibration_store_base_ntc(struct FlashDataInfo* flash)
+{
+    if (!flash || !calibration_ntc_adu_valid(g_cur_ntc_adc)) return;
+    flash->_pad1[0] = CALIBRATION_BASE_NTC_MAGIC0;
+    flash->_pad1[1] = CALIBRATION_BASE_NTC_MAGIC1;
+    flash->_pad1[2] = (uint8_t)g_cur_ntc_adc;
+    flash->_pad1[3] = (uint8_t)(g_cur_ntc_adc >> 8);
+}
+
+static bool calibration_base_ntc_read(const struct FlashDataInfo* flash,
+                                      uint16_t* value)
+{
+    if (!flash || !value
+        || flash->_pad1[0] != CALIBRATION_BASE_NTC_MAGIC0
+        || flash->_pad1[1] != CALIBRATION_BASE_NTC_MAGIC1) {
+        return false;
+    }
+    const uint16_t ntc = (uint16_t)flash->_pad1[2]
+                         | ((uint16_t)flash->_pad1[3] << 8);
+    if (!calibration_ntc_adu_valid(ntc)) return false;
+    *value = ntc;
+    return true;
 }
 
 static bool calibration_ntc_model_fields_valid(
@@ -543,6 +571,7 @@ static void calibration_make_flash_header(
     memset(flash, 0, sizeof(*flash));
     flash->has_data = FLASH_HAS_DATA_F;
     flash->_pad0[0] = CALIBRATION_NEW_RECORD_MARKER;
+    calibration_store_base_ntc(flash);
     flash->imgbg_ofs = slot->imgbg_offset;
     flash->imgbg_size = THERMAL_CALIBRATION_V1_IMAGE_BYTES;
     flash->badpts_ofs = slot->badpoints_offset;
@@ -866,6 +895,12 @@ bool thermal_calibration_v1_data(enum thermal_calibration_v1_data_kind kind,
 uint32_t thermal_calibration_v1_id(void)
 {
     return calibration.active_calibration_id;
+}
+
+bool thermal_calibration_v1_base_ntc_adu(uint16_t* value)
+{
+    return calibration.boot_has_calibration
+           && calibration_base_ntc_read(flash_header, value);
 }
 
 bool thermal_calibration_v1_ntc_model(

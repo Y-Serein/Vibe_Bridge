@@ -206,6 +206,10 @@ X-Sipeed-Request: 1
 | `GET` | `/api/v1/calibration/data/{id}` | 获取校准表二进制数据 |
 | `POST` | `/api/v1/calibration/v1` | TN160 工厂双点标定包写入；仅设备明确声明该能力时提供 |
 | `GET` | `/api/v1/calibration/v1/manifest` | TN160 工厂标定的只读状态、CRC 和数据 URL |
+| `POST` | `/api/v1/calibration/v1/thermal-model` | 可选 `T160DM2` 逐机 B 残差 anchor/gain 写入；需先有匹配的 V1 标定 |
+| `POST` | `/api/v1/calibration/v1/thermal-model/clear` | 以带 generation 的清除记录停用逐机 B 残差，保留 V1+四台均值 |
+| `GET` | `/api/v1/calibration/v1/thermal-model/manifest` | 逐机残差事务与 calibration ID 绑定状态 |
+| `GET` | `/api/v1/calibration/v1/thermal-model/state` | 当前均值保底、逐机残差、钳位及 gain 状态 |
 | `POST` | `/api/v1/ota` | 支持网页 OTA 时提供 |
 | `GET` | `/api/v1/ota/status` | 支持网页 OTA 时提供 |
 
@@ -1005,21 +1009,13 @@ calibration.format=tn160-calibration-v1 的固件。
 | 115264 | 10 | 五个 {y, x} 坏点，0xffff 为尾部终止项 |
 
 模型扩展必须为全零，或按 tag 满足对应的全部字段约束；不接受半初始化参数。旧
-`TN` 参数继续支持写入和回读，但不参与运行，`thermal_ntc_model_active` 固定为
-`false`。`TC` 仅为旧包兼容保留。`RR` 是当前逐机状态模型：每个通过场景帧门禁的
-完整帧计算120行参考的均值与跨度；当均值位于 `512..15872` 且跨度位于
-`1..2048` 时，运行时计算
-`row_ref_comp = clamp((row_ref_mean-row_ref_reference)×row_ref_k_q8/256,
-±row_ref_limit)`，并使用 `effective_anchor=base_anchor+row_ref_comp`。异常行参考不
-产生新控制量；已经取得过有效样本时保持最后一个有效补偿，否则 fail-open 到基础
-anchor。
-
-`RR` 有效时不叠加旧 `TC` 时间项或 NTC fallback，也不在 FFC 后重置参考点；FFC
-连续性预测的旧、新 anchor 使用同一个当前行参考补偿。无 `RR` 的基础 V1、`TN`、
-`TC` 包保持原有兼容行为及 `-0.20×ΔNTC` fallback。VTEMP 只保留为诊断字段，不
-参与逐帧补偿、模型门控或 FFC anchor。`/api/v1/diagnostics` 通过
-`thermal_row_ref_model_valid/active`、`thermal_row_ref_sample_valid`、模型参数及
-`thermal_row_ref_comp_adu` 提供写后和运行状态核对。
+`TN`、`TC`、`RR` 继续支持读取诊断，但不参与当前默认温度控制。基础 V1 成功写入、
+重启并全量回读后，只要 V1 保存的 `base_ntc_adu` 和当前 NTC 有效，设备自动启用四台
+均值 anchor（`K_Q8=290`，限幅 ±600 ADU）。可选 `T160DM2` 只保存单台 B 状态相对
+均值的 anchor/gain 残差，且必须绑定当前 V1 `calibration_id`；它不能改写 V1
+`mean_diff` 或把动态项写入 FFC 持久 anchor。没有逐机包、包失配、写入失败或 NTC
+无效时，设备保留 V1+均值；V1/NTC 基准无效时退回纯 V1。完整字段、Flash 事务与
+回退说明见 `docs/design/tn160_thermal_drift_model_v1.md`。
 
 设备必须拒绝长度、magic、固定尺寸、header CRC、段 CRC 或 payload CRC 不正确的包；
 还必须拒绝非法扩展模型、超出传感器 ADU 范围、非有限/不合理 gain、越界或
@@ -1049,6 +1045,26 @@ TN160 使用两个 payload 槽和两个 selector 页。新包先完整擦写到�
 
 完整 64-byte header 和三段数据都必须逐字节与待写入包一致。没有有效 V1 标定时，
 这些只读接口返回 404。
+
+逐机热模型单独以 `POST /api/v1/calibration/v1/thermal-model` 写入，不会改写 TNC1
+像素表。客户端必须比较写后 `GET /api/v1/calibration/v1/thermal-model` 的完整 64 bytes
+与上传包，并确认 `/thermal-model/manifest` 的 `calibration_id` 仍等于当前 V1 标定。
+只有匹配当前 V1、包 CRC 与 Flash 记录 CRC 均正确的 `T160DM2` 才允许作为第三层参与
+测温；无逐机模型、模型失配或 B 写入失败时设备保持 V1+均值，NTC 无效时退回纯 V1。
+NTC 超出 B 学习区间时使用最近端点并通过 `/thermal-model/state` 报告
+`ntc_clamped=true`，禁止无界外推。模型同时修正全局 anchor 和 V1 响应跨度；`TN`、
+`TC`、`RR`、启动时间和 VTEMP 不得与其叠加控制。
+`/api/v1/diagnostics` 中的 `normal_comp_adu`/`total_comp_adu` 表示当前已应用的 NTC
+anchor 修正（无逐机包时就是四台均值保底，有逐机包时是均值与 B 残差之和）；动态 gain
+由 `thermal_drift_model_gain_scale_q16` 单独表示，并同时提供
+`thermal_drift_model_active` 与 `thermal_drift_model_ntc_clamped`。完整模型记录状态仍以
+`/api/v1/calibration/v1/thermal-model/state` 为准。
+
+清除逐机 B 使用 `POST /api/v1/calibration/v1/thermal-model/clear`，请求头为
+`X-Sipeed-Request: 1`、`X-Sipeed-Thermal-Model-Confirm: clear-v2`，body 长度为 0。
+固件向非活动槽提交更高 generation 的 CRC 保护清除记录；只有擦写和回读全部验证通过
+才停用 B。清除中断或失败时原有效 B 继续运行；清除成功后状态必须为
+`valid=false, per_device=false, active=true, mean_active=true`，基础 V1 和四台均值不变。
 
 #### 11.5.3 访问边界
 

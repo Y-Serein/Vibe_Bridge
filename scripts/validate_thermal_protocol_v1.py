@@ -31,6 +31,17 @@ ROW_REF_REFERENCE_MIN = 512
 ROW_REF_REFERENCE_MAX = 15872
 ROW_REF_K_Q8_MAX = 512
 ROW_REF_LIMIT_MAX = 1500
+THERMAL_DRIFT_MODEL_ANCHOR_LIMIT_ADU = 800
+THERMAL_DRIFT_MODEL_GAIN_SCALE_MIN_Q16 = 55706
+THERMAL_DRIFT_MODEL_GAIN_SCALE_MAX_Q16 = 75366
+THERMAL_DRIFT_MODEL_BYTES = 64
+THERMAL_DRIFT_MODEL_MAGIC = b"T160DM2\0"
+THERMAL_DRIFT_MODEL_VERSION = 2
+THERMAL_DRIFT_MODEL_FLAG_GAIN = 0x0001
+THERMAL_DRIFT_MODEL_GAIN_Q16_LIMIT = 9830
+THERMAL_DRIFT_MEAN_K_Q8 = 290
+THERMAL_DRIFT_MEAN_LIMIT_ADU = 600
+THERMAL_DRIFT_MIN_NTC_SPAN_ADU = 32
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -147,6 +158,87 @@ def validate_row_ref_model_diagnostics(diagnostics):
         assert diagnostics.get("thermal_ntc_model_active", False) is False
         assert diagnostics["normal_comp_adu"] == comp_adu
     return active
+
+
+def validate_thermal_drift_model_diagnostics(diagnostics):
+    stored = bool(diagnostics.get("valid", False))
+    active = bool(diagnostics.get("active", False))
+    mean_active = bool(diagnostics.get("mean_active", False))
+    per_device = bool(diagnostics.get("per_device", False))
+    clamped = bool(diagnostics.get("ntc_clamped", False))
+    base_ntc = diagnostics.get("base_ntc_adu", 0)
+    ntc_min = diagnostics.get("ntc_min_adu", 0)
+    ntc_max = diagnostics.get("ntc_max_adu", 0)
+    anchor_comp = diagnostics.get("anchor_comp_adu", 0)
+    mean_comp = diagnostics.get("mean_anchor_comp_adu", 0)
+    device_comp = diagnostics.get("device_anchor_residual_adu", 0)
+    gain_delta = diagnostics.get("gain_delta_q16", 0)
+    gain_scale = diagnostics.get("gain_scale_q16", 65536)
+    assert per_device == stored
+    assert diagnostics.get("mean_k_q8") == THERMAL_DRIFT_MEAN_K_Q8
+    assert diagnostics.get("mean_limit_adu") == THERMAL_DRIFT_MEAN_LIMIT_ADU
+    assert not active or mean_active
+    assert not per_device or active
+    assert not mean_active or 8 < base_ntc < 4088
+    if stored:
+        assert 8 < ntc_min <= base_ntc <= ntc_max < 4088
+    else:
+        assert base_ntc == 0 or 8 < base_ntc < 4088
+        assert (ntc_min, ntc_max) == (0, 0)
+    if not active:
+        assert not mean_active
+        assert anchor_comp == 0
+        assert mean_comp == 0 and device_comp == 0
+        assert gain_delta == 0
+        assert gain_scale == 65536
+        return False
+    assert abs(anchor_comp) <= THERMAL_DRIFT_MODEL_ANCHOR_LIMIT_ADU
+    assert abs(mean_comp) <= THERMAL_DRIFT_MEAN_LIMIT_ADU
+    assert anchor_comp == mean_comp + device_comp
+    assert abs(gain_delta) <= THERMAL_DRIFT_MODEL_GAIN_Q16_LIMIT
+    assert gain_scale == 65536 + gain_delta
+    assert (THERMAL_DRIFT_MODEL_GAIN_SCALE_MIN_Q16 <= gain_scale
+            <= THERMAL_DRIFT_MODEL_GAIN_SCALE_MAX_Q16)
+    if clamped:
+        assert active
+    return True
+
+
+def validate_thermal_drift_model_packet(packet, calibration_id):
+    assert len(packet) == THERMAL_DRIFT_MODEL_BYTES
+    unpacked = struct.unpack("<8sHHIHHhhHhHH28sI", packet)
+    (magic, version, bytes_, packet_id, base_ntc, learned_ntc,
+     anchor_residual, gain_residual, flags, mean_k_q8,
+     mean_limit, anchor_limit, reserved, crc32) = unpacked
+    assert magic == THERMAL_DRIFT_MODEL_MAGIC
+    assert (version, bytes_) == (THERMAL_DRIFT_MODEL_VERSION,
+                                 THERMAL_DRIFT_MODEL_BYTES)
+    assert packet_id == calibration_id
+    assert flags == THERMAL_DRIFT_MODEL_FLAG_GAIN
+    assert mean_k_q8 == THERMAL_DRIFT_MEAN_K_Q8
+    assert mean_limit == THERMAL_DRIFT_MEAN_LIMIT_ADU
+    assert anchor_limit == THERMAL_DRIFT_MODEL_ANCHOR_LIMIT_ADU
+    assert reserved == b"\0" * 28
+    assert zlib.crc32(packet[:60]) == crc32
+    assert 8 < base_ntc < 4088
+    assert 8 < learned_ntc < 4088
+    assert abs(learned_ntc - base_ntc) >= THERMAL_DRIFT_MIN_NTC_SPAN_ADU
+    assert abs(anchor_residual) <= THERMAL_DRIFT_MODEL_ANCHOR_LIMIT_ADU
+    assert abs(gain_residual) <= THERMAL_DRIFT_MODEL_GAIN_Q16_LIMIT
+    mean_anchor = round((learned_ntc - base_ntc)
+                        * THERMAL_DRIFT_MEAN_K_Q8 / 256.0)
+    mean_anchor = max(-THERMAL_DRIFT_MEAN_LIMIT_ADU,
+                      min(THERMAL_DRIFT_MEAN_LIMIT_ADU, mean_anchor))
+    assert abs(mean_anchor + anchor_residual) \
+        <= THERMAL_DRIFT_MODEL_ANCHOR_LIMIT_ADU
+    return {
+        "calibration_id": packet_id,
+        "base_ntc": base_ntc,
+        "learned_ntc": learned_ntc,
+        "anchor_residual": anchor_residual,
+        "gain_residual": gain_residual,
+        "mean_anchor": mean_anchor,
+    }
 
 
 def request(base, path, method="GET", timeout=3):
@@ -298,6 +390,8 @@ def main():
     parser.add_argument("base", nargs="?", default="http://192.168.17.1")
     parser.add_argument("--require-calibration", action="store_true",
                         help="还要求存在有效 TNC1 标定并完整只读回检")
+    parser.add_argument("--require-thermal-model", action="store_true",
+                        help="还要求存在匹配当前 V1 的逐机残差模型")
     args = parser.parse_args()
     base = args.base.rstrip("/")
 
@@ -317,6 +411,15 @@ def main():
     assert device["calibration"]["format"] == "tn160-calibration-v1"
     assert device["calibration"]["packet_bytes"] == 115274
     assert device["diagnostics"]["supported"] is True
+    drift_model = device["thermal_drift_model"]
+    assert drift_model["supported"] is True
+    assert drift_model["format"] == "tn160-thermal-drift-model-v2"
+    assert drift_model["packet_bytes"] == 64
+    assert drift_model["mean_k_q8"] == THERMAL_DRIFT_MEAN_K_Q8
+    assert drift_model["clear"] == \
+        "/api/v1/calibration/v1/thermal-model/clear"
+    assert drift_model["state"] == \
+        "/api/v1/calibration/v1/thermal-model/state"
 
     network = get_json(base, "/api/v1/network")
     assert network["device_ip"] == f"192.168.{network['segment']}.1"
@@ -327,6 +430,8 @@ def main():
     validate_row_ref_model_diagnostics(diagnostics)
     validate_ntc_model_diagnostics(diagnostics)
     validate_startup_model_diagnostics(diagnostics)
+    drift_state = get_json(base, drift_model["state"])
+    validate_thermal_drift_model_diagnostics(drift_state)
     get_json(base, "/api/v1/ota/status")
 
     for path in ("/frame.temp8", "/stream.temp8"):
@@ -356,7 +461,21 @@ def main():
         adc_record[:ADC16_PAYLOAD_BYTES],
         adc_record[ADC16_PAYLOAD_BYTES:])
     calibration = (validate_calibration_v1(base)
-                   if args.require_calibration else None)
+                   if args.require_calibration or args.require_thermal_model
+                   else None)
+    thermal_model = None
+    if args.require_thermal_model:
+        assert calibration is not None
+        model_manifest = get_json(
+            base, "/api/v1/calibration/v1/thermal-model/manifest")
+        assert model_manifest["valid"] is True
+        assert model_manifest["per_device"] is True
+        assert model_manifest["calibration_id"] == calibration["calibration_id"]
+        assert model_manifest["packet_bytes"] == THERMAL_DRIFT_MODEL_BYTES
+        thermal_model = validate_thermal_drift_model_packet(
+            get_bytes(base, "/api/v1/calibration/v1/thermal-model"),
+            calibration["calibration_id"],
+        )
     print(json.dumps({
         "ok": True,
         "base": base,
@@ -370,6 +489,7 @@ def main():
         "adc16_record_bytes": len(adc_record),
         "calibration_id": (calibration["calibration_id"]
                            if calibration is not None else None),
+        "thermal_model": thermal_model,
     }, ensure_ascii=False, indent=2))
 
 

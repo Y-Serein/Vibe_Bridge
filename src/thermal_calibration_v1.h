@@ -21,8 +21,9 @@
 
 /* Optional tagged eight-byte extension inside TNC1 header bytes 52..59.
  * All-zero bytes retain the base V1 meaning.  Legacy "TN" remains readable
- * but inactive; "TC" is the retired startup-time model; "RR" carries the
- * per-device row-reference dynamic-anchor model. */
+ * but inactive; "TC" is the retired startup-time model; "RR" is retained
+ * for diagnostics only.  The production PWL thermal model is intentionally
+ * stored in its own CRC-bound record, not compressed into these eight bytes. */
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_TAG       0x4e54u /* "TN" */
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_K_Q8_MAX  8192
 #define THERMAL_CALIBRATION_V1_NTC_MODEL_LIMIT_MAX 1500u
@@ -143,6 +144,10 @@ bool thermal_calibration_v1_make_packet_header(
 bool thermal_calibration_v1_data(enum thermal_calibration_v1_data_kind kind,
                                  const uint8_t** data, uint32_t* bytes);
 uint32_t thermal_calibration_v1_id(void);
+/* NTC state observed while the active V1 transaction was committed.  New
+ * records store it in otherwise reserved FlashDataInfo bytes so a separately
+ * bound per-device model can identify the V1 calibration state. */
+bool thermal_calibration_v1_base_ntc_adu(uint16_t* value);
 bool thermal_calibration_v1_ntc_model(
     struct thermal_calibration_v1_ntc_model* model);
 bool thermal_calibration_v1_startup_model(

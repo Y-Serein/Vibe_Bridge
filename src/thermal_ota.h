@@ -49,6 +49,12 @@ int32_t thermal_ota_diag_result(void);
 bool thermal_ota_calibration_flash_erase(uint32_t relative_offset);
 bool thermal_ota_calibration_flash_program(uint32_t relative_offset,
                                            const uint8_t* page);
+/* Small post-calibration model records use the same Core0 SRAM flash
+ * rendezvous as V1 calibration, but are allowed only when neither OTA nor a
+ * V1 transaction is active. */
+bool thermal_ota_model_flash_erase(uint32_t relative_offset);
+bool thermal_ota_model_flash_program(uint32_t relative_offset,
+                                     const uint8_t* page);
 uint32_t thermal_flash_crc32_begin(void);
 uint32_t thermal_flash_crc32_update(uint32_t crc, const uint8_t* data,
                                     size_t bytes);
