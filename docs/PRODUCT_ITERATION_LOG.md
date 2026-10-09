@@ -1,5 +1,21 @@
 # 产品迭代日志
 
+## 2026-09-24 — 恢复 UART Thermal160 Camera 传输路径（待用户构建/上板）
+
+- 目标/用户现象：当前正式 NCM 固件仍保留旧 UART 代码，但 `THERMAL_NCM_MODE=1` 时没有启动 `ouart_init/uart_poll2`，MaixCAM2 `Thermal160 Camera` 无法收到图像和诊断。
+- 关键实现：默认 `pico2-release` 保留 NCM 并监听 UART；首个 NCM 帧请求锁定 NCM，首个有效 UART 命令（MaixCAM2 的 `0x44`）锁定 UART，同一上电会话不并行发送。另保留 `pico2-serial` 纯串口 preset。串口路径恢复 UART 2M→`0x44`→4M 握手、CALI_U8 帧发送和 NTC/VTEMP/FFC 诊断尾；Camera 解析器新增当前完整 70-byte 诊断尾兼容，同时保留 30/46/54-byte 旧格式；无 V1 标定时继续显示图像和诊断，绝对温度显示 `UNCALIBRATED`。
+- 验证结果：`main.c` 在 `THERMAL_NCM_MODE=0/1` 下 ARM `-fsyntax-only` 通过；Camera Python AST 语法检查通过；默认 Python 测试 71 项通过；未构建 UF2、未烧录、未上板。
+- 当前状态：源码候选完成；默认 `pico2-release` 是 NCM/UART 互斥双模式，`pico2-serial` 仅是无 USB 的纯串口 fallback；未构建 UF2、未烧录、未上板。
+- 风险/未验证平台：MaixCAM2 UART 引脚、2M/4M 握手、连续 160×120 帧、温度/诊断显示仍需真实硬件验证；NCM 默认路径未改变。
+
+## 2026-09-23 — Layer 2 启动/相对 NTC 基准候选（已撤回）
+
+- 目标/用户现象：2026-09-22 的 `V1+NTC+FFC dg` 已明显改善长时间漂移，但 2–60 s 仍有约 30–160 ADU 段内下降；2026-09-08 原始批次显示 FFC 间 `center_ADU/NTC` 斜率中位数约 2.62。
+- 关键实现：保留绝对 NTC 均值 `290/256` 和 accepted FFC `dg×1.0`；新增公共 Layer 2 `-300·t/(t+12s)` 启动项（70–150 s 或 NTC Δ 80–160 ADU 淡出）以及 `K_rel=666/256≈2.60` 的 `NTC_now−NTC_lastFFC` 项。绝对均值项改以 `NTC_lastFFC−NTC_base` 为参考，避免重复计算同一 NTC 变化；FFC 前后使用旧/新参考快照做连续性平移。未启用 B/gain、row_ref、VTEMP 或旧 TC 控制，不改 USB/NCM、Flash 格式和 FFC 采集基线。
+- 验证结果：基于 2026-09-08/09-22 CSV 完成离线参数估计；Python 全量测试 70 项通过；ARM Release 参数下 `main.c`、`thermal_drift_model.c` `-fsyntax-only` 通过；`git diff --check` 通过。
+- 当前状态：2026-09-23 两台日志显示该候选不能作为默认模型，已撤回到 `V1+绝对 NTC+FFC dg`；V1 span 只作为诊断变量，不阻塞 Layer 2。未经用户 CMake 构建、UF2、烧录和真机验证。
+- 风险/未验证平台：v1 的相对 NTC 项达到约 `-384 ADU`；v2 的 `mean_diff=539.5 ADU`、`t_low≈50°C/t_high≈75°C` 暴露 V1 span 异常，不能靠 Layer 2 调参修复。后续必须先做 V1 标定质量门禁，再单独辨识启动项。
+
 ## 2026-09-14 — 保留 NTC 均值并加入有界 FFC 全局漂移候选（待用户构建）
 
 - 目标/用户现象：固定目标下 V1-only 与 V1+NTC 均存在设备自身热漂移；最新日志显示 NTC 可抵消部分漂移，剩余误差与已接受 FFC 的全局 `dg` 累积相关。

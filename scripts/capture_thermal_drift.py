@@ -48,6 +48,15 @@ REQUIRED_FIELDS = (
     "thermal_drift_model_active",
     "thermal_drift_model_ntc_clamped",
     "thermal_drift_model_gain_scale_q16",
+    "thermal_radiometry_available",
+    "thermal_radiometry_active",
+    "thermal_radiometry_clamped",
+    "thermal_radiometry_axis_adu",
+    "thermal_radiometry_index",
+    "thermal_radiometry_kt_q14",
+    "thermal_radiometry_bt_adu",
+    "thermal_radiometry_corrected_nuc",
+    "thermal_radiometry_temperature_kelvin_x16",
 )
 
 
@@ -114,6 +123,24 @@ def make_row(diagnostics, elapsed_seconds):
             diagnostics["thermal_drift_model_ntc_clamped"],
         "thermal_drift_model_gain_scale_q16":
             diagnostics["thermal_drift_model_gain_scale_q16"],
+        "thermal_radiometry_available":
+            diagnostics["thermal_radiometry_available"],
+        "thermal_radiometry_active":
+            diagnostics["thermal_radiometry_active"],
+        "thermal_radiometry_clamped":
+            diagnostics["thermal_radiometry_clamped"],
+        "thermal_radiometry_axis_adu":
+            diagnostics["thermal_radiometry_axis_adu"],
+        "thermal_radiometry_index":
+            diagnostics["thermal_radiometry_index"],
+        "thermal_radiometry_kt_q14":
+            diagnostics["thermal_radiometry_kt_q14"],
+        "thermal_radiometry_bt_adu":
+            diagnostics["thermal_radiometry_bt_adu"],
+        "thermal_radiometry_corrected_nuc":
+            diagnostics["thermal_radiometry_corrected_nuc"],
+        "thermal_radiometry_temperature_kelvin_x16":
+            diagnostics["thermal_radiometry_temperature_kelvin_x16"],
     }
 
 

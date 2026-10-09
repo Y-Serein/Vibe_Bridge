@@ -23,6 +23,7 @@
 #include "init.h"
 #include "thermal_calibration_v1.h"
 #include "thermal_drift_model.h"
+#include "thermal_radiometry_runtime.h"
 #include "thermal_ota.h"
 #include "web_assets.h"
 
@@ -1231,7 +1232,16 @@ static void prepare_response(struct http_client* client)
                 "\"thermal_row_ref_comp_adu\":%d,"
                 "\"thermal_drift_model_active\":%u,"
                 "\"thermal_drift_model_ntc_clamped\":%u,"
-                "\"thermal_drift_model_gain_scale_q16\":%ld}\n",
+                "\"thermal_drift_model_gain_scale_q16\":%ld,"
+                "\"thermal_radiometry_available\":%u,"
+                "\"thermal_radiometry_active\":%u,"
+                "\"thermal_radiometry_clamped\":%u,"
+                "\"thermal_radiometry_axis_adu\":%u,"
+                "\"thermal_radiometry_index\":%u,"
+                "\"thermal_radiometry_kt_q14\":%u,"
+                "\"thermal_radiometry_bt_adu\":%d,"
+                "\"thermal_radiometry_corrected_nuc\":%u,"
+                "\"thermal_radiometry_temperature_kelvin_x16\":%u}\n",
                 (unsigned long)diagnostics.frame_number,
                 (unsigned long)diagnostics.timestamp_ms,
                 (unsigned)diagnostics.vtemp_adu,
@@ -1294,7 +1304,16 @@ static void prepare_response(struct http_client* client)
                 (int)diagnostics.thermal_row_ref_comp_adu,
                 (unsigned)g_thermal_drift_model_active,
                 (unsigned)g_thermal_drift_model_ntc_clamped,
-                (long)g_thermal_drift_model_gain_scale_q16);
+                (long)g_thermal_drift_model_gain_scale_q16,
+                (unsigned)g_thermal_radiometry_available,
+                (unsigned)g_thermal_radiometry_active,
+                (unsigned)g_thermal_radiometry_clamped,
+                (unsigned)g_thermal_radiometry_axis_adu,
+                (unsigned)g_thermal_radiometry_index,
+                (unsigned)g_thermal_radiometry_kt_q14,
+                (int)g_thermal_radiometry_bt_adu,
+                (unsigned)g_thermal_radiometry_corrected_nuc,
+                (unsigned)g_thermal_radiometry_temperature_kelvin_x16);
             client->flash_data = (const uint8_t*)client->request;
             client->body_length = body_len > 0 ? (uint32_t)body_len : 0;
         } else {

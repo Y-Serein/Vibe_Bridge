@@ -7,76 +7,97 @@ description: Diagnose and close pico_tn160/TN160/PT160 thermal drift, startup pa
 
 Drive the thermal path toward stability, accuracy, and cross-board transfer without regressing UVC, FFC, calibration storage, or MaixCam2. Hardware feedback is primary evidence. User hardware time is expensive: do not ask for a firmware test unless the candidate has a numerical prediction and a result that can falsify it.
 
-## Current product override — 2026-09-14 three-layer candidate and rollback contract
+## Current product override — 2026-09-15 NTC + accepted-FFC-dg main controller
 
 This section supersedes every older “current override” below if there is any
-conflict. The old entries remain as failure evidence only. Read `HANDOFF.md`
-and `C_context/MEMORY.md` for live source/data identity before making a change.
+conflict. Read `HANDOFF.md` and `C_context/MEMORY.md`; use the latest Scope
+CSV/PNG under `/home/slam/Sipeed/docs/pcio_tn160/logs` before proposing work.
 
-### Product goal and non-negotiable control semantics
+### Product goal and frozen main control law
 
-- The goal is **both** absolute 0–50°C accuracy and dynamic stability. A fixed
-  50°C curve, training replay, valid CRC, successful build or active flag is not
-  a product pass by itself.
-- The current controller is explicitly three layers:
-
-  ```text
-  V1 baseline → four-board mean NTC anchor → optional per-device B residual
-  ```
-
-- The four-board mean is the safety fallback, compiled as `K_Q8=290`
-  (`1.1328125 ADU/NTC`) and clamped to ±600 ADU. After V1 write, reboot and
-  full readback, valid `base_ntc_adu` enables `mean_active=1` even without B.
-- The 64-byte `T160DM2` record is bound to the exact V1 `calibration_id` and
-  adds one B endpoint for anchor and one for 0–50°C response gain. It corrects
-  a later thermal-state residual; it is **not** a proven first-minute startup
-  time model. Do not describe it as solving startup drift without an on/off
-  cold-start measurement.
-- Missing, invalid, V1-mismatched or NTC-unavailable B leaves `V1+mean` when
-  the V1 base NTC is valid; invalid V1/base NTC falls back to pure V1. Outside
-  the B interval clamp to the nearest endpoint and report the clamp.
-- FFC continuity uses one model snapshot on both sides; no dynamic correction
-  is persisted into the FFC base anchor.
-
-### Per-device record, clear tombstone and production inputs
-
-- `T160DM2` fields are `calibration_id`, `base_ntc_adu`, `learned_ntc_adu`, one
-  `anchor_residual_adu`, one `gain_residual_q16`, mean contract, limits and CRC.
-  Do not restore the retired five-free-node format.
-- Low/high samples crossing FFC must be aligned before gain fitting:
+- The goal remains **both** dynamic stability and 0–50°C absolute accuracy.
+  Do not call a fixed-temperature curve, a valid CRC, a successful build, or a
+  B packet a product pass.
+- The confirmed fixed-target diagnosis is device-chain global drift. Do not
+  repeat the “is the target moving?” investigation unless the user explicitly
+  says the setup changed.
+- The current main controller is:
 
   ```text
-  D(N) = [H(N) - A_FFC_high(N)] - [L(N) - A_FFC_low(N)]
+  A_eff = A_FFC
+        + clamp((NTC_current - NTC_base) × 290 / 256, ±600 ADU)
+        + clamp(sum(accepted FFC dg) × 256 / 256, ±600 ADU)
+  D_eff = D_V1
   ```
 
-  Raw cross-FFC `H-L` is not gain. A single 50°C trace can observe only `H(N)`
-  and cannot create a complete B gain model.
-- B write uses two rotating Flash sectors. After RP2350 `FLASH_OP`, explicitly
-  flush XIP cache, verify record CRC/generation/full bytes, and retry the same
-  inactive slot at most once. Never erase the active fallback first.
-- Clearing B uses `POST /api/v1/calibration/v1/thermal-model/clear` with
-  `clear-v2` and a higher-generation `flags=0x0002` tombstone. Success must
-  read back `valid=0, per_device=0, active=1, mean_active=1`; V1 is untouched.
-- If a B POST or GET fails, read packet/manifest/state before deciding whether
-  the new write failed, an old B remains active, or only V1+mean is running.
+- `K_Q8=290` is the four-board batch mean and must remain enabled. The
+  2026-09-23 startup/relative-NTC candidate is rejected; do not add a second
+  NTC slope until a new paired dataset proves it independently. V1-only
+  hardware data was worse, so do not remove NTC or rename another path as an
+  NTC replacement.
+- V1 `mean_diff`, `t_low_c` and `t_high_c` remain mandatory diagnostics for
+  separating bad V1 span from thermal drift, but they are not a runtime block;
+  product qualification and model fitting decide whether a unit is accepted.
+- `FFC dg` is measured with the shutter closed, and is therefore a scene-
+  isolated global offset observation. Accumulate it only after an accepted FFC;
+  rejected/failed FFC must not modify it. Apply a bounded value and use the old
+  and new snapshots in the FFC continuity prediction. Never persist it into
+  V1/FFC base anchor.
+- Do not use `row_ref`, VTEMP, the retired TC packet/boot gate, TABLE, or the
+  rejected startup/relative-NTC candidate as runtime thermal control. Row
+  reference remains scene-correlated diagnostics only.
 
-### Evidence gate, validation and stop condition
+### 2026-09-23 Layer 2 startup/body candidate (rejected)
 
-- Before changing the controller, classify the error: absolute error, continuous
-  drift, persistent FFC change, transient FFC, startup-window miss,
-  target movement, or state/clamp miss. Unknown room/hand scenes are not
-  absolute-temperature evidence.
-- Reject mixed V1 `mean_diff` identities. If warming and cooling at the same
-  NTC differ by more than the 50°C equivalent of 0.5°C at three common codes,
-  stop the one-state model and request a second physical observable.
-- Minimal qualification: fixed 50°C cold start for 180 s, fixed 0°C for 30 s,
-  known normal-temperature target, and B on/off comparison. Require final 8 s
-  endpoint error <=1°C, 50°C start-to-end <=0.5°C, P5–P95 <=1.5°C and no
-  unexplained sustained clamp.
-- The user owns firmware builds, UF2 creation, flashing and hardware tests.
-  Do not run them without precise current-turn authorization. Preserve Scope
-  UI, USB/NCM, Flash layout, GPIO/PIO/DMA and FFC contracts unless separately
-  approved.
+The 2026-09-08 raw batch and 2026-09-22 `V1+NTC+FFC dg` traces support one
+bounded public Layer 2 candidate. This supersedes the blanket prohibition on
+every startup-time term, but does not restore the retired TC packet, boot
+gate, TABLE, or row-reference controller:
+
+```text
+A_layer2 = warmup(t, boot_ntc)
+          + 666/256 × (NTC_now - NTC_lastFFC)
+          + 290/256 × (NTC_lastFFC - NTC_base)
+          + 256/256 × sum(accepted FFC dg)
+```
+
+`warmup=-300*t/(t+12s)`, faded over 70–150 s or NTC Δ 80–160 ADU. The
+absolute 290/256 term is evaluated at the last accepted FFC reference and the
+666/256 term only covers the delta since that FFC, so the same NTC movement is
+not applied twice. 2026-09-23 logs showed over-compensation and a separate V1
+span failure (`mean_diff=539.5 ADU`), so this candidate is rejected and the
+source has returned to `V1 + 290/256 absolute NTC + accepted-FFC-dg`. Do not
+revive it by tuning constants until V1 quality gates and a new paired dataset
+separate span error from startup offset.
+
+### B is no longer the main drift solution
+
+- `T160DM2` B is **suspended** for dynamic/startup drift. Do not ask for B
+  training, upload, clear, Scope workflow changes, or B on/off tests while the
+  main NTC+FFC-dg controller is being qualified.
+- B has one remaining potential use: after the main controller is dynamically
+  stable, correct a repeatable single-device absolute anchor residual and/or
+  0–50°C response-span gain residual using same-V1 paired low/high evidence.
+- A single high-temperature/startup trace cannot identify gain. If B is
+  revisited, require paired 0°C/known-normal/50°C evidence, declare its exact
+  residual formula, and obtain explicit user approval for any product-flow or
+  Flash/UI change.
+- Retain existing B double-slot, CRC, XIP-flush and tombstone implementation as
+  optional infrastructure; do not restore the retired five-node model.
+
+### Evidence gate and reporting discipline
+
+- Start from existing logs. Analyze `center_roi_adu`, NTC, accepted `nuc_dg`,
+  anchor/effective anchor and FFC transitions before proposing another capture.
+  Do not consume user hardware time by repeating settled baseline checks.
+- Distinguish the model structure from qualification: the current law corrects
+  global anchor only; it does not prove a thermally invariant gain/span.
+- For a coefficient change, give the physical observable, formula, replay
+  prediction, fail condition, rollback and one bounded hardware check. Do not
+  blindly sweep K values.
+- The user owns builds, UF2 creation, flashing and hardware tests. Preserve
+  Scope UI, USB/NCM, Flash layout, GPIO/PIO/DMA and FFC contracts unless
+  separately approved.
 
 ## Historical 2026-09-07 architecture reset (superseded where conflicting)
 
@@ -353,6 +374,28 @@ Type-C UVC and UART/MaixCam2 share `binary_calib_frame()`, so implement compensa
 - Different power/installation thermal environment.
 
 After Maix cross-board validation, run one representative Type-C UVC and thermal-environment regression. A generic UVC stream does not provide the Maix diagnostic CSV.
+
+## UART/NCM transport regression gate (2026-09-24)
+
+- The default `pico2-release` may mirror the processed frame to USB CDC-NCM and
+  UART at the same time. MaixCAM2 uses `/dev/ttyS2`, starts at 2 Mbaud, sends
+  `0x44`, then changes to 4 Mbaud; the UART frame includes the full 70-byte
+  diagnostic tail.
+- `DOM_UVC` and `DOM_NCM` currently share an enum value. Never use the runtime
+  test `dataomode == DOM_UVC` to decide whether a UART command is allowed in a
+  NCM build: that drops MaixCAM2's `0x44`, leaves the firmware at 2 Mbaud, and
+  makes the host's 4 Mbaud parser see no valid frame. Gate UVC-only filtering
+  with the compile-time `THERMAL_NCM_MODE` (or change the enum only with a
+  separate compatibility review).
+- When MaixCAM2 reports "initialized but no frame", use this order: verify the
+  actual Linux port from the log; trace host command bytes; confirm
+  `uart_poll2()` consumes the command; confirm both sides switch baud; then
+  inspect DMA queue/parser alignment. Do not first blame device time, ZIP
+  copies, or a different `/dev/ttyS*` path after the log has disproved them.
+- A transport fix must not alter the thermal law, NCM descriptor, HTTP v1,
+  Flash layout, FFC, PIO, or DMA contracts beyond the UART command path. Mark
+  UART hardware feedback as real-device evidence, but still run the NCM
+  regression separately.
 
 ## Preserve safety and compatibility
 

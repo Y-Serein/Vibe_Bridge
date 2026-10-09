@@ -13,12 +13,30 @@
         "PICO_SDK_PATH": "${sourceDir}/tools/pico-sdk-2.2.0",
         "PICO_LWIP_PATH": "${sourceDir}/tools/lwip"
       }
+    },
+    {
+      "name": "pico2-serial",
+      "displayName": "TN160 RP2350 UART Thermal Camera",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-serial",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/tools/pico-sdk-2.2.0/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake",
+        "PICO_BOARD": "pico2",
+        "PICO_SDK_PATH": "${sourceDir}/tools/pico-sdk-2.2.0",
+        "PICO_LWIP_PATH": "${sourceDir}/tools/lwip",
+        "THERMAL_NCM_MODE": "OFF"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "pico2-release",
       "configurePreset": "pico2-release"
+    },
+    {
+      "name": "pico2-serial",
+      "configurePreset": "pico2-serial"
     }
   ]
 }

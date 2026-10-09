@@ -39,6 +39,13 @@
 - 可随便重构的实验项目：很多参数来自硬件验证，不能凭经验改。
 - 只看单一主机系统的 USB 项目：Windows、Linux、Android/iOS 的 NCM 枚举和 HTTP 可达性都是当前基线的一部分。
 
+### 文档与日志默认位置
+
+- 本项目主要文档、日志、图片和现场资料的默认根目录是 `/home/slam/Sipeed/wsl/pcio_tn160/docs/`，对应用户侧路径 `Sipeed\wsl\pcio_tn160\docs`。
+- 用户明确给出 `Sipeed\wsl\pcio_tn160\docs\...`、提到该目录下的文件，或只说 `logs.txt`、最新日志、图片、看图时，优先从该外部文档根目录定位。
+- 不得把明确的外部文档路径替换成当前仓库 `/home/slam/dev/pico_tn160/docs/` 下的同名文件；目标不存在时报告真实缺失，不静默读取另一份同名文件。
+- 当前仓库 `docs/` 只用于仓库内已有或明确指定的版本化工程文档。源码搜索、编辑和构建仍在 `/home/slam/dev/pico_tn160` 进行；外部文档默认只读，除非用户明确要求修改。
+
 ---
 
 ## 2. 常用命令
@@ -305,3 +312,13 @@ NCM 当前最小真机校验使用 `python3 scripts/validate_thermal_protocol_v1
 - 涉及 GPIO/ADC/NTC/AVDD 时，不要只从软件角度判断；硬件连线和供电问题可能是根因。
 - 涉及电源、MOS、充电、OTG、过流、发热时，不要只从软件角度判断，必须提示可能存在硬件风险。
 - 无法实测硬件时，明确标注“未上板验证”。
+
+## 12. TN160 Scope 采集入口（永久约定）
+
+- `/home/slam/Project/yserein-scope` 的 `src/plugins/tn160_ncm/ProductionCalibrationPage` 是 TN160 研发/产测采集的默认入口，优先复用现有 Scope 组件，不另起一套 UI 或手工脚本流程。
+- 现有采集槽位已经固定：`captureLow()`、`captureHigh()`、`captureHighB()`、`captureOffset()`；对应 `low/high/high_b/offset` 归档及 manifest、acceptance、monitor 数据。
+- 研发 Family characterization 复用这四个槽位：A1=0°C、A2=50°C、B1=升高机芯热状态后的 50°C、B2=热状态下的 0°C。它是研发采集，不等于量产步骤。
+- State B 的等待边界固定为：State A 参考建立后最多 180 秒；在 180 秒内 `|ΔNTC| >= 32 ADU` 时立即放行 `captureHighB()`；超过 180 秒仍未达到 32 ADU 时保持未就绪，不继续无限等待，也不自动放行。
+- 量产仍遵守已确认的短流程；不得因为 Family/KT/BT/NUC-T 研发需要，把四状态采集强加到每台量产设备。
+- `scripts/capture_tn160_family_characterization.py` 和 `scripts/capture_thermal_drift.py` 仅是无 Scope、自动化回放或底层排障备用入口；给用户操作步骤时，默认先写 Scope 页面路径和现有按钮，不要求用户复制脚本命令。
+- Scope 工作树有用户既有改动，禁止 reset/restore/clean；本仓库修改温漂模型时不得顺手改 Scope UI、宿主 ABI 或组件状态机，除非用户另行授权。

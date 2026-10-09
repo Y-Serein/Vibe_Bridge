@@ -6,6 +6,9 @@ get_filename_component(prj_name ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(pico_sdk_import)
 
+set(THERMAL_RADIOMETRY_GENERATED_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/thermal_radiometry_profile_generated.c")
+
 project(
     ${prj_name}
     VERSION 0.1.0
@@ -23,6 +26,19 @@ option(
     "Enable runtime NTC mean and optional per-device thermal drift compensation"
     ON
 )
+
+option(
+    THERMAL_NCM_MODE
+    "Build the USB CDC-NCM transport path; OFF restores the UART thermal-frame path"
+    ON
+)
+
+option(
+    THERMAL_UART_OUTPUT_ENABLE
+    "Mirror processed frames to UART while the selected transport is running"
+    ON
+)
+
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -197,6 +213,9 @@ add_executable(
     src/main.c
     src/thermal_calibration_v1.c
     src/thermal_drift_model.c
+    src/thermal_radiometry.c
+    src/thermal_radiometry_runtime.c
+    src/thermal_radiometry_profile_empty.c
     src/thermal_ncm.c
     src/thermal_ota.c
     src/cmap/turbo.c
@@ -211,6 +230,10 @@ add_executable(
     ${THERMAL_TINYUSB_NCM_OVERLAY}/lib/networking/dhserver.c
     src/dnserver.c
 )
+if(EXISTS "${THERMAL_RADIOMETRY_GENERATED_SOURCE}")
+    target_sources(${PROJECT_NAME} PRIVATE
+        "${THERMAL_RADIOMETRY_GENERATED_SOURCE}")
+endif()
 target_link_options(
     ${PROJECT_NAME} PRIVATE
     "LINKER:--script=${CMAKE_CURRENT_SOURCE_DIR}/pico_flash_region_custom.ld"
@@ -233,7 +256,8 @@ target_compile_definitions(
     PICO_FLASH_SIZE_BYTES=2097152
     PICO_STACK_SIZE=2048
     PICO_CORE1_STACK_SIZE=4096
-    THERMAL_NCM_MODE=1
+    THERMAL_NCM_MODE=$<BOOL:${THERMAL_NCM_MODE}>
+    THERMAL_UART_OUTPUT_ENABLE=$<BOOL:${THERMAL_UART_OUTPUT_ENABLE}>
     THERMAL_DRIFT_RUNTIME_ENABLE=$<BOOL:${THERMAL_DRIFT_RUNTIME_ENABLE}>
     PICO_TN160_VERSION=\"${PROJECT_VERSION}\"
 )

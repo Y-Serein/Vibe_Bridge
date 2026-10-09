@@ -40,6 +40,7 @@
 #include "thermal_ncm.h"
 #include "thermal_calibration_v1.h"
 #include "thermal_drift_model.h"
+#include "thermal_radiometry_runtime.h"
 #include "thermal_ota.h"
 #include "usb_descriptors.h"
 
@@ -755,6 +756,15 @@ enum FfcEventDecision : uint8_t {
  * Total frame bytes sent in CALI_U8 mode: PX_CNT + 7 + FRAME_DIAG_TAIL. */
 #define FRAME_DIAG_TAIL     64
 
+#if THERMAL_UART_OUTPUT_ENABLE
+#define UART_SERIAL_FRAME_BYTES (PX_CNT + 7u + FRAME_DIAG_TAIL)
+static uint8_t uart_serial_frame[UART_SERIAL_FRAME_BYTES]
+    __attribute__((aligned(4)));
+static volatile bool uart_serial_frame_pending = false;
+static volatile bool uart_serial_dma_active = false;
+#endif
+
+
 /* VTEMP EMA smoother (x256 fixed-point) retained for diagnostics only. */
 static volatile uint32_t g_vtemp_smooth_x256 = 0;
 
@@ -1101,6 +1111,24 @@ static int16_t temp_x10_from_corrected_adu(
         return INT16_MAX;
     }
     return (int16_t)x10;
+}
+
+static int16_t temp_x10_from_kelvin_x16(uint16_t kelvin_x16)
+{
+    const float celsius = (float)kelvin_x16 / 16.0f - 273.15f;
+    const int32_t x10 = (int32_t)roundf(celsius * 10.0f);
+    if (x10 < INT16_MIN) return INT16_MIN;
+    if (x10 > INT16_MAX) return INT16_MAX;
+    return (int16_t)x10;
+}
+
+static uint16_t thermal_radiometry_signal_adu(
+    uint16_t adu, int32_t base_anchor)
+{
+    const int32_t signal = (int32_t)adu - base_anchor;
+    if (signal <= 0) return 0u;
+    if (signal >= 16383) return 16383u;
+    return (uint16_t)signal;
 }
 
 static void ffc_continuity_capture_reference(const uint8_t* raw)
@@ -2965,12 +2993,14 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
     float t_lo_c_f = 0.0f, t_hi_c_f = 0.0f;
     bool temp_map_ok = false;
     int32_t eff_anchor = ram_temp_anchor;
-    int32_t startup_comp_i32 = 0;
+    const int32_t startup_comp_i32 = 0;
     int32_t normal_comp_i32 = 0;
     const struct thermal_drift_model_runtime drift_model =
         thermal_drift_model_evaluate(g_cur_ntc_adc);
-    /* RR, TC and VTEMP stay diagnostic-only.  A matching per-device model
-     * adjusts both the absolute low endpoint and the 0-to-50 C response. */
+    /* RR, legacy TC metadata, startup-time candidates and VTEMP stay
+     * diagnostic-only.  The safe Layer 2 baseline is the absolute NTC mean
+     * plus accepted-FFC dg; a matching per-device model may additionally
+     * adjust the absolute low endpoint and 0-to-50 C response. */
     (void)thermal_scene_row_ref_comp_for(g_thermal_row_ref_mean_adu,
                                          g_thermal_row_ref_span_adu,
                                          center_roi_adu);
@@ -3006,22 +3036,77 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
         temp_map_ok = true;
     }
 
-    const int16_t center_raw_x10 =
+    int16_t center_raw_x10 =
         temp_map_ok ? temp_x10_from_corrected_adu(center_raw_adu, eff_anchor,
                                                    effective_mean_diff)
                     : INT16_MAX;
-    const int16_t center_roi_x10 =
+    int16_t center_roi_x10 =
         temp_map_ok ? temp_x10_from_corrected_adu(center_roi_adu, eff_anchor,
                                                    effective_mean_diff)
                     : INT16_MAX;
-    const int16_t scene_min_x10 =
+    int16_t scene_min_x10 =
         temp_map_ok ? temp_x10_from_corrected_adu(scene_min_adu, eff_anchor,
                                                    effective_mean_diff)
                     : INT16_MAX;
-    const int16_t scene_max_x10 =
+    int16_t scene_max_x10 =
         temp_map_ok ? temp_x10_from_corrected_adu(scene_max_adu, eff_anchor,
                                                    effective_mean_diff)
                     : INT16_MAX;
+
+    /* A validated TN160 radiometry profile supersedes the empirical T^4
+     * mapping for temperature fields, while V1/FFC still own the image
+     * domain.  The profile is optional: an absent or mismatched profile
+     * leaves the existing V1 + thermal-drift fallback untouched. */
+    struct thermal_radiometry_result radiometry_raw = {};
+    struct thermal_radiometry_result radiometry_center = {};
+    struct thermal_radiometry_result radiometry_min = {};
+    struct thermal_radiometry_result radiometry_max = {};
+    const uint32_t radiometry_calibration_id =
+        thermal_calibration_v1_id();
+    const bool radiometry_frame_ok =
+        thermal_radiometry_runtime_apply(
+            thermal_radiometry_signal_adu(center_raw_adu, eff_anchor),
+            g_cur_ntc_adc, cur_vtemp, 0u,
+            radiometry_calibration_id,
+            g_ffc_state == SIPEED_FFC_STATE_IDLE
+                && g_shutter_state == SIPEED_SHUTTER_STATE_OPEN,
+            &radiometry_raw)
+        && thermal_radiometry_runtime_apply(
+            thermal_radiometry_signal_adu(center_roi_adu, eff_anchor),
+            g_cur_ntc_adc, cur_vtemp, 0u,
+            radiometry_calibration_id,
+            g_ffc_state == SIPEED_FFC_STATE_IDLE
+                && g_shutter_state == SIPEED_SHUTTER_STATE_OPEN,
+            &radiometry_center)
+        && thermal_radiometry_runtime_apply(
+            thermal_radiometry_signal_adu(scene_min_adu, eff_anchor),
+            g_cur_ntc_adc, cur_vtemp, 0u,
+            radiometry_calibration_id,
+            g_ffc_state == SIPEED_FFC_STATE_IDLE
+                && g_shutter_state == SIPEED_SHUTTER_STATE_OPEN,
+            &radiometry_min)
+        && thermal_radiometry_runtime_apply(
+            thermal_radiometry_signal_adu(scene_max_adu, eff_anchor),
+            g_cur_ntc_adc, cur_vtemp, 0u,
+            radiometry_calibration_id,
+            g_ffc_state == SIPEED_FFC_STATE_IDLE
+                && g_shutter_state == SIPEED_SHUTTER_STATE_OPEN,
+            &radiometry_max);
+    if (radiometry_frame_ok) {
+        center_raw_x10 = temp_x10_from_kelvin_x16(
+            radiometry_raw.temperature_kelvin_x16);
+        center_roi_x10 = temp_x10_from_kelvin_x16(
+            radiometry_center.temperature_kelvin_x16);
+        scene_min_x10 = temp_x10_from_kelvin_x16(
+            radiometry_min.temperature_kelvin_x16);
+        scene_max_x10 = temp_x10_from_kelvin_x16(
+            radiometry_max.temperature_kelvin_x16);
+        t_lo_x10 = scene_min_x10;
+        t_hi_x10 = scene_max_x10;
+        t_lo_c_f = (float)t_lo_x10 / 10.0f;
+        t_hi_c_f = (float)t_hi_x10 / 10.0f;
+        temp_map_ok = t_hi_x10 > t_lo_x10;
+    }
 
     /* Per-frame temperature-linear LUT: map the ADU-linear intensity 0..254
      * (which is linear in radiance within the scene window) to an output that
@@ -3029,7 +3114,35 @@ static inline __attribute__((always_inline)) void binary_calib_frame(
      * gamma=0.6 LUT. Falls back to identity when no temperature mapping. */
     {
         const float t_span_c = t_hi_c_f - t_lo_c_f;
-        if (temp_map_ok && t_span_c > 0.01f) {
+        if (radiometry_frame_ok && t_span_c > 0.01f) {
+            const float inv_span = 254.0f / t_span_c;
+            const uint32_t range = g_smooth_high > g_smooth_low
+                ? (uint32_t)g_smooth_high - g_smooth_low : 1u;
+            for (int i = 0; i < 256; ++i) {
+                const uint16_t adu = (uint16_t)(
+                    (uint32_t)g_smooth_low
+                    + ((uint32_t)i * range + 127u) / 254u);
+                struct thermal_radiometry_result mapped = {};
+                const bool mapped_ok = thermal_radiometry_runtime_apply(
+                    thermal_radiometry_signal_adu(adu, eff_anchor),
+                    g_cur_ntc_adc, cur_vtemp, 0u,
+                    radiometry_calibration_id,
+                    g_ffc_state == SIPEED_FFC_STATE_IDLE
+                        && g_shutter_state == SIPEED_SHUTTER_STATE_OPEN,
+                    &mapped);
+                if (!mapped_ok) {
+                    gamma_lut[i] = (uint8_t)(i > 254 ? 254 : i);
+                    continue;
+                }
+                const float mapped_c =
+                    (float)temp_x10_from_kelvin_x16(
+                        mapped.temperature_kelvin_x16) / 10.0f;
+                float output = (mapped_c - t_lo_c_f) * inv_span;
+                if (output < 0.0f) output = 0.0f;
+                if (output > 254.0f) output = 254.0f;
+                gamma_lut[i] = (uint8_t)output;
+            }
+        } else if (temp_map_ok && t_span_c > 0.01f) {
             const float t_lo_k = t_lo_c_f + 273.15f;
             const float t_hi_k = t_hi_c_f + 273.15f;
             const float lo_K4 = t_lo_k * t_lo_k * t_lo_k * t_lo_k;
@@ -3279,6 +3392,16 @@ static inline __attribute__((always_inline)) void try_start_dma()
         return;
     }
 
+#if THERMAL_NCM_MODE && THERMAL_UART_OUTPUT_ENABLE
+    if (!uart_serial_frame_pending) {
+        return;
+    }
+    uart_serial_frame_pending = false;
+    uart_serial_dma_active = true;
+    uart_tx_dma_start(uart_serial_frame, UART_SERIAL_FRAME_BYTES);
+    return;
+#endif
+
     const int b = newest_ready;
     if (b < 0) {
         return;
@@ -3309,13 +3432,41 @@ void __isr dma_irq1_handler()
 {
     dma_hw->ints1 = 1u << uart_tx_dma_chan;
 
+#if THERMAL_NCM_MODE && THERMAL_UART_OUTPUT_ENABLE
+    if (uart_serial_dma_active) {
+        uart_serial_dma_active = false;
+        dma_busy = 0;
+        __sev();
+        return;
+    }
+#endif
+
     const int b = sending;
-    tx_state[b] = TXBUF_FREE;
+    if (b >= 0 && b < TXBUF_CNT) {
+        tx_state[b] = TXBUF_FREE;
+    }
     __dmb();
     sending = -1;
     dma_busy = 0;
     __sev();
 }
+
+#if THERMAL_NCM_MODE && THERMAL_UART_OUTPUT_ENABLE
+static inline void uart_serial_queue_frame(const uint8_t* frame)
+{
+    if (!frame || uart_serial_dma_active) return;
+    memcpy(uart_serial_frame, frame, UART_SERIAL_FRAME_BYTES);
+    __dmb();
+    uart_serial_frame_pending = true;
+    __sev();
+}
+#else
+static inline void uart_serial_queue_frame(const uint8_t* frame)
+{
+    (void)frame;
+}
+#endif
+
 
 static inline __attribute__((always_inline)) void fill_txbuf(const int tx_idx,
                                                              const int raw_idx)
@@ -3467,7 +3618,9 @@ baud_get2(const uint8_t cmd)
         baud = UBMCC;
         ouomode = UOM_CALI_U8;
         cmode = CM_ON;
+#if !THERMAL_NCM_MODE
         dataomode = DOM_UART; /* override UVC mode so UART path runs */
+#endif
         caliidx = CALIBUF_IMG_L_IDX; /* reset capture index on each trigger */
         flash_dm = false;
         led_off();
@@ -3476,7 +3629,9 @@ baud_get2(const uint8_t cmd)
         baud = UBMDD;
         ouomode = UOM_CALI_U8;
         cmode = CM_OFF;
+#if !THERMAL_NCM_MODE
         dataomode = DOM_UART; /* override UVC mode so dump path runs */
+#endif
         flash_dm = true;
         break;
     default:
@@ -3531,6 +3686,10 @@ static inline __attribute__((always_inline)) void ouart_init(const uint8_t cmd)
 static inline __attribute__((always_inline)) void uart_poll2(
     uint32_t (*sel)(uint8_t))
 {
+    /* DOM_UVC aliases DOM_NCM for the USB transport.  This filter is only
+     * valid in the legacy UVC build; keeping it in the NCM build would drop
+     * the MaixCAM2 0x44 baud-switch command. */
+#if !THERMAL_NCM_MODE
     if (dataomode == DOM_UVC) {
         tud_task();
         /* In UVC mode only accept explicit override commands (0xCC/0xDD).
@@ -3563,6 +3722,7 @@ static inline __attribute__((always_inline)) void uart_poll2(
         curr_uartb = baud;
         return;
     }
+#endif
 
     if (!uart_is_readable(OUART)) {
         return;
@@ -3571,7 +3731,11 @@ static inline __attribute__((always_inline)) void uart_poll2(
     const uint8_t cmd = uart_getc(OUART);
     const uint32_t baud = sel(cmd);
 
-    if (baud == 0 || baud == curr_uartb) {
+    if (baud == 0u) {
+        return;
+    }
+
+    if (baud == curr_uartb) {
         return;
     }
 
@@ -3601,7 +3765,7 @@ static inline __attribute__((always_inline)) uint32_t now()
     return to_ms_since_boot(get_absolute_time());
 }
 
-#if !THERMAL_NCM_MODE
+#if !THERMAL_NCM_MODE && MAIN_FUNC_MODE == MAIN_FUNC_MODE_160M_UVC
 enum {
     UVCBUF_FREE = 0,
     UVCBUF_FILLING,
@@ -4290,6 +4454,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
     sending = -1;
     dma_busy = 0;
     println("Core1 consumer start");
+#if THERMAL_NCM_MODE
     dataomode = DOM_NCM;
     ouomode = UOM_CALI_U8;
     cmode = CM_OFF;
@@ -4297,6 +4462,15 @@ void __time_critical_func(core1_rawbuf_consumer)()
     thermal_ncm_init(ncm_frame_acquire, ncm_frame_release,
                      ncm_adc16_frame_acquire, ncm_adc16_frame_release,
                      ncm_adc16_frame_cancel);
+#if THERMAL_UART_OUTPUT_ENABLE
+    ouart_init(UART_BAUD_MODE_DEF);
+#endif
+#else
+    dataomode = DOM_UART;
+    ouomode = UOM_CALI_U8;
+    cmode = CM_OFF;
+    ouart_init(UART_BAUD_MODE_DEF);
+#endif
     flash_safe_execute_core_init();
     dma_busy = 0;
     buf_idx = 0;
@@ -4350,6 +4524,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
                         rawbuf_uniform_rows[idx];
                     g_capture_last_frame_uniform_max_run =
                         rawbuf_uniform_max_run[idx];
+#if THERMAL_NCM_MODE
                     const bool adc16_captured =
                         adc16_snapshot_state == ADC16_SNAPSHOT_REQUESTED;
                     bool diag_raw_captured = false;
@@ -4362,7 +4537,10 @@ void __time_critical_func(core1_rawbuf_consumer)()
                                sizeof(g_capture_row_ref_diag));
                         diag_raw_captured = true;
                     }
+#endif
                     fill_txbuf(b, idx);
+                    uart_serial_queue_frame(norm_buf[b]);
+#if THERMAL_NCM_MODE
                     if (diag_raw_captured && !g_capture_raw_diag_frozen) {
                         const uint8_t* pixels = &norm_buf[b][1];
                         uint32_t previous_sum = 0;
@@ -4399,6 +4577,7 @@ void __time_critical_func(core1_rawbuf_consumer)()
                         __dmb();
                         adc16_snapshot_state = ADC16_SNAPSHOT_READY;
                     }
+#endif
                     __dmb();
 
                     int old_tx_ready = newest_ready;
@@ -4418,7 +4597,14 @@ void __time_critical_func(core1_rawbuf_consumer)()
             did_work = true;
         }
 
+#if THERMAL_UART_OUTPUT_ENABLE
+        uart_poll2(baud_get2);
+#endif
+#if THERMAL_NCM_MODE
         thermal_ncm_task();
+#else
+        /* UART-only build: uart_poll2 above owns the command path. */
+#endif
 
         /* FFC: check trigger once per loop iteration when in normal output.
          * Allow first FFC even without full calibration (calibg == nullptr);
@@ -4431,6 +4617,12 @@ void __time_critical_func(core1_rawbuf_consumer)()
                 ffc_run(cur_fpa);
             }
         }
+
+#if THERMAL_NCM_MODE && THERMAL_UART_OUTPUT_ENABLE
+        try_start_dma();
+#elif !THERMAL_NCM_MODE
+        if (dataomode == DOM_UART) try_start_dma();
+#endif
 
         if (!did_work) {
             tight_loop_contents();
@@ -4447,11 +4639,19 @@ static inline __attribute__((always_inline)) void uart_tx_dma_wait_done()
 
 static inline void ffc_service_usb(void)
 {
-    /* Core0 also calls shutter_on() once during sensor startup. TinyUSB and
-     * lwIP are owned by Core1 and are not safe to enter concurrently from
-     * both cores; runtime FFC itself always runs on Core1. */
+    /* Core0 also calls shutter_on() once during sensor startup. Transport
+     * service is owned by Core1; runtime FFC itself always runs on Core1. */
     if (get_core_num() == 1) {
+#if THERMAL_NCM_MODE
         thermal_ncm_task();
+#if THERMAL_UART_OUTPUT_ENABLE
+        uart_poll2(baud_get2);
+        try_start_dma();
+#endif
+#else
+        uart_poll2(baud_get2);
+        try_start_dma();
+#endif
     }
 }
 
@@ -5365,6 +5565,7 @@ int __time_critical_func(spi_init_40MHz4)()
     * alternate selector only after all payload readback checks pass. */
     thermal_calibration_v1_boot_select();
     thermal_drift_model_boot_load();
+    thermal_radiometry_runtime_boot_load();
     thermal_ntc_model_boot_load();
 
     if (thermal_calibration_v1_boot_has_calibration()
